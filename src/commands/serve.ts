@@ -120,6 +120,7 @@ import { addManaged, patchManaged, removeManaged } from "../managed.ts";
 import { PtyBridge, termSessionName } from "../pty.ts";
 import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
+import { listDir, readRepoFile, gitGrep } from "../files.ts";
 import type { ServerWebSocket } from "bun";
 import { appendCmd as appendAisdkCmd, removeEntry as removeAisdkEntry, readEntry as readAisdkEntry, findEntryByAnyId as findAisdkEntryByAnyId, isEntryBusy as isAisdkEntryBusy } from "../aisdk-registry.ts";
 import { markClosed } from "../closing.ts";
@@ -2465,6 +2466,38 @@ export async function cmdServe() {
           return json({ repos: await listRepos() });
         }
         return json({ repos: await listRepos() });
+      }
+
+      // ---- Files / Search: browse repo files + content search (path-scoped) ----
+      if (path === "/api/repos/tree" && req.method === "GET") {
+        const rel = url.searchParams.get("path") || "";
+        const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
+        if (!repo) return err(404, "repo not found");
+        try {
+          return json({ repo: repo.name, path: rel, entries: await listDir(repo.cwd, rel) });
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
+        }
+      }
+
+      if (path === "/api/repos/file" && req.method === "GET") {
+        const rel = url.searchParams.get("path") || "";
+        if (!rel) return err(400, "path is required");
+        const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
+        if (!repo) return err(404, "repo not found");
+        try {
+          return json(await readRepoFile(repo.cwd, rel));
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
+        }
+      }
+
+      if (path === "/api/repos/search" && req.method === "GET") {
+        const q = (url.searchParams.get("q") || "").trim();
+        if (!q) return err(400, "q is required");
+        const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
+        if (!repo) return err(404, "repo not found");
+        return json({ repo: repo.name, query: q, matches: gitGrep(repo.cwd, q) });
       }
 
       if (path === "/api/sessions") {

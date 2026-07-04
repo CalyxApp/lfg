@@ -68,6 +68,7 @@ import {
   Radio,
   RotateCcw,
   ScrollText,
+  Search,
   Send,
   Settings,
   Sparkles,
@@ -97,6 +98,8 @@ const BrowserProfiles = lazyWithReload("BrowserProfiles", () => import("./Browse
 import { Badge } from "@/components/ui/badge";
 import { ImageAnnotator } from "@/components/ImageAnnotator";
 import { SessionDiffBar } from "@/components/SessionDiffView";
+import { FilesView } from "@/components/FilesView";
+import { SearchView } from "@/components/SearchView";
 import { Textarea } from "@/components/ui/textarea";
 import { Drawer, DrawerContent, DrawerTitle } from "@/components/ui/drawer";
 import {
@@ -4069,6 +4072,10 @@ export function App() {
           <Suspense fallback={<div className="py-10 text-center text-sm text-muted-foreground">Loading browser profiles...</div>}>
             <BrowserProfiles />
           </Suspense>
+        ) : tab === "files" ? (
+          <FilesView repos={repos} />
+        ) : tab === "search" ? (
+          <SearchView repos={repos} />
         ) : extNavTabs.some((t) => t.id === tab) ? (
           extNavTabs.find((t) => t.id === tab)!.render()
         ) : (
@@ -4086,6 +4093,8 @@ export function App() {
             onBrainConfigChange={updateBrainConfig}
             onOpenUsage={() => setTab("usage")}
             onOpenChangelog={() => setTab("changelog")}
+            onOpenFiles={() => setTab("files")}
+            onOpenSearch={() => setTab("search")}
             extTabs={extNavTabs}
             onOpenExt={setTab}
           />
@@ -12110,6 +12119,8 @@ function SettingsView({
   onBrainConfigChange,
   onOpenUsage,
   onOpenChangelog,
+  onOpenFiles,
+  onOpenSearch,
   extTabs,
   onOpenExt,
 }: {
@@ -12126,6 +12137,8 @@ function SettingsView({
   onBrainConfigChange: (patch: Partial<SessionBrainConfig>) => void;
   onOpenUsage: () => void;
   onOpenChangelog: () => void;
+  onOpenFiles: () => void;
+  onOpenSearch: () => void;
   extTabs: ExtensionNavTab[];
   onOpenExt: (id: string) => void;
 }) {
@@ -12147,6 +12160,41 @@ function SettingsView({
           </div>
         </div>
       </div>
+
+      {/* Workspace — file browsing & search, each opens as its own page. */}
+      <section className="space-y-2">
+        <h2 className="px-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          Workspace
+        </h2>
+        <div className="overflow-hidden rounded-2xl border border-border bg-card/40 divide-y divide-border">
+          <button
+            type="button"
+            onClick={onOpenFiles}
+            className="flex w-full items-center justify-between gap-4 px-4 py-2.5 text-left transition-colors duration-150 ease-ios hover:bg-foreground/[0.03] active:bg-foreground/[0.06]"
+          >
+            <div className="flex items-center gap-3">
+              <span className="flex size-7 items-center justify-center rounded-[7px] bg-primary text-white">
+                <Folder className="size-4" />
+              </span>
+              <span className="text-sm font-medium">Browse files</span>
+            </div>
+            <ChevronRight className="size-4 text-muted-foreground/60" />
+          </button>
+          <button
+            type="button"
+            onClick={onOpenSearch}
+            className="flex w-full items-center justify-between gap-4 px-4 py-2.5 text-left transition-colors duration-150 ease-ios hover:bg-foreground/[0.03] active:bg-foreground/[0.06]"
+          >
+            <div className="flex items-center gap-3">
+              <span className="flex size-7 items-center justify-center rounded-[7px] bg-foreground text-background">
+                <Search className="size-4" />
+              </span>
+              <span className="text-sm font-medium">Search</span>
+            </div>
+            <ChevronRight className="size-4 text-muted-foreground/60" />
+          </button>
+        </div>
+      </section>
 
       {/* Usage — opens as its own page. */}
       <section className="space-y-2">
