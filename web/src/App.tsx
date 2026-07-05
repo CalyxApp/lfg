@@ -3930,13 +3930,13 @@ export function App() {
               <button
                 type="button"
                 onClick={() =>
-                  setTab(tab === "settings" || tab === "ask" ? "live" : "settings")
+                  setTab(tab === "settings" || tab === "ask" || tab === "files" || tab === "search" ? "live" : "settings")
                 }
                 aria-label="Back"
                 className="flex h-8 items-center gap-1 rounded-full pl-1.5 pr-3 text-[13px] font-medium tracking-[-0.01em] text-muted-foreground transition-colors duration-200 ease-out hover:text-foreground active:scale-[0.96]"
               >
                 <ChevronLeft className="size-[18px]" />
-                <span>{tab === "settings" || tab === "ask" ? "Live" : "Settings"}</span>
+                <span>{tab === "settings" || tab === "ask" || tab === "files" || tab === "search" ? "Live" : "Settings"}</span>
               </button>
             )}
           </div>
@@ -3968,7 +3968,19 @@ export function App() {
             ) : null}
             <AskNavButton active={tab === "ask"} onOpen={() => setTab("ask")} />
             <IconTab
-              active={tab !== "live"}
+              active={tab === "files"}
+              onClick={() => setTab("files")}
+              icon={<Folder className="size-[18px]" />}
+              label="Files"
+            />
+            <IconTab
+              active={tab === "search"}
+              onClick={() => setTab("search")}
+              icon={<Search className="size-[18px]" />}
+              label="Search"
+            />
+            <IconTab
+              active={tab !== "live" && tab !== "files" && tab !== "search"}
               onClick={() => setTab("settings")}
               icon={<Settings className="size-[18px]" />}
               label="Settings"
