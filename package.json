@@ -24,6 +24,7 @@
     "ai-sdk-provider-claude-code": "^3.0.0",
     "ai-sdk-provider-codex-cli": "^1.2.2",
     "ai-sdk-provider-opencode-sdk": "^3.0.6",
+    "gray-matter": "^4.0.3",
     "marked": "^18.0.3",
     "opencode-ai": "^1.17.7",
     "playwright": "^1.61.0",

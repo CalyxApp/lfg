@@ -120,7 +120,8 @@ import { addManaged, patchManaged, removeManaged } from "../managed.ts";
 import { PtyBridge, termSessionName } from "../pty.ts";
 import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
-import { listDir, readRepoFile, gitGrep } from "../files.ts";
+import { listDir, readRepoFile, gitGrep, writeRepoFile, gitCommitPaths, readRepoFileRaw } from "../files.ts";
+import { vaultSummary, vaultItems, updateVaultDoc } from "../vault.ts";
 import type { ServerWebSocket } from "bun";
 import { appendCmd as appendAisdkCmd, removeEntry as removeAisdkEntry, readEntry as readAisdkEntry, findEntryByAnyId as findAisdkEntryByAnyId, isEntryBusy as isAisdkEntryBusy } from "../aisdk-registry.ts";
 import { markClosed } from "../closing.ts";
@@ -2498,6 +2499,112 @@ export async function cmdServe() {
         const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
         if (!repo) return err(404, "repo not found");
         return json({ repo: repo.name, query: q, matches: gitGrep(repo.cwd, q) });
+      }
+
+      // Save (or create) a text file, optionally auto-committing just that path.
+      // Pathspec commit — can never sweep other staged work in a shared checkout.
+      if (path === "/api/repos/write" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          repo?: string;
+          path?: string;
+          content?: string;
+          commit?: boolean;
+          message?: string;
+          createOnly?: boolean;
+        } | null;
+        if (!body?.repo || !body.path || typeof body.content !== "string") {
+          return err(400, "repo, path and content are required");
+        }
+        const repo = (await listRepos()).find((r) => r.name === body.repo);
+        if (!repo) return err(404, "repo not found");
+        try {
+          const result = await writeRepoFile(repo.cwd, body.path, body.content, {
+            createOnly: body.createOnly,
+          });
+          let commit: string | null = null;
+          if (body.commit !== false) {
+            commit = gitCommitPaths(
+              repo.cwd,
+              [body.path],
+              body.message || `mobile: ${result.created ? "create" : "update"} ${body.path}`,
+            );
+          }
+          return json({ ...result, commit });
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
+        }
+      }
+
+      // Raw bytes for preview-able assets (images, PDF, HTML). Active content
+      // (html/svg) is sandboxed via CSP: HTML previews may run their own scripts
+      // but in an opaque origin, so the JSON POST APIs stay behind CORS preflight.
+      if (path === "/api/repos/raw" && req.method === "GET") {
+        const rel = url.searchParams.get("path") || "";
+        if (!rel) return err(400, "path is required");
+        const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
+        if (!repo) return err(404, "repo not found");
+        try {
+          const { bytes, type } = await readRepoFileRaw(repo.cwd, rel);
+          const active = type.startsWith("text/html") || type === "image/svg+xml";
+          return new Response(bytes, {
+            headers: {
+              "Content-Type": type,
+              "X-Content-Type-Options": "nosniff",
+              "Cache-Control": "no-cache",
+              ...(active
+                ? {
+                    "Content-Security-Policy": type.startsWith("text/html")
+                      ? "sandbox allow-scripts"
+                      : "sandbox",
+                  }
+                : {}),
+            },
+          });
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
+        }
+      }
+
+      // ---- Vault: Calyx frontmatter awareness (tasks / projects / areas) ----
+      if (path === "/api/vault/summary" && req.method === "GET") {
+        const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
+        if (!repo) return err(404, "repo not found");
+        return json({ repo: repo.name, ...vaultSummary(repo.cwd) });
+      }
+
+      if (path === "/api/vault/items" && req.method === "GET") {
+        const type = (url.searchParams.get("type") || "task").trim().toLowerCase();
+        const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
+        if (!repo) return err(404, "repo not found");
+        return json({ repo: repo.name, type, ...vaultItems(repo.cwd, type) });
+      }
+
+      // Frontmatter-only update (e.g. flip task status) — surgical splice, the
+      // rest of the file survives byte-for-byte. Auto-commits just that path.
+      if (path === "/api/vault/update" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          repo?: string;
+          path?: string;
+          updates?: Record<string, unknown>;
+          commit?: boolean;
+          message?: string;
+        } | null;
+        if (!body?.repo || !body.path || !body.updates || typeof body.updates !== "object") {
+          return err(400, "repo, path and updates are required");
+        }
+        const repo = (await listRepos()).find((r) => r.name === body.repo);
+        if (!repo) return err(404, "repo not found");
+        try {
+          const result = await updateVaultDoc(repo.cwd, body.path, body.updates);
+          let commit: string | null = null;
+          if (body.commit !== false) {
+            const what = Object.keys(body.updates).join(",");
+            commit = gitCommitPaths(repo.cwd, [body.path], body.message || `mobile: ${what} → ${body.path}`);
+          }
+          return json({ path: result.path, commit });
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
+        }
       }
 
       if (path === "/api/sessions") {

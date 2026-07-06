@@ -6,8 +6,8 @@
 // every git invocation uses an arg array (no shell) so a query or path can't
 // inject. lfg's web API has no auth of its own, so these are a real surface.
 
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve, sep } from "node:path";
 
 const MAX_FILE_BYTES = 1_000_000; // 1 MB — larger files return { tooLarge } for a mobile viewer
 const MAX_SEARCH_RESULTS = 200;
@@ -26,6 +26,24 @@ export async function safeResolve(repoCwd: string, rel: string): Promise<string>
   const abs = resolve(root, rel || ".");
   if (abs !== root && !abs.startsWith(root + sep)) {
     throw new Error("path escapes repository");
+  }
+  // Symlink hardening: realpath the target (or, for not-yet-created paths, its
+  // deepest existing ancestor) and re-check — an in-repo symlink must not lead
+  // outside the repo. Now load-bearing: this module has write paths.
+  let probe = abs;
+  for (;;) {
+    let real: string;
+    try {
+      real = await realpath(probe);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+      const parent = dirname(probe);
+      if (parent === probe) break;
+      probe = parent;
+      continue;
+    }
+    if (real !== root && !real.startsWith(root + sep)) throw new Error("path escapes repository");
+    break;
   }
   return abs;
 }
@@ -71,6 +89,88 @@ export async function readRepoFile(repoCwd: string, rel: string): Promise<FileRe
   const buf = await readFile(abs);
   if (buf.subarray(0, 8192).includes(0)) return { path: rel, size: st.size, binary: true }; // NUL sniff
   return { path: rel, size: st.size, content: buf.toString("utf8") };
+}
+
+/** Write (or create) a UTF-8 text file inside the repo. Creates parent dirs for new files. */
+export async function writeRepoFile(
+  repoCwd: string,
+  rel: string,
+  content: string,
+  opts?: { createOnly?: boolean },
+): Promise<{ path: string; size: number; created: boolean }> {
+  if (!rel) throw new Error("path required");
+  const size = Buffer.byteLength(content, "utf8");
+  if (size > MAX_FILE_BYTES) throw new Error("file too large");
+  const abs = await safeResolve(repoCwd, rel);
+  const st = await stat(abs).catch((e) => {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw e;
+  });
+  if (st && !st.isFile()) throw new Error("not a file");
+  if (st && opts?.createOnly) throw new Error("file already exists");
+  if (!st) await mkdir(dirname(abs), { recursive: true });
+  await writeFile(abs, content, "utf8");
+  return { path: rel, size, created: !st };
+}
+
+/**
+ * Stage and commit specific paths only (pathspec commit — never sweeps other
+ * staged work in a shared checkout). Returns the short hash, or null when the
+ * save was a no-op or the file is .gitignore'd (saved to disk, nothing to commit).
+ */
+export function gitCommitPaths(repoCwd: string, paths: string[], message: string): string | null {
+  if (!paths.length) return null;
+  const ignored = git(repoCwd, ["check-ignore", "--stdin"], paths.join("\n") + "\n");
+  const commitable = ignored.ok
+    ? paths.filter((p) => !ignored.out.split("\n").map((l) => l.trim()).includes(p))
+    : paths;
+  if (!commitable.length) return null;
+  const add = git(repoCwd, ["add", "--", ...commitable]);
+  if (!add.ok) throw new Error(add.err.trim() || "git add failed");
+  const staged = git(repoCwd, ["diff", "--cached", "--name-only", "--", ...commitable]);
+  if (!staged.out.trim()) return null;
+  const commit = git(repoCwd, [
+    "-c", "user.name=Calyx Mobile",
+    "-c", "user.email=mobile@calyxapp.co",
+    "commit", "-m", message, "--", ...commitable,
+  ]);
+  if (!commit.ok) throw new Error(commit.err.trim() || "git commit failed");
+  const hash = git(repoCwd, ["rev-parse", "--short", "HEAD"]);
+  return hash.ok ? hash.out.trim() : "";
+}
+
+const RAW_TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".svg": "image/svg+xml",
+  ".avif": "image/avif",
+  ".pdf": "application/pdf",
+  ".html": "text/html; charset=utf-8",
+  ".htm": "text/html; charset=utf-8",
+};
+const MAX_RAW_BYTES = 20_000_000; // images/PDFs get a fatter cap than text
+
+/**
+ * Raw bytes + content-type for preview-able assets (images, PDF, HTML).
+ * HTML/SVG are active content — the caller MUST serve these with a sandboxing
+ * CSP header; this module only vouches for path safety and size.
+ */
+export async function readRepoFileRaw(
+  repoCwd: string,
+  rel: string,
+): Promise<{ bytes: Uint8Array; type: string; size: number }> {
+  const dot = rel.lastIndexOf(".");
+  const type = dot >= 0 ? RAW_TYPES[rel.slice(dot).toLowerCase()] : undefined;
+  if (!type) throw new Error("unsupported preview type");
+  const abs = await safeResolve(repoCwd, rel);
+  const st = await stat(abs);
+  if (!st.isFile()) throw new Error("not a file");
+  if (st.size > MAX_RAW_BYTES) throw new Error("file too large");
+  const buf = await readFile(abs);
+  return { bytes: buf, type, size: st.size };
 }
 
 /** Literal, case-insensitive content search across a repo (tracked + untracked, .gitignore-aware). */
