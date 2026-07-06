@@ -98,7 +98,8 @@ const BrowserProfiles = lazyWithReload("BrowserProfiles", () => import("./Browse
 import { Badge } from "@/components/ui/badge";
 import { ImageAnnotator } from "@/components/ImageAnnotator";
 import { SessionDiffBar } from "@/components/SessionDiffView";
-import { FilesView } from "@/components/FilesView";
+import { VaultView } from "@/components/VaultView";
+import { CaptureView } from "@/components/CaptureView";
 import { SearchView } from "@/components/SearchView";
 import { Textarea } from "@/components/ui/textarea";
 import { Drawer, DrawerContent, DrawerTitle } from "@/components/ui/drawer";
@@ -2777,6 +2778,24 @@ export function App() {
   // extension nav-tabs now render inside the Settings page rather than as their
   // own top-level tabs.
   const [tab, setTab] = useState<string>("live");
+
+  // Phase-0 routing: reflect the active tab into location.hash (#/files) and
+  // restore it on load, so PWA relaunches, reloads and shared links land on
+  // the right screen. replaceState only — no history-stack games; the app's
+  // own back affordances keep working.
+  useEffect(() => {
+    const fromHash = () => {
+      const h = location.hash.replace(/^#\/?/, "");
+      if (h && ROUTABLE_TABS.has(h)) setTab(h);
+    };
+    fromHash();
+    window.addEventListener("hashchange", fromHash);
+    return () => window.removeEventListener("hashchange", fromHash);
+  }, []);
+  useEffect(() => {
+    const next = `#/${tab}`;
+    if (location.hash !== next) history.replaceState(null, "", next);
+  }, [tab]);
   const extNavTabs = useExtensionNavTabs();
   const [autoAgents, setAutoAgents] = useState<AutoAgent[]>([]);
   const [schedTz, setSchedTz] = useState<string>(DEFAULT_SCHED_TZ);
@@ -3930,13 +3949,21 @@ export function App() {
               <button
                 type="button"
                 onClick={() =>
-                  setTab(tab === "settings" || tab === "ask" || tab === "files" || tab === "search" ? "live" : "settings")
+                  setTab(
+                    tab === "settings" || tab === "ask" || tab === "files" || tab === "capture" || tab === "search"
+                      ? "live"
+                      : "settings",
+                  )
                 }
                 aria-label="Back"
                 className="flex h-8 items-center gap-1 rounded-full pl-1.5 pr-3 text-[13px] font-medium tracking-[-0.01em] text-muted-foreground transition-colors duration-200 ease-out hover:text-foreground active:scale-[0.96]"
               >
                 <ChevronLeft className="size-[18px]" />
-                <span>{tab === "settings" || tab === "ask" || tab === "files" || tab === "search" ? "Live" : "Settings"}</span>
+                <span>
+                  {tab === "settings" || tab === "ask" || tab === "files" || tab === "capture" || tab === "search"
+                    ? "Live"
+                    : "Settings"}
+                </span>
               </button>
             )}
           </div>
@@ -3967,24 +3994,36 @@ export function App() {
               />
             ) : null}
             <AskNavButton active={tab === "ask"} onOpen={() => setTab("ask")} />
-            <IconTab
-              active={tab === "files"}
-              onClick={() => setTab("files")}
-              icon={<Folder className="size-[18px]" />}
-              label="Files"
-            />
-            <IconTab
-              active={tab === "search"}
-              onClick={() => setTab("search")}
-              icon={<Search className="size-[18px]" />}
-              label="Search"
-            />
-            <IconTab
-              active={tab !== "live" && tab !== "files" && tab !== "search"}
-              onClick={() => setTab("settings")}
-              icon={<Settings className="size-[18px]" />}
-              label="Settings"
-            />
+            {!isMobile ? (
+              <>
+                <IconTab
+                  active={tab === "files"}
+                  onClick={() => setTab("files")}
+                  icon={<Folder className="size-[18px]" />}
+                  label="Files"
+                />
+                <IconTab
+                  active={tab === "capture"}
+                  onClick={() => setTab("capture")}
+                  icon={<Plus className="size-[18px]" />}
+                  label="Capture"
+                />
+                <IconTab
+                  active={tab === "search"}
+                  onClick={() => setTab("search")}
+                  icon={<Search className="size-[18px]" />}
+                  label="Search"
+                />
+                <IconTab
+                  active={
+                    tab !== "live" && tab !== "files" && tab !== "capture" && tab !== "search"
+                  }
+                  onClick={() => setTab("settings")}
+                  icon={<Settings className="size-[18px]" />}
+                  label="Settings"
+                />
+              </>
+            ) : null}
           </div>
         </NavIsland>
       </header>
@@ -4085,7 +4124,9 @@ export function App() {
             <BrowserProfiles />
           </Suspense>
         ) : tab === "files" ? (
-          <FilesView repos={repos} />
+          <VaultView repos={repos} />
+        ) : tab === "capture" ? (
+          <CaptureView repos={repos} />
         ) : tab === "search" ? (
           <SearchView repos={repos} />
         ) : extNavTabs.some((t) => t.id === tab) ? (
@@ -4145,6 +4186,11 @@ export function App() {
           ) : null}
         </>
       ) : null}
+
+      {/* Bottom tab bar — mobile only; tucks away while the keyboard is up or
+          during a voice call so it never fights the composer for the bottom. */}
+      {isMobile && !callOpen && !keyboardOpen ? <TabBar tab={tab} onSelect={setTab} /> : null}
+
       {callOpen ? (
         <Suspense fallback={null}>
           <VoiceCall
@@ -4533,6 +4579,84 @@ function NavIsland({
     >
       {children}
     </div>
+  );
+}
+
+// Tabs the hash router will restore on load (extension tabs are dynamic and
+// excluded on purpose — they may not be registered yet at first paint).
+const ROUTABLE_TABS = new Set([
+  "live",
+  "auto",
+  "brain",
+  "ask",
+  "usage",
+  "coding-agents",
+  "agent-browser",
+  "changelog",
+  "term",
+  "browser",
+  "files",
+  "capture",
+  "search",
+  "settings",
+]);
+
+// Every agent-world screen lights up the Agents destination in the tab bar.
+const AGENT_FAMILY_TABS = new Set([
+  "live",
+  "auto",
+  "brain",
+  "ask",
+  "usage",
+  "coding-agents",
+  "agent-browser",
+  "term",
+  "browser",
+]);
+
+// Bottom tab bar (mobile) — the app's five destinations, wrapped in the same
+// NavIsland pill as the header so the chrome reads as one matched set. Sits
+// in-flow at the end of the root flex column: content and the inline composer
+// stack above it, nothing can hide beneath it.
+function TabBar({ tab, onSelect }: { tab: string; onSelect: (tab: string) => void }) {
+  const items = [
+    { id: "live", label: "Agents", icon: Bot, active: AGENT_FAMILY_TABS.has(tab) },
+    { id: "files", label: "Files", icon: Folder, active: tab === "files" },
+    { id: "capture", label: "Capture", icon: Plus, active: tab === "capture" },
+    { id: "search", label: "Search", icon: Search, active: tab === "search" },
+    {
+      id: "settings",
+      label: "Settings",
+      icon: Settings,
+      active: !AGENT_FAMILY_TABS.has(tab) && !["files", "capture", "search"].includes(tab),
+    },
+  ];
+  return (
+    <nav
+      aria-label="Primary"
+      className="z-40 shrink-0 px-3 pb-[max(env(safe-area-inset-bottom),0.75rem)] pt-1"
+    >
+      <NavIsland>
+        <div className="flex h-[3.4rem] items-center justify-around rounded-full bg-background/80 px-1.5 backdrop-blur-xl">
+          {items.map((it) => (
+            <button
+              key={it.id}
+              type="button"
+              onClick={() => onSelect(it.id)}
+              aria-label={it.label}
+              aria-current={it.active ? "page" : undefined}
+              className={cn(
+                "flex h-12 flex-1 flex-col items-center justify-center gap-0.5 rounded-full transition-colors duration-200 ease-out active:scale-[0.94]",
+                it.active ? "text-primary" : "text-muted-foreground",
+              )}
+            >
+              <it.icon className="size-[21px]" strokeWidth={it.active ? 2.2 : 2} />
+              <span className="text-[10px] font-medium tracking-[-0.01em]">{it.label}</span>
+            </button>
+          ))}
+        </div>
+      </NavIsland>
+    </nav>
   );
 }
 
