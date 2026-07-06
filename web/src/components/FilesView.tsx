@@ -432,9 +432,9 @@ function MarkdownDoc({ source }: { source: string }) {
           ))}
         </div>
       ) : null}
-      <div className="rounded-2xl border border-border bg-card/40 px-4 py-4 text-[15px] leading-relaxed [&_pre]:overflow-x-auto">
+      <article className="markdown rounded-2xl border border-border bg-card/40 px-4 py-4 text-[15px] leading-relaxed [&_pre]:overflow-x-auto">
         <Streamdown>{body}</Streamdown>
-      </div>
+      </article>
     </div>
   );
 }
