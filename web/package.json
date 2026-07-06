@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "@base-ui/react": "^1.3.0",
+    "@capacitor/core": "^8.4.1",
+    "@capacitor/ios": "^8.4.1",
     "@elevenlabs/client": "^1.12.1",
     "@microsoft/fetch-event-source": "^2.0.1",
     "@pierre/diffs": "^1.2.12",
@@ -38,6 +40,7 @@
     "web-haptics": "^0.0.6"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.4.1",
     "@tailwindcss/vite": "^4.2.2",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",

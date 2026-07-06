@@ -1,0 +1,18 @@
+App/build
+App/Pods
+App/output
+App/App/public
+DerivedData
+xcuserdata
+
+# Cordova plugins for Capacitor
+capacitor-cordova-ios-plugins
+
+# Generated Config files
+App/App/capacitor.config.json
+App/App/config.xml
+
+# Vendored SPM dep (has its own .git) — xcodebuild remote loader is broken on this Mac;
+# fresh checkouts: git clone --depth 1 --branch 8.4.1 https://github.com/ionic-team/capacitor-swift-pm.git web/ios/capacitor-swift-pm
+capacitor-swift-pm/
+App/App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved.bak
