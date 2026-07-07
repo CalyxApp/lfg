@@ -3142,7 +3142,9 @@ export function App() {
                       ? isMobile
                         ? "home"
                         : "live"
-                      : "settings",
+                      : isMobile && AGENT_TOOL_TABS.has(tab)
+                        ? "live"
+                        : "settings",
                   )
                 }
                 aria-label="Back"
@@ -3154,7 +3156,9 @@ export function App() {
                     ? isMobile
                       ? "Home"
                       : "Live"
-                    : "Settings"}
+                    : isMobile && AGENT_TOOL_TABS.has(tab)
+                      ? "Agents"
+                      : "Settings"}
                 </span>
               </button>
             )}
@@ -3237,6 +3241,7 @@ export function App() {
             onNoteStatus={setNoteStatus}
           />
         ) : tab === "live" ? (
+          <>
           <LiveView
             sessions={liveSessions}
             users={users}
@@ -3266,6 +3271,8 @@ export function App() {
             autoAgents={projectScopedAutoAgents}
             onOpenFinding={setOpenFinding}
           />
+          {isMobile ? <AgentToolChips onOpen={setTab} /> : null}
+          </>
         ) : tab === "auto" ? (
           <AutoManageView
             autoAgents={projectScopedAutoAgents}
@@ -3354,6 +3361,7 @@ export function App() {
             dark={dark}
             toggleTheme={toggleTheme}
             user={userFilter !== "__all" && userFilter !== "__unassigned" ? userFilter : null}
+            mobile={isMobile}
             onOpenTerminal={() => setTab("term")}
             onOpenBrowser={() => setTab("browser")}
             onOpenCodingAgents={() => setTab("coding-agents")}
@@ -3364,8 +3372,6 @@ export function App() {
             onBrainConfigChange={updateBrainConfig}
             onOpenUsage={() => setTab("usage")}
             onOpenChangelog={() => setTab("changelog")}
-            onOpenFiles={() => setTab("files")}
-            onOpenSearch={() => setTab("search")}
             extTabs={extNavTabs}
             onOpenExt={setTab}
           />
@@ -3850,6 +3856,55 @@ const AGENT_FAMILY_TABS = new Set([
   "term",
   "browser",
 ]);
+
+// The agent tool screens consolidated under the Agents tab on mobile (the
+// "Also under Agents" chips at the tail of the Live feed). Mobile back returns
+// them to the feed; desktop still reaches them through Settings, so its back
+// keeps pointing there.
+const AGENT_TOOL_TABS = new Set([
+  "auto",
+  "brain",
+  "usage",
+  "coding-agents",
+  "agent-browser",
+  "term",
+  "browser",
+]);
+
+// Mobile: the grouped list of agent tool screens, rendered as a wrapping chip
+// row under the Live feed — the Phase-1 consolidation from the IA mockup, so
+// Settings can go back to being just settings on the phone.
+function AgentToolChips({ onOpen }: { onOpen: (tab: string) => void }) {
+  const tools = [
+    { id: "auto", label: "Auto agents", icon: CalendarClock },
+    { id: "agent-browser", label: "Agent browser", icon: GitFork },
+    { id: "coding-agents", label: "Coding agents", icon: Bot },
+    { id: "term", label: "Terminal", icon: TerminalSquare },
+    { id: "usage", label: "Usage", icon: Activity },
+    { id: "brain", label: "Session brain", icon: Brain },
+    { id: "browser", label: "Browser profiles", icon: Globe },
+  ];
+  return (
+    <section className="mx-auto mt-6 max-w-xl space-y-2 pb-2">
+      <h2 className="px-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        Also under Agents
+      </h2>
+      <div className="flex flex-wrap gap-1.5 px-1">
+        {tools.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => onOpen(t.id)}
+            className="flex items-center gap-1.5 rounded-full bg-secondary px-3 py-1.5 text-xs font-medium tracking-[-0.01em] text-muted-foreground transition-colors duration-150 ease-ios hover:text-foreground active:scale-[0.97]"
+          >
+            <t.icon className="size-3.5" />
+            {t.label}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 // Bottom tab bar (mobile) — the app's five destinations, wrapped in the same
 // NavIsland pill as the header so the chrome reads as one matched set. Sits
@@ -11482,6 +11537,7 @@ function SettingsView({
   dark,
   toggleTheme,
   user,
+  mobile,
   onOpenTerminal,
   onOpenBrowser,
   onOpenCodingAgents,
@@ -11492,14 +11548,16 @@ function SettingsView({
   onBrainConfigChange,
   onOpenUsage,
   onOpenChangelog,
-  onOpenFiles,
-  onOpenSearch,
   extTabs,
   onOpenExt,
 }: {
   dark: boolean;
   toggleTheme: () => void;
   user: string | null;
+  // Mobile trims Settings to actual settings: the agent tool screens live
+  // under the Agents tab (AgentToolChips) there, while desktop's only route
+  // to them is still this page.
+  mobile: boolean;
   onOpenTerminal: () => void;
   onOpenBrowser: () => void;
   onOpenCodingAgents: () => void;
@@ -11510,8 +11568,6 @@ function SettingsView({
   onBrainConfigChange: (patch: Partial<SessionBrainConfig>) => void;
   onOpenUsage: () => void;
   onOpenChangelog: () => void;
-  onOpenFiles: () => void;
-  onOpenSearch: () => void;
   extTabs: ExtensionNavTab[];
   onOpenExt: (id: string) => void;
 }) {
@@ -11534,41 +11590,12 @@ function SettingsView({
         </div>
       </div>
 
-      {/* Workspace — file browsing & search, each opens as its own page. */}
-      <section className="space-y-2">
-        <h2 className="px-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-          Workspace
-        </h2>
-        <div className="overflow-hidden rounded-2xl border border-border bg-card/40 divide-y divide-border">
-          <button
-            type="button"
-            onClick={onOpenFiles}
-            className="flex w-full items-center justify-between gap-4 px-4 py-2.5 text-left transition-colors duration-150 ease-ios hover:bg-foreground/[0.03] active:bg-foreground/[0.06]"
-          >
-            <div className="flex items-center gap-3">
-              <span className="flex size-7 items-center justify-center rounded-[7px] bg-primary text-white">
-                <Folder className="size-4" />
-              </span>
-              <span className="text-sm font-medium">Browse files</span>
-            </div>
-            <ChevronRight className="size-4 text-muted-foreground/60" />
-          </button>
-          <button
-            type="button"
-            onClick={onOpenSearch}
-            className="flex w-full items-center justify-between gap-4 px-4 py-2.5 text-left transition-colors duration-150 ease-ios hover:bg-foreground/[0.03] active:bg-foreground/[0.06]"
-          >
-            <div className="flex items-center gap-3">
-              <span className="flex size-7 items-center justify-center rounded-[7px] bg-foreground text-background">
-                <Search className="size-4" />
-              </span>
-              <span className="text-sm font-medium">Search</span>
-            </div>
-            <ChevronRight className="size-4 text-muted-foreground/60" />
-          </button>
-        </div>
-      </section>
-
+      {/* Agent tool screens — desktop only: its single route to them is this
+          page, while mobile reaches them via the Agents tab's chip row. The
+          old Workspace (Files/Search) section is gone on both: desktop has
+          the header icon tabs, mobile the tab bar and Home tiles. */}
+      {mobile ? null : (
+      <>
       {/* Usage — opens as its own page. */}
       <section className="space-y-2">
         <h2 className="px-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
@@ -11705,6 +11732,8 @@ function SettingsView({
           </button>
         </div>
       </section>
+      </>
+      )}
 
       {/* Extension tabs — each opens as its own page. */}
       {extTabs.length ? (
