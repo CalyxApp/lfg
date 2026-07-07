@@ -2867,12 +2867,23 @@ export function App() {
       clear();
       return;
     }
+    const isEditable = (n: Element | null): boolean =>
+      !!n &&
+      (n.tagName === "INPUT" ||
+        n.tagName === "TEXTAREA" ||
+        (n as HTMLElement).isContentEditable);
     const sync = () => {
       // Keyboard height ≈ layout height − visual height. `innerHeight` is the
       // layout viewport (doesn't shrink for the keyboard on iOS); 120px clears
       // URL-bar jitter without missing a real keyboard (~250px+).
+      //
+      // Height alone misfires inside plain browser tabs (Brave/Safari-tab bottom
+      // chrome shrinks the visual viewport by ~150–180px at rest), which pinned
+      // keyboardOpen=true and hid the tab bar. A real on-screen keyboard implies
+      // a focused editable element, so gate on focus — except the Terminal tab,
+      // whose canvas input may not surface an editable activeElement.
       const kb = Math.max(0, window.innerHeight - vv.height);
-      const open = kb > 120;
+      const open = kb > 120 && (tab === "term" || isEditable(document.activeElement));
       const el = rootRef.current;
       const measuredHeight = `${Math.ceil(vv.height)}px`;
       document.documentElement.style.setProperty("--lfg-app-height", measuredHeight);
@@ -2903,6 +2914,10 @@ export function App() {
     sync();
     vv.addEventListener("resize", sync, { passive: true });
     vv.addEventListener("scroll", sync, { passive: true });
+    // Focus moves don't always fire a visualViewport resize; re-sync so the
+    // focus-gated keyboard flag flips promptly on focus/blur.
+    window.addEventListener("focusin", sync, { passive: true });
+    window.addEventListener("focusout", sync, { passive: true });
     // Returning from the app switcher / backgrounding doesn't reliably fire a
     // visualViewport resize on iOS. Sample across the frames where WebKit settles
     // its viewport metrics; this mimics the relayout a manual pinch/zoom caused.
@@ -2924,6 +2939,8 @@ export function App() {
     return () => {
       vv.removeEventListener("resize", sync);
       vv.removeEventListener("scroll", sync);
+      window.removeEventListener("focusin", sync);
+      window.removeEventListener("focusout", sync);
       window.removeEventListener("pageshow", resync);
       window.removeEventListener("focus", resync);
       document.removeEventListener("visibilitychange", onVisible);
