@@ -123,7 +123,7 @@ export async function writeRepoFile(
  * even if we crash). On systems without flock(1) (macOS dev) or if acquisition
  * times out (15s), we run without the lock rather than fail the save.
  */
-export async function withRepoLock<T>(repoCwd: string, fn: () => T): Promise<T> {
+export async function withRepoLock<T>(repoCwd: string, fn: () => T | Promise<T>): Promise<T> {
   type Holder = { stdout: ReadableStream<Uint8Array>; stdin: { end(): void }; kill(): void };
   let holder: Holder | null = null;
   try {
@@ -142,7 +142,7 @@ export async function withRepoLock<T>(repoCwd: string, fn: () => T): Promise<T> 
     } catch {
       holder = null; // flock(1) missing (macOS dev) — proceed unlocked
     }
-    return fn();
+    return await fn();
   } finally {
     if (holder) {
       try {

@@ -2518,21 +2518,26 @@ export async function cmdServe() {
         const repo = (await listRepos()).find((r) => r.name === body.repo);
         if (!repo) return err(404, "repo not found");
         try {
-          const result = await writeRepoFile(repo.cwd, body.path, body.content, {
-            createOnly: body.createOnly,
-          });
-          let commit: string | null = null;
-          if (body.commit !== false) {
-            // Hoisted: the guard's narrowing of body.path doesn't survive into
-            // the closure below.
-            const repoCwd = repo.cwd;
-            const relPath = body.path;
-            const message =
-              body.message || `mobile: ${result.created ? "create" : "update"} ${relPath}`;
-            // Under the repo sync lock so the commit can't race vault-sync.sh's
-            // rebase in this same checkout (orphaned-commit vector).
-            commit = await withRepoLock(repoCwd, () => gitCommitPaths(repoCwd, [relPath], message));
+          // Hoisted: the guard's narrowing of body.path doesn't survive into
+          // the closures below.
+          const repoCwd = repo.cwd;
+          const relPath = body.path;
+          const content = body.content;
+          const createOnly = body.createOnly;
+          const doWrite = () => writeRepoFile(repoCwd, relPath, content, { createOnly });
+          if (body.commit === false) {
+            return json({ ...(await doWrite()), commit: null });
           }
+          // Write AND commit under one repo sync lock span: a sync rebase must
+          // never run between them (it would see the dirty tree), and a commit
+          // must never land mid-rebase (orphaned-commit vector).
+          const custom = body.message;
+          const { result, commit } = await withRepoLock(repoCwd, async () => {
+            const result = await doWrite();
+            const message =
+              custom || `mobile: ${result.created ? "create" : "update"} ${relPath}`;
+            return { result, commit: gitCommitPaths(repoCwd, [relPath], message) };
+          });
           return json({ ...result, commit });
         } catch (e) {
           return err(400, e instanceof Error ? e.message : String(e));
@@ -2599,16 +2604,21 @@ export async function cmdServe() {
         const repo = (await listRepos()).find((r) => r.name === body.repo);
         if (!repo) return err(404, "repo not found");
         try {
-          const result = await updateVaultDoc(repo.cwd, body.path, body.updates);
-          let commit: string | null = null;
-          if (body.commit !== false) {
-            const what = Object.keys(body.updates).join(",");
-            const repoCwd = repo.cwd;
-            const relPath = body.path;
-            const message = body.message || `mobile: ${what} → ${relPath}`;
-            // Same sync-lock rationale as /api/repos/write above.
-            commit = await withRepoLock(repoCwd, () => gitCommitPaths(repoCwd, [relPath], message));
+          const repoCwd = repo.cwd;
+          const relPath = body.path;
+          const updates = body.updates;
+          if (body.commit === false) {
+            const result = await updateVaultDoc(repoCwd, relPath, updates);
+            return json({ path: result.path, commit: null });
           }
+          // Write + commit under one sync-lock span — same rationale as
+          // /api/repos/write above.
+          const message =
+            body.message || `mobile: ${Object.keys(updates).join(",")} → ${relPath}`;
+          const { result, commit } = await withRepoLock(repoCwd, async () => {
+            const result = await updateVaultDoc(repoCwd, relPath, updates);
+            return { result, commit: gitCommitPaths(repoCwd, [relPath], message) };
+          });
           return json({ path: result.path, commit });
         } catch (e) {
           return err(400, e instanceof Error ? e.message : String(e));
