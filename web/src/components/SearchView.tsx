@@ -2,8 +2,9 @@
 //   • Files       → GET  /api/repos/search  (git grep across the selected repo)
 //   • Transcripts → POST /api/transcripts/search  (existing FTS5 index)
 //
-// Results are read-only for MVP (tapping doesn't yet jump into Files / the
-// session — that's cross-tab wiring left for a follow-up).
+// File matches deep-link into the Files tab via `onOpenFile` (App switches
+// tabs and hands VaultView the repo+path). Transcript matches are still
+// read-only — jumping into a session is a follow-up.
 
 import { useState } from "react";
 import { FileText, Loader2, MessageSquare, Search } from "lucide-react";
@@ -18,10 +19,19 @@ type TranscriptMatch = { sessionId: string; role: string; kind: string; snippet:
 
 type Mode = "files" | "transcripts";
 
-export function SearchView({ repos }: { repos: Repo[] }) {
+export function SearchView({
+  repos,
+  onOpenFile,
+}: {
+  repos: Repo[];
+  onOpenFile?: (repo: string, path: string) => void;
+}) {
   const [mode, setMode] = useState<Mode>("files");
   const [query, setQuery] = useState("");
   const [repo, setRepo] = useState<string | null>(repos[0]?.name ?? null);
+  // The repo the current fileMatches came from — the pill selection can move
+  // after a search, and taps must open the file where it was actually found.
+  const [resultsRepo, setResultsRepo] = useState<string | null>(null);
   const [fileMatches, setFileMatches] = useState<FileMatch[]>([]);
   const [transcripts, setTranscripts] = useState<TranscriptMatch[]>([]);
   const [loading, setLoading] = useState(false);
@@ -41,6 +51,7 @@ export function SearchView({ repos }: { repos: Repo[] }) {
           `/api/repos/search?repo=${encodeURIComponent(repo!)}&q=${encodeURIComponent(q)}`,
         );
         setFileMatches(res.matches);
+        setResultsRepo(repo);
       } else {
         const res = await postJson<{ results: TranscriptMatch[] }>("/api/transcripts/search", { query: q });
         setTranscripts(res.results);
@@ -136,7 +147,14 @@ export function SearchView({ repos }: { repos: Repo[] }) {
         <div className="overflow-hidden rounded-2xl border border-border bg-card/40 divide-y divide-border">
           {mode === "files"
             ? fileMatches.map((m, i) => (
-                <div key={`${m.path}:${m.line}:${i}`} className="px-4 py-2.5">
+                <button
+                  key={`${m.path}:${m.line}:${i}`}
+                  type="button"
+                  onClick={() => {
+                    if (resultsRepo) onOpenFile?.(resultsRepo, m.path);
+                  }}
+                  className="block w-full px-4 py-2.5 text-left transition-colors duration-150 ease-ios hover:bg-foreground/[0.03] active:bg-foreground/[0.06]"
+                >
                   <div className="flex items-baseline gap-2 text-xs text-muted-foreground">
                     <span className="truncate font-medium text-foreground">{m.path}</span>
                     <span className="shrink-0">:{m.line}</span>
@@ -144,7 +162,7 @@ export function SearchView({ repos }: { repos: Repo[] }) {
                   <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted-foreground">
                     {m.text}
                   </pre>
-                </div>
+                </button>
               ))
             : transcripts.map((m, i) => (
                 <div key={`${m.sessionId}:${i}`} className="px-4 py-2.5">

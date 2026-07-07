@@ -1,6 +1,7 @@
-// CaptureView — the ＋ tab: jot a thought on the phone, land it in a repo as a
-// dated markdown note under inbox/, auto-committed. Obsidian-style quick
-// capture; remembers the last-used repo. Voice capture is a later follow-up.
+// CaptureView — the ＋ tab: jot or dictate a thought on the phone, land it in a
+// repo as a dated markdown note under inbox/, auto-committed. Obsidian-style
+// quick capture; remembers the last-used repo. The mic is dictation-only (fills
+// the body; no silence-auto-save) — committing a file stays a deliberate tap.
 
 import { useEffect, useState } from "react";
 import { Check, Loader2, PenLine } from "lucide-react";
@@ -8,6 +9,7 @@ import { postJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Textarea } from "./ui/textarea";
 import { Input } from "./ui/input";
+import { MicButton } from "./dictation";
 
 type Repo = { name: string; project?: string; custom?: boolean };
 
@@ -108,16 +110,29 @@ export function CaptureView({ repos }: { repos: Repo[] }) {
         placeholder="Title (optional)"
         autoCapitalize="sentences"
       />
-      <Textarea
-        value={body}
-        onChange={(e) => {
-          setBody(e.target.value);
-          if (savedPath) setSavedPath(null);
-        }}
-        placeholder="What's on your mind?"
-        rows={8}
-        className="min-h-40 text-[15px] leading-relaxed"
-      />
+      <div className="relative">
+        <Textarea
+          value={body}
+          onChange={(e) => {
+            setBody(e.target.value);
+            if (savedPath) setSavedPath(null);
+          }}
+          placeholder="What's on your mind?"
+          rows={8}
+          className="min-h-40 pb-12 text-[15px] leading-relaxed"
+        />
+        <MicButton
+          minimal
+          className="absolute bottom-2 right-2 size-9"
+          baseText={body}
+          onText={(text, base) => {
+            setBody(base.trim() ? `${base.trimEnd()} ${text}` : text);
+            if (savedPath) setSavedPath(null);
+          }}
+          onInterim={(text, base) => setBody(base.trim() ? `${base.trimEnd()} ${text}` : text)}
+          onCancel={(base) => setBody(base)}
+        />
+      </div>
 
       {error ? (
         <div className="mx-1 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">

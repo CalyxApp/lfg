@@ -71,7 +71,15 @@ function dueLabel(due: string, today: string): { text: string; tone: "overdue" |
   return { text: due.slice(5), tone: "later" };
 }
 
-export function VaultView({ repos }: { repos: Repo[] }) {
+export function VaultView({
+  repos,
+  deepLink,
+  onDeepLinkConsumed,
+}: {
+  repos: Repo[];
+  deepLink?: { repo: string; path: string } | null;
+  onDeepLinkConsumed?: () => void;
+}) {
   const [repo, setRepo] = useState<string | null>(null);
   const [pane, setPane] = useState<Pane>("files");
   const [summary, setSummary] = useState<VaultSummary | null>(null);
@@ -81,6 +89,19 @@ export function VaultView({ repos }: { repos: Repo[] }) {
   const [error, setError] = useState<string | null>(null);
   const [openPath, setOpenPath] = useState<string | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
+
+  // Cross-tab deep link (a Search result): select the repo, land on the Files
+  // pane with the file open, then consume the link so later visits to the tab
+  // aren't re-hijacked. openPath survives the repo-probe effect below (which
+  // only resets panes/items), so ordering is safe for both same-repo and
+  // switch-repo arrivals.
+  useEffect(() => {
+    if (!deepLink) return;
+    setRepo(deepLink.repo);
+    setPane("files");
+    setOpenPath(deepLink.path);
+    onDeepLinkConsumed?.();
+  }, [deepLink, onDeepLinkConsumed]);
 
   // Probe vault-ness on repo select (cheap scan server-side).
   useEffect(() => {

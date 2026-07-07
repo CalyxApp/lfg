@@ -74,6 +74,29 @@ function recoverFromChunkLoadError(message: string): boolean {
   return true; // reloading onto the fresh build; swallow this report
 }
 
+// Browser- and extension-injected noise. Mobile browsers and wallet extensions
+// inject scripts straight into the page context, so their failures reach our
+// global handlers with OUR page URL as `source` — the message text is the only
+// reliable tell. Seen in the wild (data/client-errors/errors.jsonl):
+//   • Brave/wallet shims:  "undefined is not an object (evaluating 'window.ethereum…')"
+//   • Firefox/Brave iOS:   "Can't find variable: __firefox__", window.__firefox__.reader
+//   • WebExtension frames: URLs on the chrome-extension:// family of schemes
+// Grow this list from the jsonl as new junk appears; nothing here can ever
+// match our own code.
+const INJECTED_NOISE =
+  /window\.ethereum|ethereum\.selectedAddress|__firefox__|chrome-extension:\/\/|moz-extension:\/\/|safari-web-extension:\/\//i;
+
+// True for reports that are provably not our code: injected-script junk, plus
+// the opaque cross-origin "Script error." — no detail, no stack, no source.
+// Our own bundle is same-origin, so a real app error always carries more than
+// that; an opaque one can only come from someone else's script.
+function isForeignNoise(r: Report): boolean {
+  const hay = `${r.message} ${r.stack ?? ""} ${r.source ?? ""}`;
+  if (INJECTED_NOISE.test(hay)) return true;
+  if (/^script error\.?$/i.test(r.message.trim()) && !r.stack && !r.source) return true;
+  return false;
+}
+
 function sig(message: string, extra = ""): string {
   return (message + "|" + extra).replace(/\s+/g, " ").trim().slice(0, 300);
 }
@@ -102,6 +125,13 @@ export function reportError(r: Report): void {
     // A stale/failed code-split chunk → recover with a one-time reload instead of
     // escalating a transient, self-healing condition into a phantom auto-fix run.
     if (recoverFromChunkLoadError(r.message)) return;
+    // Extension/browser-injected junk — drop before it consumes the report
+    // budget or raises a finding (and dispatches an auto-fix agent) for code
+    // that was never ours.
+    if (isForeignNoise(r)) {
+      console.debug("lfg: ignored injected/foreign error:", r.message);
+      return;
+    }
     if (count >= MAX_REPORTS_PER_LOAD) return;
     const key = sig(r.message, r.source ?? (r.stack ?? "").split("\n")[1] ?? "");
     if (sent.has(key)) return;
