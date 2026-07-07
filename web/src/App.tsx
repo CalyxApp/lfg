@@ -9220,11 +9220,12 @@ function NewSessionDialog({
     // path: keep it open and focused so the next session can be typed while this
     // one boots in the background. Do not auto-expand it on submit; the fixed
     // bottom bar can expose the browser canvas while its height/position changes.
-    if (variant === "inline") {
-      requestAnimationFrame(() => fieldRef.current?.querySelector("textarea")?.focus());
-    } else {
-      onClose();
-    }
+    // Close on submit for BOTH variants. The inline (mobile) composer used to
+    // stay open and refocus for a rapid next prompt — but on the phone "Start"
+    // means go: the fixed panel sits above the tab bar (z-55 vs z-40), so once
+    // the keyboard dropped it kept covering the nav (Sam's 07-07 device QA),
+    // and the feed is where the freshly launched session shows up anyway.
+    onClose();
     void (async () => {
       try {
         const uploaded = files.length ? await Promise.all(files.map(uploadAttachment)) : [];
@@ -9667,8 +9668,21 @@ function NewSessionDialog({
     return (
       <div
         aria-busy={launching}
-        className="pointer-events-auto fixed inset-x-0 bottom-0 z-[55] overflow-x-clip bg-background/95 pt-4 shadow-[0_-8px_24px_rgba(0,0,0,0.12)] backdrop-blur-xl"
+        className="pointer-events-auto fixed inset-x-0 bottom-0 z-[55] overflow-x-clip bg-background/95 pt-2 shadow-[0_-8px_24px_rgba(0,0,0,0.12)] backdrop-blur-xl"
       >
+        {/* The panel overlays the tab bar (z-55 vs z-40), so it must carry its
+            own way out — otherwise dismissing the keyboard strands the user
+            with no nav until they leave the tab. */}
+        <div className="mx-auto flex max-w-lg justify-end px-3 pb-1">
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close composer"
+            className="flex size-7 items-center justify-center rounded-full bg-secondary text-muted-foreground transition-colors duration-150 ease-ios hover:text-foreground active:scale-[0.94]"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
         <div ref={inlineShellRef} className="mx-auto max-w-lg will-change-transform">
           {formBody}
         </div>
