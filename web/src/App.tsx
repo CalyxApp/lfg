@@ -2793,6 +2793,11 @@ export function App() {
   // Mobile: the inline chat composer sits behind the ＋ FAB instead of being
   // open by default — the Live feed is for reading until you ask to compose.
   const [composerOpen, setComposerOpen] = useState(false);
+  // Leaving the feed resets the compose state, so returning always lands on
+  // the readable feed + FAB (and a stuck composer can't strand the layout).
+  useEffect(() => {
+    if (tab !== "live") setComposerOpen(false);
+  }, [tab]);
 
   // Phase-0 routing: reflect the active tab into location.hash (#/files) and
   // restore it on load, so PWA relaunches, reloads and shared links land on
@@ -2863,6 +2868,10 @@ export function App() {
   //     keyboard is open we collapse that padding (see `keyboardOpen`) so the
   //     terminal fills right up to the keyboard instead of floating above a gap.
   //
+  // Keyboard-detection calibration (see sync() below): smallest chrome-only
+  // viewport delta observed, and the innerHeight it was observed at.
+  const chromeBaselineRef = useRef<number>(Infinity);
+  const lastInnerHeightRef = useRef<number>(0);
   useEffect(() => {
     const vv = window.visualViewport;
     const clear = () => {
@@ -2882,23 +2891,28 @@ export function App() {
       clear();
       return;
     }
-    const isEditable = (n: Element | null): boolean =>
-      !!n &&
-      (n.tagName === "INPUT" ||
-        n.tagName === "TEXTAREA" ||
-        (n as HTMLElement).isContentEditable);
     const sync = () => {
       // Keyboard height ≈ layout height − visual height. `innerHeight` is the
       // layout viewport (doesn't shrink for the keyboard on iOS); 120px clears
       // URL-bar jitter without missing a real keyboard (~250px+).
       //
-      // Height alone misfires inside plain browser tabs (Brave/Safari-tab bottom
-      // chrome shrinks the visual viewport by ~150–180px at rest), which pinned
-      // keyboardOpen=true and hid the tab bar. A real on-screen keyboard implies
-      // a focused editable element, so gate on focus — except the Terminal tab,
-      // whose canvas input may not surface an editable activeElement.
-      const kb = Math.max(0, window.innerHeight - vv.height);
-      const open = kb > 120 && (tab === "term" || isEditable(document.activeElement));
+      // Height alone misfires inside plain browser tabs: Brave/Safari-tab
+      // chrome shrinks the visual viewport ~150–180px AT REST, which pinned
+      // keyboardOpen=true and hid the tab bar. Focus-gating wasn't enough
+      // either — iOS keeps a field focused after the keyboard is dismissed.
+      // Self-calibrate instead: the smallest layout−visual delta seen this
+      // session is the chrome-only baseline (0 in the installed PWA); only a
+      // rise well above it (a real keyboard adds ~250px+) counts. Baseline
+      // resets when innerHeight jumps (rotation / window resize).
+      const delta = Math.max(0, window.innerHeight - vv.height);
+      if (Math.abs(window.innerHeight - lastInnerHeightRef.current) > 200) {
+        chromeBaselineRef.current = Infinity;
+      }
+      lastInnerHeightRef.current = window.innerHeight;
+      if (delta < chromeBaselineRef.current) chromeBaselineRef.current = delta;
+      const baseline = chromeBaselineRef.current === Infinity ? 0 : chromeBaselineRef.current;
+      const kb = Math.max(0, delta - baseline);
+      const open = kb > 150;
       const el = rootRef.current;
       const measuredHeight = `${Math.ceil(vv.height)}px`;
       document.documentElement.style.setProperty("--lfg-app-height", measuredHeight);
@@ -2929,8 +2943,8 @@ export function App() {
     sync();
     vv.addEventListener("resize", sync, { passive: true });
     vv.addEventListener("scroll", sync, { passive: true });
-    // Focus moves don't always fire a visualViewport resize; re-sync so the
-    // focus-gated keyboard flag flips promptly on focus/blur.
+    // Focus moves often accompany keyboard transitions without a reliable
+    // visualViewport resize event; re-measure on them so the flag flips fast.
     window.addEventListener("focusin", sync, { passive: true });
     window.addEventListener("focusout", sync, { passive: true });
     // Returning from the app switcher / backgrounding doesn't reliably fire a
@@ -3970,8 +3984,8 @@ export function App() {
             {tab === "live" || tab === "home" ? (
               <button
                 type="button"
-                onClick={() => setTab(tab === "home" ? "home" : "live")}
-                aria-label={tab === "home" ? "Home" : "Live"}
+                onClick={() => setTab(isMobile ? "home" : "live")}
+                aria-label={isMobile ? "Home" : "Live"}
                 aria-current="page"
                 className="flex items-center rounded-full px-1.5 transition-transform active:scale-[0.96]"
               >
