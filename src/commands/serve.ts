@@ -120,7 +120,7 @@ import { addManaged, patchManaged, removeManaged } from "../managed.ts";
 import { PtyBridge, termSessionName } from "../pty.ts";
 import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
-import { listDir, readRepoFile, gitGrep, writeRepoFile, gitCommitPaths, readRepoFileRaw } from "../files.ts";
+import { listDir, readRepoFile, gitGrep, writeRepoFile, gitCommitPaths, readRepoFileRaw, withRepoLock } from "../files.ts";
 import { vaultSummary, vaultItems, updateVaultDoc } from "../vault.ts";
 import type { ServerWebSocket } from "bun";
 import { appendCmd as appendAisdkCmd, removeEntry as removeAisdkEntry, readEntry as readAisdkEntry, findEntryByAnyId as findAisdkEntryByAnyId, isEntryBusy as isAisdkEntryBusy } from "../aisdk-registry.ts";
@@ -2523,11 +2523,15 @@ export async function cmdServe() {
           });
           let commit: string | null = null;
           if (body.commit !== false) {
-            commit = gitCommitPaths(
-              repo.cwd,
-              [body.path],
-              body.message || `mobile: ${result.created ? "create" : "update"} ${body.path}`,
-            );
+            // Hoisted: the guard's narrowing of body.path doesn't survive into
+            // the closure below.
+            const repoCwd = repo.cwd;
+            const relPath = body.path;
+            const message =
+              body.message || `mobile: ${result.created ? "create" : "update"} ${relPath}`;
+            // Under the repo sync lock so the commit can't race vault-sync.sh's
+            // rebase in this same checkout (orphaned-commit vector).
+            commit = await withRepoLock(repoCwd, () => gitCommitPaths(repoCwd, [relPath], message));
           }
           return json({ ...result, commit });
         } catch (e) {
@@ -2599,7 +2603,11 @@ export async function cmdServe() {
           let commit: string | null = null;
           if (body.commit !== false) {
             const what = Object.keys(body.updates).join(",");
-            commit = gitCommitPaths(repo.cwd, [body.path], body.message || `mobile: ${what} → ${body.path}`);
+            const repoCwd = repo.cwd;
+            const relPath = body.path;
+            const message = body.message || `mobile: ${what} → ${relPath}`;
+            // Same sync-lock rationale as /api/repos/write above.
+            commit = await withRepoLock(repoCwd, () => gitCommitPaths(repoCwd, [relPath], message));
           }
           return json({ path: result.path, commit });
         } catch (e) {

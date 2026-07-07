@@ -114,6 +114,47 @@ export async function writeRepoFile(
 }
 
 /**
+ * Run `fn` while holding the repo's sync lock (`.git/calyx-sync.lock`, kernel
+ * flock). vault-sync.sh holds the same lock around its fetch/rebase/push, so a
+ * mobile commit can never land mid-rebase and get orphaned when the rebase
+ * moves the branch — the one data-loss race that fires with NO conflict.
+ * Mechanism: a child `flock … sh` acquires the lock, prints "ok", then blocks
+ * on `read` until we close its stdin — releasing the lock (kernel-released
+ * even if we crash). On systems without flock(1) (macOS dev) or if acquisition
+ * times out (15s), we run without the lock rather than fail the save.
+ */
+export async function withRepoLock<T>(repoCwd: string, fn: () => T): Promise<T> {
+  type Holder = { stdout: ReadableStream<Uint8Array>; stdin: { end(): void }; kill(): void };
+  let holder: Holder | null = null;
+  try {
+    try {
+      holder = Bun.spawn(
+        ["flock", "-w", "15", join(repoCwd, ".git", "calyx-sync.lock"), "sh", "-c", "echo ok; read _"],
+        { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
+      ) as unknown as Holder;
+      const reader = holder.stdout.getReader();
+      const first = await reader.read();
+      reader.releaseLock();
+      if (!first.value || !new TextDecoder().decode(first.value).startsWith("ok")) {
+        holder.kill();
+        holder = null; // timed out or flock unhappy — proceed unlocked
+      }
+    } catch {
+      holder = null; // flock(1) missing (macOS dev) — proceed unlocked
+    }
+    return fn();
+  } finally {
+    if (holder) {
+      try {
+        holder.stdin.end();
+      } catch {
+        holder.kill();
+      }
+    }
+  }
+}
+
+/**
  * Stage and commit specific paths only (pathspec commit — never sweeps other
  * staged work in a shared checkout). Returns the short hash, or null when the
  * save was a no-op or the file is .gitignore'd (saved to disk, nothing to commit).
