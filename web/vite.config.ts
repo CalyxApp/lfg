@@ -12,6 +12,11 @@ const API_TARGET = process.env.LFG_API_TARGET ?? "http://localhost:8766";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  // Visible build identity (Settings → About + boot console line) so "which
+  // bundle is this device actually running" is never a guessing game again.
+  define: {
+    __BUILD_STAMP__: JSON.stringify(new Date().toISOString().replace("T", " ").slice(0, 16) + "Z"),
+  },
   // Emit source maps so the auto-fix agent can map a minified production stack
   // frame back to the original source in web/src. "hidden" keeps the .map files
   // out of the served bundle's sourceMappingURL (no end-user devtools exposure),

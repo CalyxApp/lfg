@@ -48,6 +48,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Folder,
+  House,
   GitFork,
   Loader2,
   MessageSquare,
@@ -100,7 +101,11 @@ import { ImageAnnotator } from "@/components/ImageAnnotator";
 import { SessionDiffBar } from "@/components/SessionDiffView";
 import { VaultView } from "@/components/VaultView";
 import { CaptureView } from "@/components/CaptureView";
+import { HomeView } from "@/components/HomeView";
 import { SearchView } from "@/components/SearchView";
+
+// Injected by Vite `define` at build time (see vite.config.ts).
+declare const __BUILD_STAMP__: string;
 import { Textarea } from "@/components/ui/textarea";
 import { Drawer, DrawerContent, DrawerTitle } from "@/components/ui/drawer";
 import {
@@ -2777,7 +2782,17 @@ export function App() {
   // Tabs are "live" | "settings" | "ask" | "term" | "browser". Auto agents and runtime
   // extension nav-tabs now render inside the Settings page rather than as their
   // own top-level tabs.
-  const [tab, setTab] = useState<string>("live");
+  // Mobile lands on the Home dashboard; desktop keeps the live feed as its
+  // default (it has no Home destination in the header). The hash restore below
+  // overrides either when a deep link / relaunch carries one.
+  const [tab, setTab] = useState<string>(() =>
+    typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches
+      ? "home"
+      : "live",
+  );
+  // Mobile: the inline chat composer sits behind the ＋ FAB instead of being
+  // open by default — the Live feed is for reading until you ask to compose.
+  const [composerOpen, setComposerOpen] = useState(false);
 
   // Phase-0 routing: reflect the active tab into location.hash (#/files) and
   // restore it on load, so PWA relaunches, reloads and shared links land on
@@ -3938,7 +3953,7 @@ export function App() {
   }
 
   const mainBottomPadding =
-    tab === "live" && !keyboardOpen
+    tab === "live" && composerOpen && !keyboardOpen
       ? "pb-[var(--lfg-above-orb)] md:pb-3"
       : "pb-3";
 
@@ -3952,11 +3967,11 @@ export function App() {
       <header className="z-40 flex shrink-0 items-center justify-between gap-2 px-3 pb-1 pt-[calc(0.5rem+env(safe-area-inset-top))]">
         <NavIsland className="shrink-0">
           <div className="flex h-11 items-center rounded-full bg-background/80 px-1.5 backdrop-blur-xl">
-            {tab === "live" ? (
+            {tab === "live" || tab === "home" ? (
               <button
                 type="button"
-                onClick={() => setTab("live")}
-                aria-label="Live"
+                onClick={() => setTab(tab === "home" ? "home" : "live")}
+                aria-label={tab === "home" ? "Home" : "Live"}
                 aria-current="page"
                 className="flex items-center rounded-full px-1.5 transition-transform active:scale-[0.96]"
               >
@@ -3968,7 +3983,9 @@ export function App() {
                 onClick={() =>
                   setTab(
                     tab === "settings" || tab === "ask" || tab === "files" || tab === "capture" || tab === "search"
-                      ? "live"
+                      ? isMobile
+                        ? "home"
+                        : "live"
                       : "settings",
                   )
                 }
@@ -3978,7 +3995,9 @@ export function App() {
                 <ChevronLeft className="size-[18px]" />
                 <span>
                   {tab === "settings" || tab === "ask" || tab === "files" || tab === "capture" || tab === "search"
-                    ? "Live"
+                    ? isMobile
+                      ? "Home"
+                      : "Live"
                     : "Settings"}
                 </span>
               </button>
@@ -4079,9 +4098,14 @@ export function App() {
             onRefresh={refreshSessions}
             onRemove={removeSession}
             onBrain={sendSessionToBrain}
-            onNew={() =>
-              isMobile ? setComposerFocusNonce((n) => n + 1) : setNewOpen(true)
-            }
+            onNew={() => {
+              if (isMobile) {
+                setComposerOpen(true);
+                setComposerFocusNonce((n) => n + 1);
+              } else {
+                setNewOpen(true);
+              }
+            }}
             findings={projectScopedFindings}
             autoAgents={projectScopedAutoAgents}
             onOpenFinding={setOpenFinding}
@@ -4140,6 +4164,17 @@ export function App() {
           <Suspense fallback={<div className="py-10 text-center text-sm text-muted-foreground">Loading browser profiles...</div>}>
             <BrowserProfiles />
           </Suspense>
+        ) : tab === "home" ? (
+          <HomeView
+            repos={repos}
+            sessions={liveSessions}
+            onOpen={setTab}
+            onNewChat={() => {
+              setTab("live");
+              setComposerOpen(true);
+              setComposerFocusNonce((n) => n + 1);
+            }}
+          />
         ) : tab === "files" ? (
           <VaultView repos={repos} />
         ) : tab === "capture" ? (
@@ -4173,10 +4208,25 @@ export function App() {
 
       {!callOpen ? (
         <>
-          {isMobile && tab === "live" ? (
-            // Mobile home screen: the create flow lives inline, anchored at the
-            // bottom (same component as the desktop drawer, `variant="inline"`).
-            // The orb has moved up into the top nav island.
+          {isMobile && tab === "live" && !composerOpen ? (
+            // Composer lives behind the ＋ FAB now — the Live feed is for
+            // reading; composing is an explicit act (Sam's call, 2026-07-07).
+            <button
+              type="button"
+              onClick={() => {
+                setComposerOpen(true);
+                setComposerFocusNonce((n) => n + 1);
+              }}
+              aria-label="New session"
+              className="fixed bottom-[calc(env(safe-area-inset-bottom)+5.4rem)] right-4 z-40 flex size-14 items-center justify-center rounded-full bg-primary text-white shadow-[0_10px_30px_rgba(0,0,0,0.28)] transition-transform active:scale-[0.92]"
+            >
+              <Plus className="size-7" />
+            </button>
+          ) : null}
+          {isMobile && tab === "live" && composerOpen ? (
+            // Mobile compose surface: the create flow lives inline, anchored at
+            // the bottom (same component as the desktop drawer,
+            // `variant="inline"`). The orb has moved up into the top nav island.
             <NewSessionDialog
               variant="inline"
               open
@@ -4194,7 +4244,10 @@ export function App() {
               defaultUser={
                 userFilter !== "__all" && userFilter !== "__unassigned" ? userFilter : ""
               }
-              onClose={() => setComposerExpanded(false)}
+              onClose={() => {
+                setComposerExpanded(false);
+                setComposerOpen(false);
+              }}
               onCreated={async (result) => {
                 const launchId = result?.launchId;
                 await refreshSessions(launchId ? { retireLaunchId: launchId } : undefined);
@@ -4602,6 +4655,7 @@ function NavIsland({
 // Tabs the hash router will restore on load (extension tabs are dynamic and
 // excluded on purpose — they may not be registered yet at first paint).
 const ROUTABLE_TABS = new Set([
+  "home",
   "live",
   "auto",
   "brain",
@@ -4637,15 +4691,15 @@ const AGENT_FAMILY_TABS = new Set([
 // stack above it, nothing can hide beneath it.
 function TabBar({ tab, onSelect }: { tab: string; onSelect: (tab: string) => void }) {
   const items = [
+    { id: "home", label: "Home", icon: House, active: tab === "home" || tab === "files" },
     { id: "live", label: "Agents", icon: Bot, active: AGENT_FAMILY_TABS.has(tab) },
-    { id: "files", label: "Files", icon: Folder, active: tab === "files" },
     { id: "capture", label: "Capture", icon: Plus, active: tab === "capture" },
     { id: "search", label: "Search", icon: Search, active: tab === "search" },
     {
       id: "settings",
       label: "Settings",
       icon: Settings,
-      active: !AGENT_FAMILY_TABS.has(tab) && !["files", "capture", "search"].includes(tab),
+      active: !AGENT_FAMILY_TABS.has(tab) && !["home", "files", "capture", "search"].includes(tab),
     },
   ];
   return (
@@ -12580,6 +12634,9 @@ function SettingsView({
             </div>
             <ChevronRight className="size-4 text-muted-foreground/60" />
           </button>
+          <div className="border-t border-border px-4 py-2.5 text-[11px] text-muted-foreground/70">
+            Build {__BUILD_STAMP__}
+          </div>
         </div>
       </section>
     </div>
