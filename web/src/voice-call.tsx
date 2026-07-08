@@ -18,6 +18,7 @@ import {
   ChevronDown,
 } from "lucide-react";
 import { lazyWithReload } from "./lib/lazy-with-reload";
+import { startElevenVoice, type ElevenHandle } from "./eleven-voice";
 
 // ───────────────────────────────────────────────────────────────────────────
 // VoiceCall — "phone call mode" for the voice orb. A focused, fullscreen call
@@ -132,6 +133,7 @@ export function VoiceCall({
   const [collapsed, setCollapsed] = useState(false);
 
   const roomRef = useRef<Room | null>(null);
+  const elevenRef = useRef<ElevenHandle | null>(null);
   const audioElsRef = useRef<HTMLAudioElement[]>([]);
   const hintTimer = useRef<number | null>(null);
   const dimTimer = useRef<number | null>(null);
@@ -153,6 +155,13 @@ export function VoiceCall({
   }, []);
 
   const disconnect = useCallback(async () => {
+    const eleven = elevenRef.current;
+    elevenRef.current = null;
+    if (eleven) {
+      try {
+        await eleven.endSession();
+      } catch {}
+    }
     const room = roomRef.current;
     roomRef.current = null;
     for (const el of audioElsRef.current) {
@@ -183,6 +192,51 @@ export function VoiceCall({
       setAgentState("thinking");
       try {
         const res = await fetch("/api/livekit/token");
+        // 503 = "livekit not configured": this deployment has no self-hosted
+        // LiveKit worker (Tier C was skipped). Fall back to the ElevenLabs
+        // managed agent (Option B) — same brain via the custom-LLM endpoint —
+        // mapped onto the same call UI. LiveKit installs are untouched.
+        if (res.status === 503) {
+          const handle = await startElevenVoice({
+            onStatus: (s) => {
+              if (s === "connected") {
+                setStatus("connected");
+                setAgentState((a) => a ?? "listening");
+              } else if (s === "idle") {
+                // Remote hangup / session ended → close the call screen.
+                if (elevenRef.current) {
+                  elevenRef.current = null;
+                  onClose();
+                }
+              } else if (s === "error") {
+                flash("Couldn't connect");
+              }
+            },
+            // No lk.agent.state in this mode: a finalized user turn means the
+            // brain is computing until the agent starts speaking.
+            onUserTranscript: (t) => {
+              if (t) {
+                setUserText(t);
+                setUserFinal(true);
+                setAgentState("thinking");
+              }
+            },
+            onMode: (m) =>
+              setAgentState(m === "speaking" ? "talking" : "listening"),
+            onAgentReply: (t) => {
+              if (t) flash(t);
+            },
+            onError: () => flash("Voice error"),
+          });
+          if (cancelled) {
+            try {
+              await handle.endSession();
+            } catch {}
+            return;
+          }
+          elevenRef.current = handle;
+          return;
+        }
         if (!res.ok) throw new Error(`token ${res.status}`);
         const { url, token } = (await res.json()) as {
           url: string;
@@ -392,9 +446,19 @@ export function VoiceCall({
   );
 
   const toggleMute = useCallback(async () => {
+    const next = !muted;
+    const eleven = elevenRef.current;
+    if (eleven) {
+      try {
+        eleven.setMicMuted(next);
+        setMuted(next);
+      } catch {
+        flash("Couldn't change the mic");
+      }
+      return;
+    }
     const room = roomRef.current;
     if (!room) return;
-    const next = !muted;
     try {
       await room.localParticipant.setMicrophoneEnabled(!next);
       setMuted(next);
