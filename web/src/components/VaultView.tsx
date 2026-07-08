@@ -1,10 +1,11 @@
 // VaultView — the Files tab shell: repo picker → segmented Files / Tasks /
 // Projects panes. Tasks & Projects appear only when the repo carries Calyx
 // frontmatter (type: task / project) — same semantics as desktop Calyx (the
-// server scan is a port of Calyx's CLI scanner). Task status flips are
-// optimistic and byte-preserving server-side.
+// server scan is a port of Calyx's CLI scanner). Task status updates are
+// optimistic and byte-preserving server-side; the status icon opens a 5-state
+// picker (todo / in-progress / needs-review / done / cancelled).
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronRight,
   Circle,
@@ -15,6 +16,7 @@ import {
   FolderGit2,
   KanbanSquare,
   Loader2,
+  Plus,
   RefreshCw,
   X,
 } from "lucide-react";
@@ -22,6 +24,7 @@ import { getJson, postJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { EmptyState } from "./ui/empty-state";
 import { FilesView } from "./FilesView";
+import { CreateTaskDrawer } from "./CreateTaskDrawer";
 
 type Repo = { name: string; project?: string; custom?: boolean };
 type VaultSummary = { isVault: boolean; counts: Record<string, number>; truncated: boolean };
@@ -89,6 +92,7 @@ export function VaultView({
   const [error, setError] = useState<string | null>(null);
   const [openPath, setOpenPath] = useState<string | null>(null);
   const [projectFilter, setProjectFilter] = useState<string | null>(null);
+  const [showCreateTask, setShowCreateTask] = useState(false);
 
   // Cross-tab deep link (a Search result): select the repo, land on the Files
   // pane with the file open, then consume the link so later visits to the tab
@@ -144,9 +148,8 @@ export function VaultView({
     }
   }, [pane, tasks, loadingItems, loadItems]);
 
-  async function flipStatus(item: VaultItem) {
+  async function setStatus(item: VaultItem, next: string) {
     if (!repo) return;
-    const next = item.status === "done" ? "todo" : "done";
     const prev = item.status;
     setTasks((ts) => ts?.map((t) => (t.path === item.path ? { ...t, status: next } : t)) ?? null);
     try {
@@ -248,18 +251,29 @@ export function VaultView({
           onExitRepo={() => setRepo(null)}
         />
       ) : pane === "tasks" ? (
-        <TasksPane
-          tasks={tasks}
-          loading={loadingItems}
-          projectFilter={projectFilter}
-          onClearFilter={() => setProjectFilter(null)}
-          onRefresh={loadItems}
-          onFlip={flipStatus}
-          onOpen={(p) => {
-            setOpenPath(p);
-            setPane("files");
-          }}
-        />
+        <>
+          <TasksPane
+            tasks={tasks}
+            loading={loadingItems}
+            projectFilter={projectFilter}
+            onClearFilter={() => setProjectFilter(null)}
+            onRefresh={loadItems}
+            onSetStatus={setStatus}
+            onCreateTask={() => setShowCreateTask(true)}
+            onOpen={(p) => {
+              setOpenPath(p);
+              setPane("files");
+            }}
+          />
+          {repo ? (
+            <CreateTaskDrawer
+              open={showCreateTask}
+              repo={repo}
+              onClose={() => setShowCreateTask(false)}
+              onCreated={() => { setShowCreateTask(false); void loadItems(); }}
+            />
+          ) : null}
+        </>
       ) : (
         <ProjectsPane
           projects={projects}
@@ -286,7 +300,8 @@ function TasksPane({
   projectFilter,
   onClearFilter,
   onRefresh,
-  onFlip,
+  onSetStatus,
+  onCreateTask,
   onOpen,
 }: {
   tasks: VaultItem[] | null;
@@ -294,7 +309,8 @@ function TasksPane({
   projectFilter: string | null;
   onClearFilter: () => void;
   onRefresh: () => void;
-  onFlip: (item: VaultItem) => void;
+  onSetStatus: (item: VaultItem, next: string) => void;
+  onCreateTask: () => void;
   onOpen: (path: string) => void;
 }) {
   const [showClosed, setShowClosed] = useState(false);
@@ -348,14 +364,24 @@ function TasksPane({
             </button>
           ) : null}
         </div>
-        <button
-          type="button"
-          onClick={onRefresh}
-          aria-label="Refresh"
-          className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
-        >
-          <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={onCreateTask}
+            aria-label="New task"
+            className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+          >
+            <Plus className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={onRefresh}
+            aria-label="Refresh"
+            className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+          >
+            <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
+          </button>
+        </div>
       </div>
 
       {open.length === 0 && closed.length === 0 ? (
@@ -368,7 +394,7 @@ function TasksPane({
         <>
           <div className="overflow-hidden rounded-2xl border border-border bg-card/40 divide-y divide-border">
             {open.map((t) => (
-              <TaskRow key={t.path} item={t} today={today} onFlip={onFlip} onOpen={onOpen} />
+              <TaskRow key={t.path} item={t} today={today} onSetStatus={onSetStatus} onOpen={onOpen} />
             ))}
             {open.length === 0 ? (
               <div className="px-4 py-6 text-center text-sm text-muted-foreground">
@@ -388,7 +414,7 @@ function TasksPane({
           {showClosed && closed.length ? (
             <div className="overflow-hidden rounded-2xl border border-border bg-card/40 divide-y divide-border opacity-70">
               {closed.map((t) => (
-                <TaskRow key={t.path} item={t} today={today} onFlip={onFlip} onOpen={onOpen} />
+                <TaskRow key={t.path} item={t} today={today} onSetStatus={onSetStatus} onOpen={onOpen} />
               ))}
             </div>
           ) : null}
@@ -398,29 +424,71 @@ function TasksPane({
   );
 }
 
+const ALL_STATUSES = ["todo", "in-progress", "needs-review", "done", "cancelled"] as const;
+
 function TaskRow({
   item,
   today,
-  onFlip,
+  onSetStatus,
   onOpen,
 }: {
   item: VaultItem;
   today: string;
-  onFlip: (item: VaultItem) => void;
+  onSetStatus: (item: VaultItem, next: string) => void;
   onOpen: (path: string) => void;
 }) {
+  const [picking, setPicking] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
   const due = item.due ? dueLabel(item.due, today) : null;
   const closed = CLOSED_STATUSES.has(item.status ?? "");
+
+  // Close picker on outside click.
+  useEffect(() => {
+    if (!picking) return;
+    function handleClick(e: MouseEvent) {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setPicking(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [picking]);
+
   return (
     <div className="flex items-center gap-1 pr-2">
-      <button
-        type="button"
-        onClick={() => onFlip(item)}
-        aria-label={closed ? "Reopen" : "Mark done"}
-        className="flex size-11 shrink-0 items-center justify-center rounded-full transition-transform active:scale-[0.88]"
-      >
-        {statusIcon(item.status, "size-[22px]")}
-      </button>
+      <div ref={pickerRef} className="relative shrink-0">
+        <button
+          type="button"
+          onClick={() => setPicking((p) => !p)}
+          aria-label="Set status"
+          className="flex size-11 items-center justify-center rounded-full transition-transform active:scale-[0.88]"
+        >
+          {statusIcon(item.status, "size-[22px]")}
+        </button>
+        {picking ? (
+          <div className="absolute left-0 top-full z-20 mt-1 flex items-center gap-0.5 rounded-2xl border border-border bg-background/95 p-1.5 shadow-lg backdrop-blur-sm">
+            {ALL_STATUSES.map((s) => (
+              <button
+                key={s}
+                type="button"
+                aria-label={s}
+                onClick={() => {
+                  setPicking(false);
+                  if (s !== item.status) onSetStatus(item, s);
+                }}
+                className={cn(
+                  "flex size-9 items-center justify-center rounded-xl transition-colors",
+                  s === item.status
+                    ? "bg-foreground/[0.08]"
+                    : "hover:bg-foreground/[0.05] active:bg-foreground/[0.10]",
+                )}
+              >
+                {statusIcon(s, "size-5")}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
       <button
         type="button"
         onClick={() => onOpen(item.path)}
