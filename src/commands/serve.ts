@@ -122,6 +122,55 @@ import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
 import { listDir, readRepoFile, gitGrep, writeRepoFile, gitCommitPaths, readRepoFileRaw, withRepoLock } from "../files.ts";
 import { vaultSummary, vaultItems, updateVaultDoc } from "../vault.ts";
+
+// ── Calyx content factory (runtime-import from sibling clone) ─────────────────
+// Uses the compiled .js from the sibling mdEditorTestExtenstionVscode clone on
+// the droplet — same code as the desktop CLI, zero vendoring, no npm install.
+// Override via CALYX_CLI_PATH env var (useful in local dev). Falls back
+// gracefully: /api/vault/create-task returns 503 if the import fails.
+
+const CALYX_FACTORY_PATH =
+  (process.env.CALYX_CLI_PATH
+    ? `${process.env.CALYX_CLI_PATH}/contentFactory.js`
+    : null) ??
+  "/home/openclaw/repos/mdEditorTestExtenstionVscode/cli/src/lib/contentFactory.js";
+
+type CreatePayload = {
+  contentType: "task";
+  title: string;
+  status: string;
+  priority: string;
+  due?: string;
+};
+
+type CreateResult = {
+  absolutePath: string;
+  relativePath: string;
+  contentType: string;
+  slug: string;
+  properties: Record<string, unknown>;
+};
+
+type CreateContentFn = (
+  payload: CreatePayload,
+  vaultRoot: string,
+  layout: { tasksFolder: string },
+) => CreateResult;
+
+let _createContent: CreateContentFn | null | undefined = undefined; // undefined = not yet tried
+
+async function getCreateContent(): Promise<CreateContentFn | null> {
+  if (_createContent !== undefined) return _createContent;
+  try {
+    const mod = await import(CALYX_FACTORY_PATH);
+    _createContent = (mod.createContent ?? mod.default?.createContent) as CreateContentFn | null;
+    if (!_createContent) console.error("[vault/create-task] contentFactory loaded but createContent missing");
+  } catch (e) {
+    console.error("[vault/create-task] failed to load contentFactory from", CALYX_FACTORY_PATH, e);
+    _createContent = null;
+  }
+  return _createContent;
+}
 import type { ServerWebSocket } from "bun";
 import { appendCmd as appendAisdkCmd, removeEntry as removeAisdkEntry, readEntry as readAisdkEntry, findEntryByAnyId as findAisdkEntryByAnyId, isEntryBusy as isAisdkEntryBusy } from "../aisdk-registry.ts";
 import { markClosed } from "../closing.ts";
@@ -2620,6 +2669,51 @@ export async function cmdServe() {
             return { result, commit: gitCommitPaths(repoCwd, [relPath], message) };
           });
           return json({ path: result.path, commit });
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
+        }
+      }
+
+      // Create a new Calyx task file via the shared contentFactory (Calyx CLI
+      // shared core). Writes to `tasks/<slug>/index.md`, locks, commits.
+      if (path === "/api/vault/create-task" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          repo?: string;
+          title?: string;
+          status?: string;
+          priority?: string;
+          due?: string;
+        } | null;
+        if (!body?.repo || !body.title?.trim()) {
+          return err(400, "repo and title are required");
+        }
+        const repo = (await listRepos()).find((r) => r.name === body.repo);
+        if (!repo) return err(404, "repo not found");
+
+        const createContent = await getCreateContent();
+        if (!createContent) {
+          return err(503, "createContent not available — check CALYX_CLI_PATH on server");
+        }
+
+        try {
+          const payload: CreatePayload = {
+            contentType: "task",
+            title: body.title.trim(),
+            status: body.status ?? "todo",
+            priority: body.priority ?? "normal",
+            ...(body.due ? { due: body.due } : {}),
+          };
+          const layout = { tasksFolder: "tasks" };
+          const { result, commit } = await withRepoLock(repo.cwd, () => {
+            const result = createContent(payload, repo.cwd, layout);
+            const commit = gitCommitPaths(
+              repo.cwd,
+              [result.relativePath],
+              `mobile: create task — ${payload.title}`,
+            );
+            return { result, commit };
+          });
+          return json({ path: result.relativePath, slug: result.slug, commit });
         } catch (e) {
           return err(400, e instanceof Error ? e.message : String(e));
         }
