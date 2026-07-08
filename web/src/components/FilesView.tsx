@@ -24,6 +24,14 @@ import { cn } from "@/lib/utils";
 import { EmptyState } from "./ui/empty-state";
 import { Input } from "./ui/input";
 import { Textarea } from "./ui/textarea";
+import {
+  Drawer,
+  DrawerClose,
+  DrawerContent,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+} from "./ui/drawer";
 
 type TreeEntry = { name: string; path: string; type: "dir" | "file" };
 type FileResult = {
@@ -369,7 +377,14 @@ export function FilesView({
             description={`${(file.size / 1_000_000).toFixed(1)} MB — too big to preview on mobile.`}
           />
         ) : isMd ? (
-          <MarkdownDoc source={file.content ?? ""} />
+          <MarkdownDoc
+            source={file.content ?? ""}
+            editProps={{
+              repo,
+              filePath: file.path,
+              onSaved: (newSource) => setFile({ ...file, content: newSource, size: newSource.length }),
+            }}
+          />
         ) : (
           <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-border bg-card/40 px-4 py-3 font-mono text-xs leading-relaxed">
             {file.content}
@@ -414,24 +429,158 @@ export function FilesView({
   );
 }
 
-/** Rendered markdown: frontmatter as subtle chips, body through Streamdown. */
-function MarkdownDoc({ source }: { source: string }) {
+type EditableField = "due" | "priority" | "project";
+const EDITABLE_FIELDS = new Set<string>(["due", "priority", "project"]);
+const PRIORITIES = ["low", "normal", "high"];
+
+interface MarkdownDocEditProps {
+  repo: string;
+  filePath: string;
+  onSaved: (newSource: string) => void;
+}
+
+/** Rendered markdown: frontmatter as chips; due/priority/project chips are tappable. */
+function MarkdownDoc({ source, editProps }: { source: string; editProps?: MarkdownDocEditProps }) {
   const { fm, body } = splitFrontmatter(source);
+  const [editingField, setEditingField] = useState<EditableField | null>(null);
+  const [fieldValue, setFieldValue] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function openEdit(k: EditableField, current: string) {
+    setFieldValue(current);
+    setError(null);
+    setEditingField(k);
+  }
+
+  async function saveField() {
+    if (!editProps || !editingField || saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const resp = await postJson<{ path: string; commit: string | null }>("/api/vault/update", {
+        repo: editProps.repo,
+        path: editProps.filePath,
+        updates: { [editingField]: fieldValue.trim() || null },
+      });
+      // Reload the file to get the updated frontmatter.
+      const fresh = await fetch(
+        `/api/repos/file?repo=${encodeURIComponent(editProps.repo)}&path=${encodeURIComponent(editProps.filePath)}`,
+      ).then((r) => r.json() as Promise<{ content?: string }>);
+      if (fresh.content != null) editProps.onSaved(fresh.content);
+      setEditingField(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const editingLabel =
+    editingField === "due" ? "Due date" :
+    editingField === "priority" ? "Priority" :
+    editingField === "project" ? "Project" : "";
+
   return (
     <div className="flex flex-col gap-3">
       {fm.length ? (
         <div className="flex flex-wrap gap-1.5 px-1">
-          {fm.map(([k, v]) => (
-            <span
-              key={k}
-              className="inline-flex max-w-full items-center gap-1 rounded-full bg-secondary px-2.5 py-1 text-[11px] font-medium text-muted-foreground"
-            >
-              <span className="opacity-70">{k}</span>
-              <span className="truncate text-foreground/80">{v}</span>
-            </span>
-          ))}
+          {fm.map(([k, v]) => {
+            const editable = editProps && EDITABLE_FIELDS.has(k);
+            if (editable) {
+              return (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => openEdit(k as EditableField, v)}
+                  className="inline-flex max-w-full items-center gap-1 rounded-full bg-secondary px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-secondary/70 active:scale-[0.96]"
+                >
+                  <span className="opacity-70">{k}</span>
+                  <span className="truncate text-foreground/80">{v}</span>
+                  <Pencil className="size-2.5 shrink-0 opacity-50" />
+                </button>
+              );
+            }
+            return (
+              <span
+                key={k}
+                className="inline-flex max-w-full items-center gap-1 rounded-full bg-secondary px-2.5 py-1 text-[11px] font-medium text-muted-foreground"
+              >
+                <span className="opacity-70">{k}</span>
+                <span className="truncate text-foreground/80">{v}</span>
+              </span>
+            );
+          })}
         </div>
       ) : null}
+
+      {/* Property edit drawer */}
+      <Drawer open={!!editingField} onOpenChange={(open) => { if (!open) setEditingField(null); }}>
+        <DrawerContent>
+          <DrawerHeader>
+            <DrawerTitle>{editingLabel}</DrawerTitle>
+          </DrawerHeader>
+          <div className="flex flex-col gap-3 px-4 pb-2">
+            {editingField === "priority" ? (
+              <div className="flex gap-2">
+                {PRIORITIES.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setFieldValue(p)}
+                    className={cn(
+                      "flex-1 rounded-xl py-2.5 text-[13px] font-medium capitalize transition-colors",
+                      fieldValue === p
+                        ? "bg-primary text-white"
+                        : "bg-secondary text-muted-foreground hover:bg-secondary/70",
+                    )}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+            ) : editingField === "due" ? (
+              <Input
+                type="date"
+                value={fieldValue}
+                onChange={(e) => setFieldValue(e.target.value)}
+                className="text-[15px]"
+              />
+            ) : (
+              <Input
+                value={fieldValue}
+                onChange={(e) => setFieldValue(e.target.value)}
+                placeholder="Project name…"
+                className="text-[15px]"
+                autoFocus
+              />
+            )}
+            {error ? (
+              <p className="text-sm text-destructive">{error}</p>
+            ) : null}
+          </div>
+          <DrawerFooter>
+            <button
+              type="button"
+              onClick={() => void saveField()}
+              disabled={saving}
+              className="flex h-11 items-center justify-center gap-2 rounded-2xl bg-primary text-[15px] font-semibold text-white disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="size-4 animate-spin" /> : null}
+              Save
+            </button>
+            <DrawerClose asChild>
+              <button
+                type="button"
+                className="flex h-11 items-center justify-center rounded-2xl bg-secondary text-[15px] font-medium text-muted-foreground"
+              >
+                Cancel
+              </button>
+            </DrawerClose>
+          </DrawerFooter>
+        </DrawerContent>
+      </Drawer>
+
       <article className="markdown rounded-2xl border border-border bg-card/40 px-4 py-4 text-[15px] leading-relaxed [&_pre]:overflow-x-auto">
         <Streamdown>{body}</Streamdown>
       </article>
