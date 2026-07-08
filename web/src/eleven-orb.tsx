@@ -37,6 +37,29 @@ export function Orb({
   getOutputVolume,
   className,
 }: OrbProps) {
+  // Creating a WebGL context can fail outright: headless/preview browsers (the
+  // `__live` screenshot view runs in HeadlessChrome with no GPU), GPU-blocklisted
+  // configs, or a page that has exhausted the browser's live-context budget.
+  // THREE's WebGLRenderer *throws* "Error creating WebGL context." in that case,
+  // and because R3F builds the renderer asynchronously the throw surfaces as an
+  // unhandledrejection that escapes the DOM-tree OrbBoundary entirely (error
+  // boundaries only catch render-phase throws — same escape route documented on
+  // useNoiseTexture below). So we probe support up front and render a static
+  // gradient stand-in rather than ever mounting a Canvas that would crash.
+  if (!isWebGLAvailable()) {
+    return (
+      <div className={className ?? "relative h-full w-full"}>
+        <div
+          className="h-full w-full rounded-full"
+          style={{
+            background: `conic-gradient(from 0deg, ${colors[0]}, ${colors[1]}, ${colors[0]})`,
+            filter: "blur(12px)",
+            opacity: 0.7,
+          }}
+        />
+      </div>
+    )
+  }
   return (
     <div className={className ?? "relative h-full w-full"}>
       <Canvas
@@ -286,6 +309,32 @@ function splitmix32(a: number) {
 function clamp01(n: number) {
   if (!Number.isFinite(n)) return 0
   return Math.min(1, Math.max(0, n))
+}
+
+// Probe once whether the browser can actually give us a WebGL context. Cached
+// because the answer can't change within a page's lifetime and creating probe
+// contexts isn't free. We release the probe context immediately so it doesn't
+// consume one of the browser's limited context slots. Any throw (some engines
+// throw rather than return null) counts as "unavailable".
+let webglSupport: boolean | null = null
+function isWebGLAvailable(): boolean {
+  if (webglSupport !== null) return webglSupport
+  if (typeof document === "undefined") return (webglSupport = false)
+  try {
+    const canvas = document.createElement("canvas")
+    const gl = (canvas.getContext("webgl2") ||
+      canvas.getContext("webgl") ||
+      canvas.getContext("experimental-webgl")) as WebGLRenderingContext | null
+    if (gl) {
+      gl.getExtension("WEBGL_lose_context")?.loseContext()
+      webglSupport = true
+    } else {
+      webglSupport = false
+    }
+  } catch {
+    webglSupport = false
+  }
+  return webglSupport
 }
 
 // A small procedurally-generated grayscale noise texture used both as the
