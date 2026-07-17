@@ -135,13 +135,23 @@ const CALYX_FACTORY_PATH =
     : null) ??
   "/home/openclaw/repos/mdEditorTestExtenstionVscode/cli/src/lib/contentFactory.js";
 
-type CreatePayload = {
-  contentType: "task";
-  title: string;
-  status: string;
-  priority: string;
-  due?: string;
-};
+type CreatePayload =
+  | {
+      contentType: "task";
+      title: string;
+      status: string;
+      priority: string;
+      due?: string;
+    }
+  | {
+      // Converse saves conversations as a custom content type (ai-voice-conversation).
+      contentType: "custom";
+      type: string;
+      title: string;
+      content?: string;
+      tags?: string[];
+      extraProperties?: Record<string, unknown>;
+    };
 
 type CreateResult = {
   absolutePath: string;
@@ -154,7 +164,7 @@ type CreateResult = {
 type CreateContentFn = (
   payload: CreatePayload,
   vaultRoot: string,
-  layout: { tasksFolder: string },
+  layout: { tasksFolder: string; projectsFolder?: string; typeFolders?: Record<string, string> },
 ) => CreateResult;
 
 let _createContent: CreateContentFn | null | undefined = undefined; // undefined = not yet tried
@@ -1591,6 +1601,49 @@ export async function cmdServe() {
             : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
           if (!repo) return err(404, "no repo available for tool call");
           return runRtTool(m[1], repo.cwd, body?.args ?? {});
+        }
+      }
+
+      // Persist a finished Converse session as an `ai-voice-conversation` note in
+      // the workspace vault (frontmatter properties + transcript body), committed.
+      if (path === "/api/voice/rt/save-conversation" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          title?: string;
+          transcript?: string;
+          tags?: string[];
+          properties?: Record<string, unknown>;
+          repo?: string;
+        } | null;
+        if (!body?.title?.trim() || !body.transcript) return err(400, "title and transcript are required");
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo = body.repo
+          ? repos.find((r) => r.name === body.repo)
+          : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        if (!repo) return err(404, "no repo available");
+        const createContent = await getCreateContent();
+        if (!createContent) return err(503, "createContent not available — check CALYX_CLI_PATH on server");
+        const noteTitle = body.title.trim();
+        try {
+          const { result, commit } = await withRepoLock(repo.cwd, () => {
+            const result = createContent(
+              {
+                contentType: "custom",
+                type: "ai-voice-conversation",
+                title: noteTitle,
+                content: body.transcript!,
+                tags: Array.isArray(body.tags) ? body.tags : [],
+                extraProperties: body.properties ?? {},
+              },
+              repo.cwd,
+              { tasksFolder: "tasks" },
+            );
+            const commit = gitCommitPaths(repo.cwd, [result.relativePath], `converse: conversation — ${noteTitle}`);
+            return { result, commit };
+          });
+          return json({ ok: true, path: result.relativePath, slug: result.slug, commit });
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
         }
       }
 
