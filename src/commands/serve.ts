@@ -306,6 +306,7 @@ import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
+import { handleRtToken, runRtTool } from "../voice-rt.ts";
 
 const PORT = Number(process.env.LFG_PORT ?? process.env.PORT ?? 8766);
 // Bind to loopback by default — the UI is meant to be reached over Tailscale
@@ -1564,6 +1565,27 @@ export async function cmdServe() {
       // the ElevenLabs API key server-side).
       if (path === "/api/voice/eleven-token" && req.method === "GET") {
         return handleElevenToken(req);
+      }
+
+      // ---- Converse (OpenAI gpt-realtime): a SEPARATE realtime voice interface,
+      // additive to the ElevenLabs cascade above (shares only the tool backend).
+      // The browser holds WebRTC directly to OpenAI; these two routes just mint
+      // the ephemeral token and run the relayed tool calls. See voice-rt.ts.
+      if (path === "/api/voice/rt/token" && req.method === "POST") {
+        return handleRtToken(req);
+      }
+      {
+        const m = path.match(/^\/api\/voice\/rt\/tools\/([a-z0-9_]+)$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            repo?: string;
+            args?: Record<string, unknown>;
+          } | null;
+          const repos = await listRepos();
+          const repo = body?.repo ? repos.find((r) => r.name === body.repo) : repos[0];
+          if (!repo) return err(404, "no repo available for tool call");
+          return runRtTool(m[1], repo.cwd, body?.args ?? {});
+        }
       }
 
       // ---- voice TTS proxy: synthesize via the configured cloud provider

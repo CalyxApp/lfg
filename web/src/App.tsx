@@ -95,6 +95,11 @@ const TermView = lazyWithReload("TermView", () =>
 const VoiceCall = lazyWithReload("VoiceCall", () =>
   import("./voice-call").then((m) => ({ default: m.VoiceCall })),
 );
+// Converse — a SEPARATE realtime voice interface (OpenAI gpt-realtime), additive
+// to VoiceCall above. Own overlay, own state; shares only the server tool backend.
+const Converse = lazyWithReload("Converse", () =>
+  import("./converse").then((m) => ({ default: m.Converse })),
+);
 const BrowserProfiles = lazyWithReload("BrowserProfiles", () => import("./BrowserProfiles"));
 import { Badge } from "@/components/ui/badge";
 import { ImageAnnotator } from "@/components/ImageAnnotator";
@@ -1916,6 +1921,7 @@ export function App() {
   const [composerFocusNonce, setComposerFocusNonce] = useState(0);
   const [notepadOpen, setNotepadOpen] = useState(false);
   const [callOpen, setCallOpen] = useState(false);
+  const [converseOpen, setConverseOpen] = useState(false);
   const [runLog, setRunLog] = useState<string | null>(null);
   // Auto agents
   // Tabs are "live" | "settings" | "ask" | "term" | "browser". Auto agents and runtime
@@ -3189,6 +3195,25 @@ export function App() {
                 onOpenCall={() => setCallOpen(true)}
               />
             ) : null}
+            {!converseOpen ? (
+              <button
+                type="button"
+                onClick={() => setConverseOpen(true)}
+                title="Converse — realtime voice (OpenAI)"
+                aria-label="Open Converse"
+                style={{
+                  width: 34,
+                  height: 34,
+                  borderRadius: 999,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontSize: 16,
+                }}
+              >
+                💬
+              </button>
+            ) : null}
             <AskNavButton active={tab === "ask"} onOpen={() => setTab("ask")} />
             {!isMobile ? (
               <>
@@ -3439,6 +3464,12 @@ export function App() {
             onClose={() => setCallOpen(false)}
             onCompose={() => setNewOpen(true)}
           />
+        </Suspense>
+      ) : null}
+
+      {converseOpen ? (
+        <Suspense fallback={null}>
+          <Converse onClose={() => setConverseOpen(false)} />
         </Suspense>
       ) : null}
 
