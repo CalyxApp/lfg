@@ -1582,7 +1582,13 @@ export async function cmdServe() {
             args?: Record<string, unknown>;
           } | null;
           const repos = await listRepos();
-          const repo = body?.repo ? repos.find((r) => r.name === body.repo) : repos[0];
+          // Converse is scoped to a SINGLE workspace (default PlatosRaveCave) — other
+          // lfg surfaces stay multi-repo, but voice notes/search all land in the one
+          // vault. Overridable via CONVERSE_WORKSPACE; explicit body.repo still wins.
+          const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+          const repo = body?.repo
+            ? repos.find((r) => r.name === body.repo)
+            : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
           if (!repo) return err(404, "no repo available for tool call");
           return runRtTool(m[1], repo.cwd, body?.args ?? {});
         }

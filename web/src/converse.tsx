@@ -214,8 +214,10 @@ const overlay: React.CSSProperties = {
 const card: React.CSSProperties = {
   width: "min(480px, 92vw)",
   maxHeight: "80vh",
-  background: "var(--card, #1b1b1f)",
-  color: "var(--fg, #f5f5f7)",
+  // Hardcoded, self-contained dark card — do NOT use app CSS vars here; they
+  // resolved to near-white text on a white card in the PWA theme (unreadable).
+  background: "#1c1c1e",
+  color: "#f2f2f7",
   borderRadius: 16,
   padding: 20,
   display: "flex",
