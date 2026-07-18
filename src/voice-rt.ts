@@ -4,8 +4,9 @@
 // cascade (voice-eleven-llm.ts / voice-call.tsx) — it shares NOTHING with it but
 // the tool backend. The browser holds the WebRTC peer connection directly to
 // OpenAI; this module only (a) mints short-lived ephemeral tokens so the real
-// OPENAI_API_KEY never reaches the browser, and (b) runs the tool calls the
-// browser relays. See docs/voice-agent-architecture.md (Rev 4) in the extension repo.
+// OPENAI_API_KEY never reaches the browser, (b) runs the tool calls the browser
+// relays, and (c) persists a finished conversation as an ai-voice-conversation
+// note. See docs/voice-agent-architecture.md (Rev 4) in the extension repo.
 //
 // Auth follows the lfg convention: no middleware — the server is loopback/Tailscale
 // only, and "user" is the soft ?user= identity, hashed into OpenAI-Safety-Identifier.
@@ -25,6 +26,33 @@ function json(obj: unknown, init?: ResponseInit) {
 }
 function err(status: number, message: string) {
   return json({ error: message }, { status });
+}
+
+function slugify(s: string): string {
+  return (
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60) || "note"
+  );
+}
+
+// Compose YAML frontmatter ourselves (no dependency on the vault CLI's contentFactory,
+// which is version-skewed on the deployed box). JSON-quoting every scalar is valid YAML
+// and safely escapes colons/quotes/newlines; arrays render as block sequences.
+function buildFrontmatter(props: Record<string, unknown>): string {
+  const lines: string[] = ["---"];
+  for (const [k, v] of Object.entries(props)) {
+    if (Array.isArray(v)) {
+      lines.push(`${k}:`);
+      for (const item of v) lines.push(`  - ${JSON.stringify(String(item))}`);
+    } else if (v !== undefined && v !== null && String(v) !== "") {
+      lines.push(`${k}: ${JSON.stringify(String(v))}`);
+    }
+  }
+  lines.push("---");
+  return lines.join("\n");
 }
 
 // ---- Phase-0 tool schemas advertised to the model (client-executed) ----
@@ -148,12 +176,7 @@ export async function runRtTool(
         const title = String(args.title ?? "").trim();
         if (!title) return err(400, "title required");
         const body = String(args.body ?? "");
-        const slug =
-          title
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, "-")
-            .replace(/^-+|-+$/g, "")
-            .slice(0, 60) || "note";
+        const slug = slugify(title);
         const rel = `notes/${slug}.md`;
         const content = `# ${title}\n\n${body}\n`;
         // Hold the repo lock across write + commit (matches /api/vault/create-task).
@@ -167,6 +190,49 @@ export async function runRtTool(
       default:
         return err(404, `unknown tool: ${name}`);
     }
+  } catch (e) {
+    return err(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * Persist a finished Converse session as an `ai-voice-conversation` note. Composes
+ * frontmatter (type/title/user-properties/tags) + transcript body, writes into
+ * `ai-voice-conversations/<slug>.md` with slug de-dup, commits under the repo lock.
+ */
+export async function saveConversation(
+  repoCwd: string,
+  input: { title: string; transcript: string; tags?: string[]; properties?: Record<string, unknown> },
+): Promise<Response> {
+  const title = input.title.trim();
+  if (!title || !input.transcript) return err(400, "title and transcript are required");
+  const baseSlug = slugify(title);
+  const frontmatter = buildFrontmatter({
+    type: "ai-voice-conversation",
+    title,
+    ...(input.properties ?? {}),
+    tags: Array.isArray(input.tags) ? input.tags : [],
+  });
+  const content = `${frontmatter}\n\n${input.transcript}\n`;
+  try {
+    const result = await withRepoLock(repoCwd, async () => {
+      let written: { path: string } | null = null;
+      for (let n = 1; n <= 20; n++) {
+        const rel =
+          n === 1 ? `ai-voice-conversations/${baseSlug}.md` : `ai-voice-conversations/${baseSlug}-${n}.md`;
+        try {
+          written = await writeRepoFile(repoCwd, rel, content, { createOnly: true });
+          break;
+        } catch (e) {
+          if (e instanceof Error && e.message.includes("already exists")) continue;
+          throw e;
+        }
+      }
+      if (!written) throw new Error("could not find a free filename");
+      const commit = gitCommitPaths(repoCwd, [written.path], `converse: conversation — ${title}`);
+      return { path: written.path, commit };
+    });
+    return json({ ok: true, ...result });
   } catch (e) {
     return err(400, e instanceof Error ? e.message : String(e));
   }

@@ -316,7 +316,7 @@ import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
-import { handleRtToken, runRtTool } from "../voice-rt.ts";
+import { handleRtToken, runRtTool, saveConversation } from "../voice-rt.ts";
 
 const PORT = Number(process.env.LFG_PORT ?? process.env.PORT ?? 8766);
 // Bind to loopback by default — the UI is meant to be reached over Tailscale
@@ -1621,30 +1621,12 @@ export async function cmdServe() {
           ? repos.find((r) => r.name === body.repo)
           : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
         if (!repo) return err(404, "no repo available");
-        const createContent = await getCreateContent();
-        if (!createContent) return err(503, "createContent not available — check CALYX_CLI_PATH on server");
-        const noteTitle = body.title.trim();
-        try {
-          const { result, commit } = await withRepoLock(repo.cwd, () => {
-            const result = createContent(
-              {
-                contentType: "custom",
-                type: "ai-voice-conversation",
-                title: noteTitle,
-                content: body.transcript!,
-                tags: Array.isArray(body.tags) ? body.tags : [],
-                extraProperties: body.properties ?? {},
-              },
-              repo.cwd,
-              { tasksFolder: "tasks" },
-            );
-            const commit = gitCommitPaths(repo.cwd, [result.relativePath], `converse: conversation — ${noteTitle}`);
-            return { result, commit };
-          });
-          return json({ ok: true, path: result.relativePath, slug: result.slug, commit });
-        } catch (e) {
-          return err(400, e instanceof Error ? e.message : String(e));
-        }
+        return saveConversation(repo.cwd, {
+          title: body.title,
+          transcript: body.transcript,
+          tags: body.tags,
+          properties: body.properties,
+        });
       }
 
       // ---- voice TTS proxy: synthesize via the configured cloud provider
