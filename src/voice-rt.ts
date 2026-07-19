@@ -12,7 +12,8 @@
 // only, and "user" is the soft ?user= identity, hashed into OpenAI-Safety-Identifier.
 
 import { createHash } from "node:crypto";
-import { gitGrep, writeRepoFile, withRepoLock, gitCommitPaths } from "./files.ts";
+import { writeRepoFile, withRepoLock, gitCommitPaths } from "./files.ts";
+import { slugify, buildFrontmatter, VAULT_TOOL_SCHEMAS, runVaultTool } from "./vault-tools.ts";
 
 const MODEL = "gpt-realtime-2.1-mini";
 const CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets";
@@ -28,63 +29,9 @@ function err(status: number, message: string) {
   return json({ error: message }, { status });
 }
 
-function slugify(s: string): string {
-  return (
-    s
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 60) || "note"
-  );
-}
-
-// Compose YAML frontmatter ourselves (no dependency on the vault CLI's contentFactory,
-// which is version-skewed on the deployed box). JSON-quoting every scalar is valid YAML
-// and safely escapes colons/quotes/newlines; arrays render as block sequences.
-function buildFrontmatter(props: Record<string, unknown>): string {
-  const lines: string[] = ["---"];
-  for (const [k, v] of Object.entries(props)) {
-    if (Array.isArray(v)) {
-      lines.push(`${k}:`);
-      for (const item of v) lines.push(`  - ${JSON.stringify(String(item))}`);
-    } else if (v !== undefined && v !== null && String(v) !== "") {
-      lines.push(`${k}: ${JSON.stringify(String(v))}`);
-    }
-  }
-  lines.push("---");
-  return lines.join("\n");
-}
-
-// ---- Phase-0 tool schemas advertised to the model (client-executed) ----
-const TOOLS = [
-  {
-    type: "function",
-    name: "search_workspace",
-    description:
-      "Search the user's notes and files for a literal phrase. Returns matching file paths and lines. Use for 'find', 'what did I write about', 'where is'.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Literal text to search for." },
-        limit: { type: "number", description: "Max results (default 8)." },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    type: "function",
-    name: "create_note",
-    description: "Create a new markdown note in the workspace. Use for 'make a note', 'jot down', 'save this'.",
-    parameters: {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "Short note title." },
-        body: { type: "string", description: "Note body (markdown)." },
-      },
-      required: ["title"],
-    },
-  },
-];
+// Vault tool suite (navigate / retrieve / introspect / create / edit) — see vault-tools.ts.
+// slugify + buildFrontmatter live there too (saveConversation below reuses them).
+const TOOLS = VAULT_TOOL_SCHEMAS;
 
 function buildSessionConfig() {
   return {
@@ -93,10 +40,13 @@ function buildSessionConfig() {
     output_modalities: ["audio"],
     reasoning: { effort: "low" },
     instructions:
-      "You are Calyx's voice assistant — warm, brief, and natural. You help the user talk to their " +
-      "workspace: search their notes and create notes by voice. Keep spoken replies to one or two " +
-      "sentences. When you use a tool, say what you're doing in a few words. Read back the title before " +
-      "you confirm a note was created. Never invent file contents — if search returns nothing, say so.",
+      "You are Calyx's voice assistant — warm, brief, and natural. You help the user work with their " +
+      "vault of notes by voice: explore it (describe_vault, browse), find things (search, list_by_type), " +
+      "read a note, and create or update notes. When you're unsure what note types, tags, or projects " +
+      "exist, call describe_vault first to learn the real names before searching or creating. Keep spoken " +
+      "replies to one or two sentences; when you use a tool, say what you're doing in a few words. Read a " +
+      "note before answering questions about it — never invent file contents; if a search returns nothing, " +
+      "say so. Confirm the title before you finish creating or changing a note.",
     audio: {
       input: {
         transcription: { model: "gpt-4o-transcribe" },
@@ -151,48 +101,16 @@ export async function handleRtToken(req: Request): Promise<Response> {
 }
 
 /**
- * Run a tool call relayed from the browser. Pure over (repoCwd, args) so serve.ts
- * can resolve the repo inline (no circular import). Returns stringifiable JSON;
- * the browser forwards the body verbatim back to the model as function_call_output.
+ * Run a tool call relayed from the browser. Delegates to the vault tool suite
+ * (vault-tools.ts). Pure over (repoCwd, args) so serve.ts resolves the repo inline;
+ * returns stringifiable JSON the browser forwards to the model as function_call_output.
  */
 export async function runRtTool(
   name: string,
   repoCwd: string,
   args: Record<string, unknown>,
 ): Promise<Response> {
-  try {
-    switch (name) {
-      case "search_workspace": {
-        const query = String(args.query ?? "").trim();
-        if (!query) return err(400, "query required");
-        const limit = Math.min(Math.max(Number(args.limit) || 8, 1), 25);
-        const matches = gitGrep(repoCwd, query, { max: limit });
-        return json({
-          count: matches.length,
-          results: matches.map((m) => ({ path: m.path, line: m.line, text: m.text })),
-        });
-      }
-      case "create_note": {
-        const title = String(args.title ?? "").trim();
-        if (!title) return err(400, "title required");
-        const body = String(args.body ?? "");
-        const slug = slugify(title);
-        const rel = `notes/${slug}.md`;
-        const content = `# ${title}\n\n${body}\n`;
-        // Hold the repo lock across write + commit (matches /api/vault/create-task).
-        const result = await withRepoLock(repoCwd, async () => {
-          const w = await writeRepoFile(repoCwd, rel, content, { createOnly: false });
-          const commit = gitCommitPaths(repoCwd, [w.path], `converse: note — ${title}`);
-          return { path: w.path, created: w.created, commit };
-        });
-        return json({ ok: true, ...result });
-      }
-      default:
-        return err(404, `unknown tool: ${name}`);
-    }
-  } catch (e) {
-    return err(400, e instanceof Error ? e.message : String(e));
-  }
+  return runVaultTool(name, repoCwd, args);
 }
 
 /**
