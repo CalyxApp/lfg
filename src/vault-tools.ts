@@ -465,6 +465,49 @@ export async function createProject(
   }
 }
 
+/**
+ * web_search — live web lookup for the assistant (voice-chat-capabilities #2).
+ * Not a vault tool strictly, but it lives in the shared toolbelt so BOTH the
+ * Converse voice call and the typed chat get it. Runs server-side through
+ * OpenAI's Responses API built-in web_search (reuses OPENAI_API_KEY — no new
+ * key or search vendor), returning a concise sourced answer the calling model
+ * can speak or quote.
+ */
+export async function webSearch(query: string): Promise<Response> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return err(503, "OPENAI_API_KEY not set on the server");
+  const q = query.trim();
+  if (!q) return err(400, "query required");
+  try {
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.LFG_WEBSEARCH_MODEL || "gpt-5.6-luna",
+        tools: [{ type: "web_search" }],
+        instructions:
+          "Search the web and answer the query concisely — a short paragraph at most. " +
+          "Name your sources inline (site name + URL). If results conflict or are thin, say so.",
+        input: q,
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!r.ok) return err(502, `web search ${r.status}: ${(await r.text().catch(() => "")).slice(0, 300)}`);
+    const j = (await r.json().catch(() => null)) as {
+      output?: { content?: { type?: string; text?: string }[] }[];
+    } | null;
+    const text = (j?.output ?? [])
+      .flatMap((it) => it.content ?? [])
+      .filter((c) => c.type === "output_text" && c.text)
+      .map((c) => c.text)
+      .join("\n")
+      .trim();
+    return json({ result: text || "(no results)" });
+  } catch (e) {
+    return err(502, `web search failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 /** update — set frontmatter fields (surgical) and/or append to a note's body, committed. */
 export async function updateNote(
   repoCwd: string,
@@ -616,6 +659,19 @@ export const VAULT_TOOL_SCHEMAS = [
   },
   {
     type: "function",
+    name: "web_search",
+    description:
+      "Search the live web — for current events, facts, prices, docs, anything NOT in the user's vault. Returns a concise sourced answer. Don't use it for things the vault tools can answer.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to look up, phrased like a search." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    type: "function",
     name: "update",
     description:
       "Change an existing note: set frontmatter fields (e.g. mark a task done) and/or append text to its body. Preserves everything else the user wrote. Use for 'mark X done', 'set priority high', 'add a note to Y'.",
@@ -654,6 +710,8 @@ export async function runVaultTool(name: string, repoCwd: string, args: Record<s
         return await readNote(repoCwd, String(args.name ?? ""), str(args.section));
       case "create":
         return await createNote(repoCwd, { type: str(args.type), title: String(args.title ?? ""), properties: obj(args.properties), body: str(args.body) });
+      case "web_search":
+        return await webSearch(String(args.query ?? ""));
       case "create_project":
         return await createProject(repoCwd, {
           title: String(args.title ?? ""),
