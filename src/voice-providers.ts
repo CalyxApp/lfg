@@ -474,6 +474,15 @@ function deepgramRealtimeStream(handlers: SttStreamHandlers): SttStreamBridge | 
       } catch {}
     } else outbox.push(m);
   };
+
+  // Deepgram closes the socket with NET-0001 after ~10 s without audio OR a
+  // {"type":"KeepAlive"} TEXT frame (docs: send one every 3-5 s of silence;
+  // harmless while audio flows). Silent gaps are normal here — mic permission
+  // prompts delay the first frame, and review-mode dictation has no silence
+  // auto-stop, so a user pausing to think mid-take must not kill the stream.
+  const keepAlive = setInterval(() => {
+    if (open && !closed) sendRaw(JSON.stringify({ type: "KeepAlive" }));
+  }, 4000) as unknown as number;
   const drain = () => {
     if (bufBytes === 0) return;
     const merged = new Uint8Array(bufBytes);
@@ -521,6 +530,7 @@ function deepgramRealtimeStream(handlers: SttStreamHandlers): SttStreamBridge | 
   });
   up.addEventListener("close", () => {
     closed = true;
+    clearInterval(keepAlive);
     handlers.onClose?.();
   });
   up.addEventListener("error", (e: unknown) => {
@@ -548,6 +558,7 @@ function deepgramRealtimeStream(handlers: SttStreamHandlers): SttStreamBridge | 
       // Slamming up.close() here loses that tail (verified live); the timer
       // only covers a wedged upstream that never closes.
       closed = true;
+      clearInterval(keepAlive);
       setTimeout(() => {
         try {
           up.close();
