@@ -17,6 +17,7 @@
 // the workspace vault as an `ai-voice-conversation` note (unchanged).
 
 import { useEffect, useRef, useState } from "react";
+import { ArrowUp, AudioLines, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { MicButton } from "./components/dictation";
 
@@ -353,302 +354,233 @@ export function Converse({ onClose }: { onClose: () => void }) {
   }
 
   // ---------- review step ----------
+  // Renders as a normal full-screen app view (bg-background + theme classes),
+  // matching the agent chat — the old self-contained dark overlay looked alien
+  // next to the rest of the PWA (Sam, 2026-07-22).
   if (phase === "review") {
     return (
-      <div style={overlay}>
-        <div style={card}>
-          <div style={headerRow}>
-            <strong>Save conversation</strong>
-            <span style={{ opacity: 0.6, fontSize: 13 }}>{threadTurns().length} turns</span>
+      <div className="fixed inset-0 z-[1000] flex flex-col bg-background text-foreground">
+        <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+          <strong className="text-base font-semibold">Save conversation</strong>
+          <span className="text-xs text-muted-foreground">{threadTurns().length} turns</span>
+        </div>
+        {saveError && (
+          <div className="mx-4 mt-2 whitespace-pre-wrap rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {saveError}
           </div>
-          {saveError && <div style={errorBox}>{saveError}</div>}
-          <div style={{ overflowY: "auto", flex: 1, display: "flex", flexDirection: "column", gap: 16 }}>
-            <NoteMetaEditor
-              title={title}
-              onTitle={setTitle}
-              tags={tags}
-              onTags={setTags}
-              properties={properties}
-              onProperties={setProperties}
-            />
-            <details style={{ fontSize: 13, opacity: 0.85 }}>
-              <summary style={{ cursor: "pointer" }}>Transcript preview</summary>
-              <pre style={transcriptPre}>{buildTranscript()}</pre>
-            </details>
-          </div>
-          <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
-            <button style={discardBtn} onClick={onClose} disabled={saving}>
-              Discard
-            </button>
-            <button style={saveBtn} onClick={handleSave} disabled={saving || !title.trim()}>
-              {saving ? "Saving…" : "Save note"}
-            </button>
-          </div>
+        )}
+        <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-4 py-3">
+          <NoteMetaEditor
+            title={title}
+            onTitle={setTitle}
+            tags={tags}
+            onTags={setTags}
+            properties={properties}
+            onProperties={setProperties}
+          />
+          <details className="text-sm text-muted-foreground">
+            <summary className="cursor-pointer">Transcript preview</summary>
+            <pre className="mt-2 whitespace-pre-wrap break-words font-sans text-sm leading-relaxed">
+              {buildTranscript()}
+            </pre>
+          </details>
+        </div>
+        <div className="flex justify-center gap-2 border-t border-border px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          <button
+            className="rounded-full border border-border px-5 py-2 text-sm font-medium text-foreground disabled:opacity-50"
+            onClick={onClose}
+            disabled={saving}
+          >
+            Discard
+          </button>
+          <button
+            className="rounded-full bg-primary px-5 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
+            onClick={handleSave}
+            disabled={saving || !title.trim()}
+          >
+            {saving ? "Saving…" : "Save note"}
+          </button>
         </div>
       </div>
     );
   }
 
   // ---------- live step (one thread; chat or voice mode) ----------
+  // Same interface as the agent chat (Sam, 2026-07-22): a full-screen themed
+  // page — user turns in .user-bubble, assistant turns as plain markdown-style
+  // text — instead of the old dark overlay card. The composer's right button
+  // MORPHS: voice (◉) when the box is empty, send (↑) once there's text.
   const activeProvider = cfg?.providers.find((p) => p.id === cfg.settings.provider);
   const modelChip = cfg ? `${activeProvider?.label ?? cfg.settings.provider} · ${cfg.settings.model}` : null;
+  const hasText = !!input.trim();
 
   return (
-    <div style={overlay}>
+    <div className="fixed inset-0 z-[1000] flex flex-col bg-background text-foreground">
       <audio ref={audioRef} autoPlay />
-      <div style={card}>
-        <div style={headerRow}>
-          <strong>Chat</strong>
-          <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            {mode === "voice" ? (
-              <span style={{ opacity: 0.7, fontSize: 13 }}>
-                {voiceStatus === "connecting" && "◉ connecting…"}
-                {voiceStatus === "live" && "◉ voice live"}
-                {voiceStatus === "error" && "◉ voice error"}
-              </span>
-            ) : modelChip ? (
-              <button style={chipBtn} onClick={() => setPickerOpen((o) => !o)} title="Choose chat model">
-                {modelChip}
-              </button>
-            ) : null}
-            <button style={closeX} onClick={closeSurface} aria-label="Close chat" title="Close">
-              ✕
-            </button>
-          </span>
-        </div>
 
-        {pickerOpen && cfg && mode === "chat" && (
-          <div style={pickerRow}>
-            <select
-              style={selectStyle}
-              value={cfg.settings.provider}
-              onChange={(e) => void updateChatConfig({ provider: e.target.value })}
+      <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
+        <strong className="text-base font-semibold">Chat</strong>
+        <div className="flex items-center gap-2">
+          {mode === "voice" ? (
+            <span className="text-xs text-muted-foreground">
+              {voiceStatus === "connecting" && "◉ connecting…"}
+              {voiceStatus === "live" && "◉ voice live"}
+              {voiceStatus === "error" && "◉ voice error"}
+            </span>
+          ) : modelChip ? (
+            <button
+              className="rounded-full border border-border px-2.5 py-1 text-xs text-muted-foreground"
+              onClick={() => setPickerOpen((o) => !o)}
+              title="Choose chat model"
             >
-              {cfg.providers.map((p) => (
-                <option key={p.id} value={p.id} disabled={!p.implemented}>
-                  {p.label}
-                  {!p.implemented ? " (soon)" : !p.available ? " (no key)" : ""}
-                </option>
-              ))}
-            </select>
-            <select
-              style={selectStyle}
-              value={cfg.settings.model}
-              onChange={(e) => void updateChatConfig({ model: e.target.value })}
-            >
-              {(activeProvider?.models ?? []).map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
+              {modelChip}
+            </button>
+          ) : null}
+          <button
+            className="flex size-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
+            onClick={closeSurface}
+            aria-label="Close chat"
+            title="Close"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
+      </div>
+
+      {pickerOpen && cfg && mode === "chat" && (
+        <div className="flex gap-2 border-b border-border px-4 py-2">
+          <select
+            className="h-9 min-w-0 flex-1 rounded-lg border border-border bg-background px-2 text-sm"
+            value={cfg.settings.provider}
+            onChange={(e) => void updateChatConfig({ provider: e.target.value })}
+          >
+            {cfg.providers.map((p) => (
+              <option key={p.id} value={p.id} disabled={!p.implemented}>
+                {p.label}
+                {!p.implemented ? " (soon)" : !p.available ? " (no key)" : ""}
+              </option>
+            ))}
+          </select>
+          <select
+            className="h-9 min-w-0 flex-1 rounded-lg border border-border bg-background px-2 text-sm"
+            value={cfg.settings.model}
+            onChange={(e) => void updateChatConfig({ model: e.target.value })}
+          >
+            {(activeProvider?.models ?? []).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {error && (
+        <div className="mx-4 mt-2 whitespace-pre-wrap rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
+      <div className="flex-1 overflow-y-auto px-4 py-3" ref={scrollRef}>
+        {log.length === 0 && !error ? (
+          <div className="px-4 py-10 text-center text-sm text-muted-foreground">
+            Type, tap the mic to dictate (you review before sending), or tap ◉ for a live voice
+            conversation — it's all one thread.
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {log.map((e, i) =>
+              e.role === "you" ? (
+                <div
+                  key={i}
+                  className="msg-text markdown user-bubble ml-auto w-fit max-w-[85%] whitespace-pre-wrap text-base"
+                >
+                  {e.text}
+                </div>
+              ) : e.role === "assistant" ? (
+                <div key={i} className="msg-text markdown max-w-full whitespace-pre-wrap text-base">
+                  {e.text}
+                </div>
+              ) : e.role === "tool" ? (
+                <div key={i} className="break-all text-xs text-muted-foreground">
+                  ⚙ {e.text}
+                </div>
+              ) : (
+                <div key={i} className="text-center text-xs text-muted-foreground">
+                  {e.text}
+                </div>
+              ),
+            )}
+            {sending && <div className="text-sm text-muted-foreground">…</div>}
           </div>
         )}
+      </div>
 
-        {error && <div style={errorBox}>{error}</div>}
-
-        <div style={logBox} ref={scrollRef}>
-          {log.length === 0 && !error ? (
-            <div style={{ opacity: 0.5 }}>
-              Type, tap 🎤 to dictate (you review before sending), or tap ◉ for a live voice
-              conversation — it's all one thread.
-            </div>
-          ) : (
-            log.map((e, i) => (
-              <div key={i} style={{ marginBottom: 6 }}>
-                <span style={{ opacity: 0.5, marginRight: 6 }}>{e.role}</span>
-                <span style={{ whiteSpace: "pre-wrap" }}>{e.text}</span>
-              </div>
-            ))
-          )}
-          {sending && <div style={{ opacity: 0.5 }}>…</div>}
-        </div>
-
-        {mode === "voice" ? (
-          <button style={endBtn} onClick={() => setMode("chat")}>
+      {mode === "voice" ? (
+        <div className="flex items-center justify-center gap-3 border-t border-border px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          <span className="text-sm text-muted-foreground">
+            {voiceStatus === "live"
+              ? "voice is live — just talk"
+              : voiceStatus === "connecting"
+                ? "connecting…"
+                : "voice error"}
+          </span>
+          <button
+            className="rounded-full bg-destructive px-5 py-2 text-sm font-medium text-destructive-foreground"
+            onClick={() => setMode("chat")}
+          >
             End voice
           </button>
-        ) : (
-          <form
-            style={composerRow}
-            onSubmit={(e) => {
-              e.preventDefault();
-              void sendChat();
-            }}
-          >
-            <input
-              style={inputStyle}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask…"
+        </div>
+      ) : (
+        <form
+          className="flex items-end gap-2 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void sendChat();
+          }}
+        >
+          <input
+            className="lfg-gfield h-11 min-h-11 min-w-0 flex-1 rounded-2xl border-transparent px-4 text-base shadow-sm placeholder:text-muted-foreground"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Ask…"
+            disabled={sending}
+          />
+          {/* Dictation is review-before-send by construction: no onAutoSubmit
+              wired, so stopping the mic leaves editable text in the box. */}
+          <MicButton
+            baseText={input}
+            onText={(text, base) => setInput(base.trim() ? `${base.trimEnd()} ${text}` : text)}
+            onInterim={(text, base) => setInput(base.trim() ? `${base.trimEnd()} ${text}` : text)}
+            onCancel={(base) => setInput(base)}
+            className="size-11 md:size-9"
+          />
+          {/* Morphing button: ◉ voice when the box is empty, ↑ send when there's text. */}
+          {hasText ? (
+            <button
+              type="submit"
+              className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
               disabled={sending}
-            />
-            {/* Dictation is review-before-send by construction: no onAutoSubmit
-                wired, so stopping the mic leaves editable text in the box. */}
-            <MicButton
-              baseText={input}
-              onText={(text, base) => setInput(base.trim() ? `${base.trimEnd()} ${text}` : text)}
-              onInterim={(text, base) => setInput(base.trim() ? `${base.trimEnd()} ${text}` : text)}
-              onCancel={(base) => setInput(base)}
-              className="size-10"
-            />
+              aria-label="Send"
+            >
+              <ArrowUp className="size-5 md:size-4" />
+            </button>
+          ) : (
             <button
               type="button"
-              style={voiceModeBtn}
+              className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
               onClick={() => setMode("voice")}
+              disabled={sending}
               title="Start realtime voice conversation"
               aria-label="Start voice mode"
             >
-              ◉
+              <AudioLines className="size-5 md:size-4" />
             </button>
-            <button type="submit" style={sendBtn} disabled={sending || !input.trim()} aria-label="Send">
-              ↑
-            </button>
-          </form>
-        )}
-      </div>
+          )}
+        </form>
+      )}
     </div>
   );
 }
 
-// --- self-contained dark styling (do NOT use app CSS vars — they render invisible) ---
-const overlay: React.CSSProperties = {
-  position: "fixed",
-  inset: 0,
-  background: "rgba(0,0,0,0.55)",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  zIndex: 1000,
-  backdropFilter: "blur(4px)",
-};
-const card: React.CSSProperties = {
-  width: "min(480px, 92vw)",
-  maxHeight: "85vh",
-  height: "min(640px, 85vh)",
-  background: "#1c1c1e",
-  color: "#f2f2f7",
-  borderRadius: 16,
-  padding: 20,
-  display: "flex",
-  flexDirection: "column",
-  gap: 14,
-  boxShadow: "0 20px 60px rgba(0,0,0,0.4)",
-};
-const headerRow: React.CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "center",
-};
-const logBox: React.CSSProperties = { flex: 1, overflowY: "auto", fontSize: 14, lineHeight: 1.5, minHeight: 120 };
-const errorBox: React.CSSProperties = {
-  background: "rgba(255,60,60,0.15)",
-  color: "#ff9b9b",
-  borderRadius: 8,
-  padding: "8px 10px",
-  fontSize: 13,
-  whiteSpace: "pre-wrap",
-};
-const transcriptPre: React.CSSProperties = {
-  whiteSpace: "pre-wrap",
-  wordBreak: "break-word",
-  marginTop: 8,
-  fontSize: 13,
-  lineHeight: 1.5,
-  opacity: 0.9,
-  fontFamily: "inherit",
-};
-const composerRow: React.CSSProperties = {
-  display: "flex",
-  gap: 8,
-  alignItems: "center",
-};
-const inputStyle: React.CSSProperties = {
-  flex: 1,
-  minWidth: 0,
-  padding: "10px 14px",
-  borderRadius: 999,
-  border: "1px solid #3a3a3c",
-  background: "#2c2c2e",
-  color: "#f2f2f7",
-  fontSize: 15,
-  outline: "none",
-};
-const voiceModeBtn: React.CSSProperties = {
-  width: 40,
-  height: 40,
-  borderRadius: 999,
-  border: "1px solid #3a3a3c",
-  background: "#2c2c2e",
-  color: "#7dd3fc",
-  fontSize: 18,
-  cursor: "pointer",
-  flexShrink: 0,
-};
-const sendBtn: React.CSSProperties = {
-  width: 40,
-  height: 40,
-  borderRadius: 999,
-  border: "none",
-  background: "#3b82f6",
-  color: "white",
-  fontSize: 18,
-  cursor: "pointer",
-  flexShrink: 0,
-};
-const chipBtn: React.CSSProperties = {
-  border: "1px solid #3a3a3c",
-  background: "#2c2c2e",
-  color: "#f2f2f7",
-  borderRadius: 999,
-  padding: "4px 10px",
-  fontSize: 12,
-  cursor: "pointer",
-};
-const closeX: React.CSSProperties = {
-  border: "none",
-  background: "transparent",
-  color: "#f2f2f7",
-  fontSize: 16,
-  cursor: "pointer",
-  opacity: 0.7,
-};
-const pickerRow: React.CSSProperties = { display: "flex", gap: 8 };
-const selectStyle: React.CSSProperties = {
-  flex: 1,
-  minWidth: 0,
-  padding: "8px 10px",
-  borderRadius: 8,
-  border: "1px solid #3a3a3c",
-  background: "#2c2c2e",
-  color: "#f2f2f7",
-  fontSize: 13,
-};
-const endBtn: React.CSSProperties = {
-  alignSelf: "center",
-  padding: "10px 28px",
-  borderRadius: 999,
-  border: "none",
-  background: "#e5484d",
-  color: "white",
-  fontSize: 15,
-  cursor: "pointer",
-};
-const saveBtn: React.CSSProperties = {
-  padding: "10px 24px",
-  borderRadius: 999,
-  border: "none",
-  background: "#3b82f6",
-  color: "white",
-  fontSize: 15,
-  cursor: "pointer",
-};
-const discardBtn: React.CSSProperties = {
-  padding: "10px 24px",
-  borderRadius: 999,
-  border: "1px solid #3a3a3c",
-  background: "transparent",
-  color: "#f2f2f7",
-  fontSize: 15,
-  cursor: "pointer",
-};
