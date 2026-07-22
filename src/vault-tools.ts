@@ -399,6 +399,72 @@ export async function createNote(
   }
 }
 
+/**
+ * create_project — scaffold a whole project (voice-chat-capabilities #1).
+ * Unlike the generic create (one flat note), this builds the vault's standard
+ * project shape: `projects/<project_id>/index.md` with the full frontmatter
+ * contract (type/project_id/title/status/description/created_at/updated_at/
+ * priority/tags) that project views and other tools key off. Additive create →
+ * auto-runs (tiered-write model §6); slug de-dup; committed under the lock.
+ */
+export async function createProject(
+  repoCwd: string,
+  input: {
+    title: string;
+    description?: string;
+    status?: string;
+    priority?: string;
+    area?: string;
+    tags?: string[];
+    body?: string;
+  },
+): Promise<Response> {
+  const title = (input.title ?? "").trim();
+  if (!title) return err(400, "title required");
+  const baseSlug = slugify(title);
+  const now = new Date().toISOString();
+  const bodyText = input.body?.trim();
+  try {
+    const result = await withRepoLock(repoCwd, async () => {
+      let written: { path: string } | null = null;
+      let projectId = baseSlug;
+      for (let n = 1; n <= 20; n++) {
+        projectId = n === 1 ? baseSlug : `${baseSlug}-${n}`;
+        const frontmatter = buildFrontmatter({
+          type: "project",
+          project_id: projectId,
+          title,
+          status: (input.status ?? "active").trim().toLowerCase(),
+          description: input.description?.trim() ?? "",
+          created_at: now,
+          updated_at: now,
+          ...(input.priority ? { priority: input.priority.trim().toLowerCase() } : {}),
+          ...(input.area ? { area: input.area.trim() } : {}),
+          tags: Array.isArray(input.tags) ? input.tags : [],
+        });
+        const content = `${frontmatter}\n\n# ${title}\n${
+          input.description?.trim() ? `\n${input.description.trim()}\n` : ""
+        }${bodyText ? `\n${bodyText}\n` : ""}`;
+        try {
+          written = await writeRepoFile(repoCwd, `projects/${projectId}/index.md`, content, {
+            createOnly: true,
+          });
+          break;
+        } catch (e) {
+          if (e instanceof Error && e.message.includes("already exists")) continue;
+          throw e;
+        }
+      }
+      if (!written) throw new Error("could not find a free project id");
+      const commit = gitCommitPaths(repoCwd, [written.path], `converse: project — ${title}`);
+      return { project_id: projectId, path: written.path, commit };
+    });
+    return json({ ok: true, ...result });
+  } catch (e) {
+    return err(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
 /** update — set frontmatter fields (surgical) and/or append to a note's body, committed. */
 export async function updateNote(
   repoCwd: string,
@@ -513,7 +579,7 @@ export const VAULT_TOOL_SCHEMAS = [
     type: "function",
     name: "create",
     description:
-      "Create a new note of a given type (defaults to a plain note), filed in the folder where notes of that type already live. Use for 'make a task', 'new project', 'jot this down'. Call describe_vault first if unsure what type or fields to use.",
+      "Create a new note of a given type (defaults to a plain note), filed in the folder where notes of that type already live. Use for 'make a task', 'jot this down'. For a whole new PROJECT use create_project instead. Call describe_vault first if unsure what type or fields to use.",
     parameters: {
       type: "object",
       properties: {
@@ -525,6 +591,25 @@ export const VAULT_TOOL_SCHEMAS = [
           additionalProperties: true,
         },
         body: { type: "string", description: "Optional note body (markdown)." },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    type: "function",
+    name: "create_project",
+    description:
+      "Start a whole new project — scaffolds projects/<project_id>/index.md with the standard project fields (status, description, priority, tags) so it shows up everywhere projects do. Use for 'start a project called X', 'set up a project for Y'. Confirm the title with the user first. Returns the project_id that tasks and notes can reference.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "The project's name." },
+        description: { type: "string", description: "One or two sentences on what the project is." },
+        status: { type: "string", description: "Project status (default 'active')." },
+        priority: { type: "string", description: "Optional: low, medium, or high." },
+        area: { type: "string", description: "Optional life/work area this belongs to." },
+        tags: { type: "array", items: { type: "string" }, description: "Optional tags." },
+        body: { type: "string", description: "Optional extra markdown for the project page (goals, first steps…)." },
       },
       required: ["title"],
     },
@@ -569,6 +654,16 @@ export async function runVaultTool(name: string, repoCwd: string, args: Record<s
         return await readNote(repoCwd, String(args.name ?? ""), str(args.section));
       case "create":
         return await createNote(repoCwd, { type: str(args.type), title: String(args.title ?? ""), properties: obj(args.properties), body: str(args.body) });
+      case "create_project":
+        return await createProject(repoCwd, {
+          title: String(args.title ?? ""),
+          description: str(args.description),
+          status: str(args.status),
+          priority: str(args.priority),
+          area: str(args.area),
+          tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
+          body: str(args.body),
+        });
       case "update":
         return await updateNote(repoCwd, { name: String(args.name ?? ""), properties: obj(args.properties), append: str(args.append) });
       default:
