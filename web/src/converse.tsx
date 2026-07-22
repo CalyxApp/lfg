@@ -17,9 +17,9 @@
 // the workspace vault as an `ai-voice-conversation` note (unchanged).
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, AudioLines, X } from "lucide-react";
+import { ArrowUp, AudioLines, Check, Mic, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
-import { MicButton } from "./components/dictation";
+import { useDictation } from "./components/dictation";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 const MODEL = "gpt-realtime-2.1-mini";
@@ -27,7 +27,10 @@ const MODEL = "gpt-realtime-2.1-mini";
 type Mode = "chat" | "voice";
 type VoiceStatus = "connecting" | "live" | "error";
 type Phase = "live" | "review";
-type LogEntry = { role: "you" | "assistant" | "tool" | "system"; text: string };
+// `id` keys realtime-voice turns so their text can be upserted in place as
+// transcript deltas stream in (see handleEvent) — that's what keeps the thread
+// in sync with the audio you actually hear.
+type LogEntry = { role: "you" | "assistant" | "tool" | "system"; text: string; id?: string };
 
 type ChatConfig = {
   settings: { provider: string; model: string };
@@ -77,6 +80,26 @@ export function Converse({ onClose }: { onClose: () => void }) {
       return next;
     });
 
+  // Insert-or-update a voice turn by realtime item id. Lets speech placeholders
+  // and streaming transcript deltas update one entry in place, in the position
+  // it was first heard — instead of whole turns popping in out of order when
+  // the (slow) full-transcript events finally arrive.
+  const upsert = (id: string, role: LogEntry["role"], text: string) =>
+    setLog((l) => {
+      const idx = l.findIndex((e) => e.id === id);
+      let next: LogEntry[];
+      if (idx >= 0) {
+        next = [...l];
+        next[idx] = { ...next[idx], text };
+      } else {
+        next = [...l.slice(-60), { id, role, text }];
+      }
+      logRef.current = next;
+      return next;
+    });
+  // running transcript per realtime item while its deltas stream in
+  const rtTextRef = useRef<Record<string, string>>({});
+
   // keep the thread pinned to the latest turn
   useEffect(() => {
     const el = scrollRef.current;
@@ -108,11 +131,18 @@ export function Converse({ onClose }: { onClose: () => void }) {
     }
   }
 
-  const threadTurns = () => logRef.current.filter((e) => e.role === "you" || e.role === "assistant");
+  // Real conversation turns — skips tool/system lines and the transient "…"
+  // speech placeholders that never got a transcription.
+  const threadTurns = () =>
+    logRef.current.filter(
+      (e) => (e.role === "you" || e.role === "assistant") && e.text.trim() && e.text !== "…",
+    );
 
   // ---------------- text mode: one typed/dictated turn ----------------
-  async function sendChat() {
-    const text = input.trim();
+  // Takes the text explicitly so both the form submit (input box) and the
+  // dictation stop-&-send path can use it.
+  async function sendChatText(raw: string) {
+    const text = raw.trim();
     if (!text || sending) return;
     if (!startedAtRef.current) startedAtRef.current = Date.now();
     const messages = [
@@ -142,6 +172,39 @@ export function Converse({ onClose }: { onClose: () => void }) {
       setSending(false);
     }
   }
+
+  // ---------------- dictation (waveform widget) ----------------
+  // The planned ChatGPT-style recorder, not the old glow button: tapping the
+  // mic swaps the composer for a live waveform strip with ✕ cancel, ✓ stop
+  // (transcript → editable text in the box), and ↑ stop-&-send. reviewOnStop
+  // disables the silence VAD, so the take runs until YOU act — the Deepgram
+  // KeepAlive keeps the stream alive through thinking pauses.
+  const joinBase = (text: string, base: string) =>
+    base.trim() ? `${base.trimEnd()} ${text}` : text;
+  const dict = useDictation({
+    baseText: input,
+    reviewOnStop: true,
+    onText: (t, b) => setInput(joinBase(t, b)),
+    onInterim: (t, b) => setInput(joinBase(t, b)),
+    onAutoSubmit: (t, b) => {
+      setInput("");
+      void sendChatText(joinBase(t, b));
+    },
+    onCancel: (b) => setInput(b),
+  });
+  // Sample the mic level into a scrolling bar history while recording — the
+  // hook's `level` is a smoothed 0..1 envelope updated on the rAF clock.
+  const levelRef = useRef(0);
+  levelRef.current = dict.level;
+  const [bars, setBars] = useState<number[]>([]);
+  useEffect(() => {
+    if (dict.state !== "recording") {
+      setBars([]);
+      return;
+    }
+    const t = setInterval(() => setBars((b) => [...b.slice(-41), levelRef.current]), 90);
+    return () => clearInterval(t);
+  }, [dict.state]);
 
   // ---------------- voice mode: realtime session lifecycle ----------------
   function teardownVoice() {
@@ -199,11 +262,34 @@ export function Converse({ onClose }: { onClose: () => void }) {
           if (item?.type === "function_call") void handleFunctionCall(item.name, item.call_id, item.arguments);
         }
         break;
+      // The moment you start speaking, drop a placeholder turn in the thread —
+      // the transcription itself arrives seconds later (often AFTER the
+      // assistant has begun replying), which is what made the transcript feel
+      // out of sync with the audio. The placeholder pins the correct position.
+      case "input_audio_buffer.speech_started":
+        if (ev.item_id) upsert(ev.item_id, "you", "…");
+        break;
+      // Stream the assistant's transcript word-by-word as it speaks (instead of
+      // one paragraph popping in when the whole utterance is done).
+      case "response.output_audio_transcript.delta":
+        if (ev.item_id && ev.delta) {
+          rtTextRef.current[ev.item_id] = (rtTextRef.current[ev.item_id] || "") + ev.delta;
+          upsert(ev.item_id, "assistant", rtTextRef.current[ev.item_id]);
+        }
+        break;
       case "response.output_audio_transcript.done":
-        if (ev.transcript) append("assistant", ev.transcript);
+        if (ev.transcript) {
+          if (ev.item_id) {
+            delete rtTextRef.current[ev.item_id];
+            upsert(ev.item_id, "assistant", ev.transcript);
+          } else append("assistant", ev.transcript);
+        }
         break;
       case "conversation.item.input_audio_transcription.completed":
-        if (ev.transcript) append("you", ev.transcript);
+        if (ev.transcript) {
+          if (ev.item_id) upsert(ev.item_id, "you", ev.transcript);
+          else append("you", ev.transcript);
+        }
         break;
       case "error":
         setError(ev.error?.message ?? "realtime error");
@@ -532,12 +618,63 @@ export function Converse({ onClose }: { onClose: () => void }) {
             End voice
           </button>
         </div>
+      ) : dict.state !== "idle" ? (
+        // ---- dictation in progress: the waveform recorder (plan mockup) ----
+        <div className="flex items-center gap-2 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+          <button
+            type="button"
+            className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground disabled:opacity-50 md:size-9"
+            onClick={() => dict.cancel()}
+            disabled={dict.state === "transcribing"}
+            aria-label="Cancel dictation"
+            title="Cancel"
+          >
+            <X className="size-5 md:size-4" />
+          </button>
+          <div className="flex h-11 min-w-0 flex-1 items-center justify-center gap-[3px] overflow-hidden rounded-2xl border border-border bg-muted/50 px-3 md:h-9">
+            {dict.state === "transcribing" ? (
+              <span className="text-sm text-muted-foreground">transcribing…</span>
+            ) : bars.length === 0 ? (
+              <span className="text-sm text-muted-foreground">listening…</span>
+            ) : (
+              bars.map((v, i) => (
+                <div
+                  key={i}
+                  className="w-[3px] shrink-0 rounded-full bg-foreground/70"
+                  style={{ height: `${4 + Math.round(v * 26)}px` }}
+                />
+              ))
+            )}
+          </div>
+          {/* ✓ stop → transcript lands in the box for review */}
+          <button
+            type="button"
+            className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+            onClick={() => void dict.stop(false)}
+            disabled={dict.state === "transcribing"}
+            aria-label="Stop and review"
+            title="Stop — review before sending"
+          >
+            <Check className="size-5 md:size-4" />
+          </button>
+          {/* ↑ stop → transcript sends immediately */}
+          <button
+            type="button"
+            className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
+            onClick={() => void dict.stop(true)}
+            disabled={dict.state === "transcribing"}
+            aria-label="Stop and send"
+            title="Stop and send"
+          >
+            <ArrowUp className="size-5 md:size-4" />
+          </button>
+        </div>
       ) : (
         <form
           className="flex items-end gap-2 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
           onSubmit={(e) => {
             e.preventDefault();
-            void sendChat();
+            void sendChatText(input);
           }}
         >
           <input
@@ -547,15 +684,18 @@ export function Converse({ onClose }: { onClose: () => void }) {
             placeholder="Ask…"
             disabled={sending}
           />
-          {/* Dictation is review-before-send by construction: no onAutoSubmit
-              wired, so stopping the mic leaves editable text in the box. */}
-          <MicButton
-            baseText={input}
-            onText={(text, base) => setInput(base.trim() ? `${base.trimEnd()} ${text}` : text)}
-            onInterim={(text, base) => setInput(base.trim() ? `${base.trimEnd()} ${text}` : text)}
-            onCancel={(base) => setInput(base)}
-            className="size-11 md:size-9"
-          />
+          {dict.supported && (
+            <button
+              type="button"
+              className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+              onClick={() => void dict.start()}
+              disabled={sending}
+              aria-label="Dictate"
+              title="Dictate — you review before sending"
+            >
+              <Mic className="size-5 md:size-4" />
+            </button>
+          )}
           {/* Morphing button: ◉ voice when the box is empty, ↑ send when there's text. */}
           {hasText ? (
             <button
