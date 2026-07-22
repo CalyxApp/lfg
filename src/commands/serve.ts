@@ -317,6 +317,14 @@ import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
 import { handleRtToken, runRtTool, saveConversation } from "../voice-rt.ts";
+import {
+  getChatSettings,
+  setChatSettings,
+  listChatProviders,
+  runChatTurn,
+  type ChatSettings,
+  type ChatTurnMessage,
+} from "../chat-providers.ts";
 
 const PORT = Number(process.env.LFG_PORT ?? process.env.PORT ?? 8766);
 // Bind to loopback by default — the UI is meant to be reached over Tailscale
@@ -1627,6 +1635,41 @@ export async function cmdServe() {
           tags: body.tags,
           properties: body.properties,
         });
+      }
+
+      // ---- Converse text mode (the "unified chat"): one typed turn against the
+      // same assistant persona + vault tool suite as the voice call, but powered
+      // by a user-selectable chat-completions provider (OpenAI first; Gemini and
+      // Claude are registered as coming-soon). Same workspace scoping as the rt
+      // tool relay above. Body { messages:[{role,content}...], repo? } →
+      // { text, toolCalls, provider, model }. See chat-providers.ts.
+      if (path === "/api/voice/rt/chat" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          messages?: ChatTurnMessage[];
+          repo?: string;
+        } | null;
+        if (!body?.messages) return err(400, "expected { messages }");
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo = body.repo
+          ? repos.find((r) => r.name === body.repo)
+          : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        if (!repo) return err(404, "no repo available for chat turn");
+        return runChatTurn(repo.cwd, body.messages);
+      }
+
+      // ---- chat model config: which provider/model powers typed turns of the
+      // unified chat. Mirrors /api/voice/config — the choice persists server-side
+      // (data/chat-settings.json); keys stay in env. GET also returns the provider
+      // list (with availability + implemented flags) so the picker can grey out
+      // the not-yet-wired ones.
+      if (path === "/api/chat/config" && req.method === "GET") {
+        return json({ settings: await getChatSettings(), providers: listChatProviders() });
+      }
+      if (path === "/api/chat/config" && req.method === "POST") {
+        const b = (await req.json().catch(() => null)) as Partial<ChatSettings> | null;
+        if (!b) return err(400, "expected body");
+        return json({ settings: await setChatSettings(b) });
       }
 
       // ---- voice TTS proxy: synthesize via the configured cloud provider

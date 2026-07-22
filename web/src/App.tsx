@@ -3199,8 +3199,8 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setConverseOpen(true)}
-                title="Converse — realtime voice (OpenAI)"
-                aria-label="Open Converse"
+                title="Converse — chat & voice, one thread (type, dictate, or talk)"
+                aria-label="Open Converse chat"
                 style={{
                   width: 34,
                   height: 34,
