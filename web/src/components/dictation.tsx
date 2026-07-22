@@ -163,6 +163,13 @@ export function useDictation(opts: {
   onCancel?: (base: string) => void;
   baseText?: string;
   silenceMs?: number;
+  // Review-before-send (unified-chat-and-voice Phase 1): when true, tap-mode
+  // dictation never auto-submits — the silence VAD is disabled (the take runs
+  // until the user acts) and tapping stop routes the transcript through onText
+  // as editable input instead of onAutoSubmit. Press-and-hold release-to-send
+  // (an explicit stop(true)) still auto-submits, so both affordances survive:
+  // tap = speak → review → send yourself; hold = speak → release sends.
+  reviewOnStop?: boolean;
 }) {
   const [state, setState] = useState<DictationState>("idle");
   // Live 0..1 microphone level, smoothed by an envelope follower. Drives the
@@ -227,6 +234,7 @@ export function useDictation(opts: {
   const onAutoSubmitRef = useRef(opts.onAutoSubmit);
   const onInterimRef = useRef(opts.onInterim);
   const onCancelRef = useRef(opts.onCancel);
+  const reviewOnStopRef = useRef(opts.reviewOnStop ?? false);
   const baseTextRef = useRef(opts.baseText ?? "");
   // Base text snapshotted at record-start, shared by interim + final so the
   // final transcript cleanly replaces the live partial without double-appending.
@@ -236,6 +244,7 @@ export function useDictation(opts: {
   onAutoSubmitRef.current = opts.onAutoSubmit;
   onInterimRef.current = opts.onInterim;
   onCancelRef.current = opts.onCancel;
+  reviewOnStopRef.current = opts.reviewOnStop ?? false;
   baseTextRef.current = opts.baseText ?? "";
 
   const supported =
@@ -506,7 +515,7 @@ export function useDictation(opts: {
         }
       };
       const vad =
-        autoStop && onAutoSubmitRef.current
+        autoStop && onAutoSubmitRef.current && !reviewOnStopRef.current
           ? (setInterval(() => {
               if (!sessionRef.current || !spoke) return;
               if (Date.now() - lastVoiceAt >= silenceMs) void stop(true);
@@ -570,10 +579,12 @@ export function useDictation(opts: {
 
   const toggle = useCallback(() => {
     if (state === "transcribing") return;
-    // Tapping the button to stop submits the request (stop(auto=true) → routes
-    // the transcript through onAutoSubmit), matching the silence-triggered and
-    // release-to-send paths. Falls back to onText if no onAutoSubmit is wired.
-    if (sessionRef.current) void stop(true);
+    // Tapping the button to stop normally submits the request (stop(auto=true)
+    // → routes the transcript through onAutoSubmit), matching the silence-
+    // triggered and release-to-send paths; falls back to onText if no
+    // onAutoSubmit is wired. In reviewOnStop mode the tap-stop instead delivers
+    // via onText — the transcript lands in the input for the user to edit/send.
+    if (sessionRef.current) void stop(!reviewOnStopRef.current);
     else void start();
   }, [state, start, stop]);
 
@@ -622,6 +633,8 @@ export const MicButton = forwardRef<
     onCancel?: (base: string) => void;
     baseText?: string;
     silenceMs?: number;
+    // Tap-mode dictation reviews instead of auto-sending (see useDictation).
+    reviewOnStop?: boolean;
     className?: string;
     minimal?: boolean;
     // Fires true while actively recording (tap or hold), false otherwise — lets a
@@ -629,7 +642,7 @@ export const MicButton = forwardRef<
     onRecordingChange?: (recording: boolean) => void;
   }
 >(function MicButton(
-  { onText, onAutoSubmit, onInterim, onCancel, baseText, silenceMs, className, minimal = false, onRecordingChange },
+  { onText, onAutoSubmit, onInterim, onCancel, baseText, silenceMs, reviewOnStop, className, minimal = false, onRecordingChange },
   ref,
 ) {
   const { state, toggle, start, stop, cancel, supported, level } = useDictation({
@@ -639,6 +652,7 @@ export const MicButton = forwardRef<
     onCancel,
     baseText,
     silenceMs,
+    reviewOnStop,
   });
   useImperativeHandle(
     ref,

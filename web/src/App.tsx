@@ -9543,6 +9543,10 @@ function NewSessionDialog({
           minimal
           className={cn("size-9 shrink-0", variant !== "inline" && "absolute bottom-1 right-1")}
           silenceMs={2500}
+          // Phase 1 of unified-chat-and-voice: tap-dictation is review-before-
+          // send — the transcript lands here as editable text and the user sends
+          // it; press-and-hold release-to-send remains the hands-free path.
+          reviewOnStop
           baseText={prompt}
           onText={(text, base) =>
             setPrompt(base.trim() ? `${base.trimEnd()} ${text}` : text)
