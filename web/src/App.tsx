@@ -52,6 +52,7 @@ import {
   GitFork,
   Loader2,
   MessageSquare,
+  MessageCircle,
   Mic,
   Bell,
   MoreVertical,
@@ -3195,7 +3196,8 @@ export function App() {
                 onOpenCall={() => setCallOpen(true)}
               />
             ) : null}
-            {!converseOpen ? (
+            {/* Desktop-only: on mobile the Chat entry lives in the bottom tab bar. */}
+            {!isMobile && !converseOpen ? (
               <button
                 type="button"
                 onClick={() => setConverseOpen(true)}
@@ -3456,7 +3458,9 @@ export function App() {
 
       {/* Bottom tab bar — mobile only; tucks away while the keyboard is up or
           during a voice call so it never fights the composer for the bottom. */}
-      {isMobile && !callOpen && !keyboardOpen ? <TabBar tab={tab} onSelect={setTab} /> : null}
+      {isMobile && !callOpen && !keyboardOpen ? (
+        <TabBar tab={tab} onSelect={setTab} onChat={() => setConverseOpen(true)} />
+      ) : null}
 
       {callOpen ? (
         <Suspense fallback={null}>
@@ -3941,10 +3945,22 @@ function AgentToolChips({ onOpen }: { onOpen: (tab: string) => void }) {
 // NavIsland pill as the header so the chrome reads as one matched set. Sits
 // in-flow at the end of the root flex column: content and the inline composer
 // stack above it, nothing can hide beneath it.
-function TabBar({ tab, onSelect }: { tab: string; onSelect: (tab: string) => void }) {
+function TabBar({
+  tab,
+  onSelect,
+  onChat,
+}: {
+  tab: string;
+  onSelect: (tab: string) => void;
+  // Chat (Converse) is an overlay, not a tab — it opens on top of whatever tab
+  // is active. Sam (2026-07-22): the entry belongs in the bottom menu, not a
+  // corner icon.
+  onChat: () => void;
+}) {
   const items = [
     { id: "home", label: "Home", icon: House, active: tab === "home" || tab === "files" },
     { id: "live", label: "Agents", icon: Bot, active: AGENT_FAMILY_TABS.has(tab) },
+    { id: "chat", label: "Chat", icon: MessageCircle, active: false },
     { id: "capture", label: "Capture", icon: Plus, active: tab === "capture" },
     { id: "search", label: "Search", icon: Search, active: tab === "search" },
     {
@@ -3965,7 +3981,7 @@ function TabBar({ tab, onSelect }: { tab: string; onSelect: (tab: string) => voi
             <button
               key={it.id}
               type="button"
-              onClick={() => onSelect(it.id)}
+              onClick={() => (it.id === "chat" ? onChat() : onSelect(it.id))}
               aria-label={it.label}
               aria-current={it.active ? "page" : undefined}
               className={cn(

@@ -98,7 +98,9 @@ const openai: ChatProvider = {
       { role: "system", content: INSTRUCTIONS },
       ...messages.map((m) => ({ role: m.role, content: m.content })),
     ];
-    const toolCalls: { name: string; args: Record<string, unknown> }[] = [];
+    // Surfaced to the UI as friendly chips — includes the outcome (ok + a
+    // path/id detail when the tool returned one), not just the invocation.
+    const toolCalls: { name: string; args: Record<string, unknown>; ok?: boolean; detail?: string }[] = [];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       let res: Response;
@@ -151,9 +153,23 @@ const openai: ChatProvider = {
         } catch {
           /* leave empty */
         }
-        toolCalls.push({ name: call.function.name, args });
         const toolRes = await runVaultTool(call.function.name, repoCwd, args);
         const output = await toolRes.text();
+        let ok: boolean | undefined;
+        let detail: string | undefined;
+        try {
+          const parsed = JSON.parse(output) as Record<string, unknown>;
+          ok = parsed?.error ? false : ((parsed?.ok as boolean | undefined) ?? true);
+          detail =
+            typeof parsed?.path === "string"
+              ? parsed.path
+              : typeof parsed?.project_id === "string"
+                ? (parsed.project_id as string)
+                : undefined;
+        } catch {
+          /* non-JSON output — leave outcome unknown */
+        }
+        toolCalls.push({ name: call.function.name, args, ok, detail });
         convo.push({ role: "tool", tool_call_id: call.id, content: output });
       }
     }

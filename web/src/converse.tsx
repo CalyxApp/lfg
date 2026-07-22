@@ -17,6 +17,7 @@
 // the workspace vault as an `ai-voice-conversation` note (unchanged).
 
 import { useEffect, useRef, useState } from "react";
+import { marked } from "marked";
 import { ArrowUp, AudioLines, Mic, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
@@ -29,8 +30,38 @@ type VoiceStatus = "connecting" | "live" | "error";
 type Phase = "live" | "review";
 // `id` keys realtime-voice turns so their text can be upserted in place as
 // transcript deltas stream in (see handleEvent) — that's what keeps the thread
-// in sync with the audio you actually hear.
-type LogEntry = { role: "you" | "assistant" | "tool" | "system"; text: string; id?: string };
+// in sync with the audio you actually hear. `ok` marks a tool chip's outcome.
+type LogEntry = { role: "you" | "assistant" | "tool" | "system"; text: string; id?: string; ok?: boolean };
+
+// Friendly one-line label for a tool call — "Created project “X”", not raw
+// JSON args (Sam, 2026-07-22: tool calls looked like "a whole bunch of random
+// text"; a successful create should read as exactly that).
+function toolLabel(name: string, args: Record<string, unknown>, ok?: boolean): string {
+  const a = (k: string) => String((args as Record<string, unknown>)[k] ?? "").trim();
+  const failed = ok === false;
+  switch (name) {
+    case "search":
+      return `Searched the vault for “${a("query")}”`;
+    case "web_search":
+      return `Searched the web for “${a("query")}”`;
+    case "describe_vault":
+      return a("type") ? `Checked the “${a("type")}” note type` : "Checked how the vault is organized";
+    case "list_by_type":
+      return `Listed ${a("type") || "notes"}`;
+    case "browse":
+      return `Browsed ${a("path") || "the vault"}`;
+    case "read":
+      return `Read “${a("name")}”`;
+    case "create":
+      return `${failed ? "Couldn't create" : "Created"} ${a("type") || "note"}${a("title") ? ` “${a("title")}”` : ""}`;
+    case "create_project":
+      return `${failed ? "Couldn't create" : "Created"} project${a("title") ? ` “${a("title")}”` : ""}`;
+    case "update":
+      return `${failed ? "Couldn't update" : "Updated"} “${a("name")}”`;
+    default:
+      return name.replaceAll("_", " ");
+  }
+}
 
 type ChatConfig = {
   settings: { provider: string; model: string };
@@ -73,9 +104,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const logRef = useRef<LogEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  const append = (role: LogEntry["role"], text: string) =>
+  const append = (role: LogEntry["role"], text: string, ok?: boolean) =>
     setLog((l) => {
-      const next = [...l.slice(-60), { role, text }];
+      const next = [...l.slice(-60), { role, text, ok }];
       logRef.current = next;
       return next;
     });
@@ -162,9 +193,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
       if (!res.ok) throw new Error(`chat ${res.status}: ${(await res.text()).slice(0, 300)}`);
       const data = (await res.json()) as {
         text: string;
-        toolCalls?: { name: string; args: Record<string, unknown> }[];
+        toolCalls?: { name: string; args: Record<string, unknown>; ok?: boolean }[];
       };
-      for (const tc of data.toolCalls ?? []) append("tool", `${tc.name}(${JSON.stringify(tc.args)})`);
+      for (const tc of data.toolCalls ?? []) append("tool", toolLabel(tc.name, tc.args, tc.ok), tc.ok);
       if (data.text) append("assistant", data.text);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -215,7 +246,6 @@ export function Converse({ onClose }: { onClose: () => void }) {
     } catch {
       /* leave empty */
     }
-    append("tool", `${name}(${JSON.stringify(args)})`);
     let output: string;
     try {
       const res = await fetch(`/api/voice/rt/tools/${name}`, {
@@ -227,6 +257,15 @@ export function Converse({ onClose }: { onClose: () => void }) {
     } catch (e) {
       output = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
     }
+    // Friendly outcome chip (not raw args): parse the tool result for ok/error.
+    let ok: boolean | undefined;
+    try {
+      const parsed = JSON.parse(output) as Record<string, unknown>;
+      ok = parsed?.error ? false : ((parsed?.ok as boolean | undefined) ?? true);
+    } catch {
+      /* unknown outcome */
+    }
+    append("tool", toolLabel(name, args, ok), ok);
     const dc = dcRef.current;
     if (!dc || dc.readyState !== "open") return;
     dc.send(
@@ -573,12 +612,24 @@ export function Converse({ onClose }: { onClose: () => void }) {
                   {e.text}
                 </div>
               ) : e.role === "assistant" ? (
-                <div key={i} className="msg-text markdown max-w-full whitespace-pre-wrap text-base">
-                  {e.text}
-                </div>
+                // Rendered markdown (same .msg-text.markdown styles as the
+                // agent chat) — assistant replies use headings/lists/bold.
+                <div
+                  key={i}
+                  className="msg-text markdown max-w-full text-base"
+                  dangerouslySetInnerHTML={{ __html: marked.parse(e.text, { async: false }) as string }}
+                />
               ) : e.role === "tool" ? (
-                <div key={i} className="break-all text-xs text-muted-foreground">
-                  ⚙ {e.text}
+                <div key={i} className="flex">
+                  <span
+                    className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
+                      e.ok === false
+                        ? "border-destructive/40 bg-destructive/10 text-destructive"
+                        : "border-border bg-muted/40 text-muted-foreground"
+                    }`}
+                  >
+                    {e.ok === false ? "✗" : "✓"} {e.text}
+                  </span>
                 </div>
               ) : (
                 <div key={i} className="text-center text-xs text-muted-foreground">
