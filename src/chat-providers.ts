@@ -79,9 +79,12 @@ const TIMEOUT_MS = 60_000;
 const openai: ChatProvider = {
   id: "openai",
   label: "OpenAI",
-  // Verified against /v1/models with the server key, 2026-07-22 (there is no
-  // gpt-5.5-mini; 5.4-mini is the current fast/cheap tier).
-  models: ["gpt-5.5", "gpt-5.4-mini"],
+  // GPT-5.6 family (launched 2026-07-09): named capability tiers — Terra is
+  // OpenAI's "everyday default" (GPT-5.5-class at ~2x lower cost, $2.50/$15 per
+  // 1M), Luna the fastest/cheapest ($1/$6), Sol the flagship ($5/$30). All three
+  // verified present on the server key via /v1/models and smoke-tested with the
+  // vault tool loop, 2026-07-22. gpt-5.5 kept as a known-good fallback.
+  models: ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5"],
   available: () => !!process.env.OPENAI_API_KEY,
   implemented: true,
   async runTurn({ model, messages, repoCwd }) {
@@ -107,6 +110,11 @@ const openai: ChatProvider = {
             messages: convo,
             tools: CHAT_COMPLETION_TOOLS,
             tool_choice: "auto",
+            // GPT-5.6 tiers default to built-in reasoning, which /v1/chat/completions
+            // rejects when combined with function tools ("use /v1/responses or set
+            // reasoning_effort to 'none'"). "none" is right for a snappy chat surface
+            // anyway; a Responses-API migration is the longer-term path.
+            ...(model.startsWith("gpt-5.6-") ? { reasoning_effort: "none" } : {}),
           }),
           signal: AbortSignal.timeout(TIMEOUT_MS),
         });
