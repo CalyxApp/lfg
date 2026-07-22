@@ -8,7 +8,7 @@
 
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { Loader2, Mic, X } from "lucide-react";
+import { ArrowUp, Check, Loader2, Mic, X } from "lucide-react";
 import { haptic } from "@/lib/haptics";
 import { cn } from "@/lib/utils";
 
@@ -889,3 +889,106 @@ export const MicButton = forwardRef<
     </button>
   );
 });
+
+// ---------------------------------------------------------------------------
+// Waveform dictation (unified-chat-and-voice Phase 1, shared) — the ChatGPT-
+// style recorder first built for Converse, extracted so the agent-session
+// composer (and future surfaces) get the same experience: tap the mic, the
+// composer swaps to a live waveform strip with ✕ cancel, ✓ stop-to-review
+// (transcript lands as editable text) and ↑ stop-&-send. reviewOnStop means
+// no silence auto-stop — the take runs until the user acts.
+
+export function useWaveformDictation(opts: {
+  baseText: string;
+  onText: (joined: string) => void; // final transcript joined onto base → put in the box
+  onInterim?: (joined: string) => void; // live hypothesis joined onto base
+  onCancel?: (base: string) => void; // restore the box to pre-recording text
+  onSend: (joined: string) => void; // ↑ stop-&-send
+}) {
+  const join = (t: string, b: string) => (b.trim() ? `${b.trimEnd()} ${t}` : t);
+  const dict = useDictation({
+    baseText: opts.baseText,
+    reviewOnStop: true,
+    onText: (t, b) => opts.onText(join(t, b)),
+    onInterim: (t, b) => opts.onInterim?.(join(t, b)),
+    onAutoSubmit: (t, b) => opts.onSend(join(t, b)),
+    onCancel: (b) => opts.onCancel?.(b),
+  });
+  // Sample the hook's smoothed 0..1 level into a scrolling bar history.
+  const levelRef = useRef(0);
+  levelRef.current = dict.level;
+  const [bars, setBars] = useState<number[]>([]);
+  useEffect(() => {
+    if (dict.state !== "recording") {
+      setBars([]);
+      return;
+    }
+    const t = setInterval(() => setBars((b) => [...b.slice(-41), levelRef.current]), 90);
+    return () => clearInterval(t);
+  }, [dict.state]);
+  return { ...dict, bars, active: dict.state !== "idle" };
+}
+
+/** The in-composer recorder row: ✕ cancel · waveform · ✓ review · ↑ send. */
+export function WaveformRecorderRow({
+  rec,
+  className,
+}: {
+  rec: ReturnType<typeof useWaveformDictation>;
+  className?: string;
+}) {
+  const transcribing = rec.state === "transcribing";
+  return (
+    <div className={cn("flex w-full items-center gap-2", className)}>
+      <button
+        type="button"
+        className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground disabled:opacity-50 md:size-9"
+        onClick={() => rec.cancel()}
+        disabled={transcribing}
+        aria-label="Cancel dictation"
+        title="Cancel"
+      >
+        <X className="size-5 md:size-4" />
+      </button>
+      <div className="flex h-11 min-w-0 flex-1 items-center justify-center gap-[3px] overflow-hidden rounded-2xl border border-border bg-muted/50 px-3 md:h-9">
+        {transcribing ? (
+          <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" /> transcribing…
+          </span>
+        ) : rec.bars.length === 0 ? (
+          <span className="text-sm text-muted-foreground">listening…</span>
+        ) : (
+          rec.bars.map((v, i) => (
+            <div
+              key={i}
+              className="w-[3px] shrink-0 rounded-full bg-foreground/70"
+              style={{ height: `${4 + Math.round(v * 26)}px` }}
+            />
+          ))
+        )}
+      </div>
+      {/* ✓ stop → transcript lands in the box for review */}
+      <button
+        type="button"
+        className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+        onClick={() => void rec.stop(false)}
+        disabled={transcribing}
+        aria-label="Stop and review"
+        title="Stop — review before sending"
+      >
+        <Check className="size-5 md:size-4" />
+      </button>
+      {/* ↑ stop → transcript sends immediately */}
+      <button
+        type="button"
+        className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
+        onClick={() => void rec.stop(true)}
+        disabled={transcribing}
+        aria-label="Stop and send"
+        title="Stop and send"
+      >
+        <ArrowUp className="size-5 md:size-4" />
+      </button>
+    </div>
+  );
+}

@@ -17,9 +17,9 @@
 // the workspace vault as an `ai-voice-conversation` note (unchanged).
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowUp, AudioLines, Check, Mic, X } from "lucide-react";
+import { ArrowUp, AudioLines, Mic, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
-import { useDictation } from "./components/dictation";
+import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 const MODEL = "gpt-realtime-2.1-mini";
@@ -174,37 +174,20 @@ export function Converse({ onClose }: { onClose: () => void }) {
   }
 
   // ---------------- dictation (waveform widget) ----------------
-  // The planned ChatGPT-style recorder, not the old glow button: tapping the
+  // The shared ChatGPT-style recorder (components/dictation.tsx) — tapping the
   // mic swaps the composer for a live waveform strip with ✕ cancel, ✓ stop
-  // (transcript → editable text in the box), and ↑ stop-&-send. reviewOnStop
-  // disables the silence VAD, so the take runs until YOU act — the Deepgram
-  // KeepAlive keeps the stream alive through thinking pauses.
-  const joinBase = (text: string, base: string) =>
-    base.trim() ? `${base.trimEnd()} ${text}` : text;
-  const dict = useDictation({
+  // (transcript → editable text in the box), and ↑ stop-&-send. No silence
+  // auto-stop; the Deepgram KeepAlive carries thinking pauses.
+  const dict = useWaveformDictation({
     baseText: input,
-    reviewOnStop: true,
-    onText: (t, b) => setInput(joinBase(t, b)),
-    onInterim: (t, b) => setInput(joinBase(t, b)),
-    onAutoSubmit: (t, b) => {
+    onText: setInput,
+    onInterim: setInput,
+    onSend: (t) => {
       setInput("");
-      void sendChatText(joinBase(t, b));
+      void sendChatText(t);
     },
     onCancel: (b) => setInput(b),
   });
-  // Sample the mic level into a scrolling bar history while recording — the
-  // hook's `level` is a smoothed 0..1 envelope updated on the rAF clock.
-  const levelRef = useRef(0);
-  levelRef.current = dict.level;
-  const [bars, setBars] = useState<number[]>([]);
-  useEffect(() => {
-    if (dict.state !== "recording") {
-      setBars([]);
-      return;
-    }
-    const t = setInterval(() => setBars((b) => [...b.slice(-41), levelRef.current]), 90);
-    return () => clearInterval(t);
-  }, [dict.state]);
 
   // ---------------- voice mode: realtime session lifecycle ----------------
   function teardownVoice() {
@@ -320,7 +303,13 @@ export function Converse({ onClose }: { onClose: () => void }) {
           if (audioRef.current) audioRef.current.srcObject = e.streams[0];
         };
 
-        const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Explicit echo cancellation / noise suppression: the phone speaker's
+        // own output leaking back into the mic can read as the user barging in,
+        // which makes the realtime API cut its reply mid-word (semantic VAD +
+        // interrupt_response). Sam hit exactly that on a first, loudest reply.
+        const mic = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
         micRef.current = mic;
         for (const track of mic.getTracks()) pc.addTrack(track, mic);
 
@@ -618,56 +607,10 @@ export function Converse({ onClose }: { onClose: () => void }) {
             End voice
           </button>
         </div>
-      ) : dict.state !== "idle" ? (
-        // ---- dictation in progress: the waveform recorder (plan mockup) ----
-        <div className="flex items-center gap-2 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
-          <button
-            type="button"
-            className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground disabled:opacity-50 md:size-9"
-            onClick={() => dict.cancel()}
-            disabled={dict.state === "transcribing"}
-            aria-label="Cancel dictation"
-            title="Cancel"
-          >
-            <X className="size-5 md:size-4" />
-          </button>
-          <div className="flex h-11 min-w-0 flex-1 items-center justify-center gap-[3px] overflow-hidden rounded-2xl border border-border bg-muted/50 px-3 md:h-9">
-            {dict.state === "transcribing" ? (
-              <span className="text-sm text-muted-foreground">transcribing…</span>
-            ) : bars.length === 0 ? (
-              <span className="text-sm text-muted-foreground">listening…</span>
-            ) : (
-              bars.map((v, i) => (
-                <div
-                  key={i}
-                  className="w-[3px] shrink-0 rounded-full bg-foreground/70"
-                  style={{ height: `${4 + Math.round(v * 26)}px` }}
-                />
-              ))
-            )}
-          </div>
-          {/* ✓ stop → transcript lands in the box for review */}
-          <button
-            type="button"
-            className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
-            onClick={() => void dict.stop(false)}
-            disabled={dict.state === "transcribing"}
-            aria-label="Stop and review"
-            title="Stop — review before sending"
-          >
-            <Check className="size-5 md:size-4" />
-          </button>
-          {/* ↑ stop → transcript sends immediately */}
-          <button
-            type="button"
-            className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
-            onClick={() => void dict.stop(true)}
-            disabled={dict.state === "transcribing"}
-            aria-label="Stop and send"
-            title="Stop and send"
-          >
-            <ArrowUp className="size-5 md:size-4" />
-          </button>
+      ) : dict.active ? (
+        // ---- dictation in progress: the shared waveform recorder ----
+        <div className="border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+          <WaveformRecorderRow rec={dict} />
         </div>
       ) : (
         <form

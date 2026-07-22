@@ -105,7 +105,7 @@ import { Badge } from "@/components/ui/badge";
 import { ImageAnnotator } from "@/components/ImageAnnotator";
 import { SessionDiffBar } from "@/components/SessionDiffView";
 import { VaultView } from "@/components/VaultView";
-import { MicButton, recordingButtonStyle, useDictation, MIC_LONG_PRESS_MS, MIC_CANCEL_DRAG_PX, type MicHandle } from "@/components/dictation";
+import { MicButton, recordingButtonStyle, useDictation, useWaveformDictation, WaveformRecorderRow, MIC_LONG_PRESS_MS, MIC_CANCEL_DRAG_PX, type MicHandle } from "@/components/dictation";
 import { CaptureView } from "@/components/CaptureView";
 import { HomeView } from "@/components/HomeView";
 import { SearchView } from "@/components/SearchView";
@@ -6213,6 +6213,21 @@ function SessionChat({
   const sid = session.sessionId;
   const [messageText, setMessageText] = useState("");
   const [sending, setSending] = useState(false);
+  // Waveform dictation for session follow-ups ("sick of having to type" —
+  // Sam, 2026-07-22): tap the mic → the composer row swaps to the shared
+  // recorder (✕ / waveform / ✓ review / ↑ send). ✓ lands the transcript in
+  // the box (review, then steer/queue as usual); ↑ sends as a steer.
+  const rec = useWaveformDictation({
+    baseText: messageText,
+    onText: setMessageText,
+    onInterim: setMessageText,
+    onSend: (t) => void sendMessage(undefined, t),
+    onCancel: (b) => setMessageText(b),
+  });
+  const recRecording = rec.state === "recording";
+  useEffect(() => {
+    onDictatingChange?.(recRecording);
+  }, [recRecording, onDictatingChange]);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [annotatingId, setAnnotatingId] = useState<string | null>(null);
@@ -6467,6 +6482,10 @@ function SessionChat({
             </div>
           ) : null}
           <div className="flex items-end gap-2">
+            {rec.active ? (
+              <WaveformRecorderRow rec={rec} />
+            ) : (
+              <>
             <Button
               size="icon"
               type="button"
@@ -6518,6 +6537,21 @@ function SessionChat({
                 <Pause className="size-4" />
               </Button>
             ) : null}
+            {/* Waveform dictation for follow-ups: tap → recorder row (✕/✓/↑). */}
+            {rec.supported ? (
+              <Button
+                size="icon"
+                type="button"
+                variant="tint"
+                className="size-11 md:size-9"
+                onClick={() => void rec.start()}
+                aria-label="Dictate"
+                title="Dictate — you review before sending"
+                disabled={sending}
+              >
+                <Mic className="size-4" />
+              </Button>
+            ) : null}
             {/* Tap steers the active turn; long-press queues without interrupting. */}
             <ComposerSendButton
               className="size-11 md:size-9"
@@ -6539,6 +6573,8 @@ function SessionChat({
               }}
               onCancel={(base) => setMessageText(base)}
             />
+              </>
+            )}
           </div>
         </form>
       ) : null}
