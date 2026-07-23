@@ -1,6 +1,7 @@
 # Upstream Adoption Plan — pulling BennyKok/lfg features into CalyxApp/lfg
 
-> **Priority: HIGH.** Status: **plan of record — not yet started.**
+> **Priority: HIGH.** Status: **spikes 1+2 complete — P0 execution in progress** (branch
+> `upstream/p0-engine-lift`).
 > Author: exploration pass, 2026-07-23. Owner: Sam.
 >
 > This plan is based on a deep read of the upstream code at tag `8c86d77`. Re-verify
@@ -45,12 +46,14 @@ conflict-free):** ~25 files. `bun install` of the 4 SDK deps was clean. The depe
   `coding-agent-adapters.ts`, `agent-catalog.ts`, `tmux.ts`
 - **Transitive ring (8):** `managed.ts`, `lfg-capabilities.ts`, `model-discovery.ts`, `resume-cache.ts`,
   `trace-log.ts`, `artifacts.ts`, `settings.ts`, `session-cache.ts`
-- **Non-serve callers of the changed API (3):** `actions/index.ts`, `commands/whatsapp.ts`, `sendq.ts`,
+- **Non-serve callers of the changed API (4):** `actions/index.ts`, `commands/whatsapp.ts`, `sendq.ts`,
   `commands/agents.ts` — also `ours: 0`, take upstream's.
 
 **Notable coupling discovery:** lifting the engine **pulls in `artifacts.ts` (a P2 file)** because the
 new `transcript-index.ts` imports it. So P0 and P2 are coupled through the new transcript index — you
 can't take the modern engine without at least the artifacts *module* (the UI is still separate).
+Similarly, **`lfg-capabilities.ts` (a P1 file) rides along in the transitive ring** — when scoping P1,
+its module is already present after P0; P1's remaining work is the MCP tools + wiring, not this file.
 
 **Residual typecheck errors after the lift — the actual work, and it's tiny + localized:**
 1. **`src/commands/serve.ts` (~12 errors) — THE reconciliation, and it's ours.** Upstream *deleted*
@@ -120,17 +123,11 @@ Because we've never touched this subsystem, don't fight `git cherry-pick`. Inste
 **Revised effort: Medium** (not Low) — dominated by the `serve.ts` reconciliation and the
 `sessions.ts`/`tmux.ts` ripple. Still low *risk*, because none of it competes with our own changes.
 
-### Corrected first action
-```
-git fetch https://github.com/BennyKok/lfg.git main         # -> FETCH_HEAD @ 8c86d77+
-git checkout -b spike/upstream-agent-engine main
-git checkout FETCH_HEAD -- src/agents/backends/{aisdk,codex-aisdk,opencode-aisdk,pi}-session.ts \
-    src/agents/backends/draft.ts src/agent-profile.ts \
-    src/aisdk-registry.ts src/sessions.ts src/transcript-index.ts \
-    src/coding-agents.ts src/coding-agent-adapters.ts src/agent-catalog.ts src/tmux.ts
-# add the 4 SDK deps to package.json, then:  bun install  && bun run typecheck
-# then hand-reconcile src/commands/serve.ts dispatch (new-session / resume / send-interrupt)
-```
+### ~~Corrected first action~~ (superseded)
+
+> The file list below was Spike 1's best guess; **Spike 2 mapped the true dependency closure
+> (~25 files, including the transitive ring). Use the canonical execution recipe at the bottom
+> of this doc instead.**
 
 ---
 
@@ -153,7 +150,8 @@ a **command file** (`data/aisdk/<id>.cmd`, append-only JSONL: send/interrupt/clo
 every 250ms) and a **registry entry** (`data/aisdk/<id>.json` — agent writes its live draft + status).
 Transcripts are indexed straight into SQLite. No magic.
 
-**Upstream commits to cherry-pick (in order):**
+**Upstream commits (reference only — do NOT cherry-pick; Spike 1 proved single-commit picks
+conflict on files upstream evolved across chains. Use the subsystem-lift recipe instead):**
 | Commit | What |
 |--------|------|
 | `20e85f0` | codex + opencode harnesses on their official SDKs — ⭐ cleanest, only new files + `package.json` |
@@ -238,8 +236,8 @@ because it sits in the `App.tsx` we've diverged on — likely rebuild in our own
 
 ## Sequencing & risks
 
-1. **P0 first.** Cherry-pick `20e85f0` → `ae03092` (→ optionally `170303c`, `d981e20`), resolve the
-   `serve.ts` dispatch hunks, `bun install`, smoke-test create → turn → interrupt → resume.
+1. **P0 first.** Subsystem lift per the canonical recipe below (NOT cherry-picks — see Spike 1),
+   reconcile `serve.ts`, `bun install`, smoke-test create → turn → interrupt → resume.
 2. **P1 next.** Bring `ask/`, `origin-deliveries`, `lfg-capabilities`, and the MCP tools; wire the
    notification + MCP-registration steps to our setup.
 3. **P2 as a scoped project.** Backend first (verifiable headlessly), UI in our own shell.
@@ -252,12 +250,39 @@ because it sits in the `App.tsx` we've diverged on — likely rebuild in our own
   which to keep; default to ours.
 - Re-verify all hashes/line numbers against a fresh `git fetch` before implementing.
 
-## Suggested first action
+## Canonical P0 execution recipe (from Spike 2's mapped closure)
 
-Prototype P0 on a throwaway branch off our `main`:
+> Supersedes the cherry-pick prototype originally suggested here (Spike 1 proved cherry-picking
+> fails on sequencing artifacts) and Spike 1's shorter file list (missing the transitive ring).
+
 ```
-git fetch https://github.com/BennyKok/lfg.git main
-git checkout -b spike/upstream-agent-engine main
-git cherry-pick 20e85f0 ae03092     # resolve serve.ts / package.json, then bun install
+git fetch https://github.com/BennyKok/lfg.git main          # verify tip is still 8c86d77
+git checkout -b upstream/p0-engine-lift main
+
+# 1. Wholesale lift — all files are ours:0, so "take theirs" is conflict-free:
+git checkout FETCH_HEAD -- \
+    src/agents/backends/aisdk-session.ts src/agents/backends/codex-aisdk-session.ts \
+    src/agents/backends/opencode-aisdk-session.ts src/agents/backends/pi-session.ts \
+    src/agents/backends/draft.ts src/agent-profile.ts \
+    src/aisdk-registry.ts src/sessions.ts src/transcript-index.ts \
+    src/coding-agents.ts src/coding-agent-adapters.ts src/agent-catalog.ts src/tmux.ts \
+    src/managed.ts src/lfg-capabilities.ts src/model-discovery.ts src/resume-cache.ts \
+    src/trace-log.ts src/artifacts.ts src/settings.ts src/session-cache.ts \
+    src/actions/index.ts src/commands/whatsapp.ts src/sendq.ts src/commands/agents.ts
+
+# 2. Deps: add @anthropic-ai/claude-agent-sdk ^0.3.205, @openai/codex-sdk 0.144.1,
+#    @opencode-ai/sdk ^1.17.7, @mariozechner/pi-coding-agent 0.73.1; then bun install.
+
+# 3. Delete src/session-brain/ (upstream removed it; we never modified it).
+
+# 4. Typecheck (no `typecheck` script in our package.json — run tsc directly):
+#      bunx tsc --noEmit
+#    Expected residual errors, all local:
+#      - serve.ts: migrate ~5 old transcript-read calls (recentMessages, messagePage, …)
+#        onto the new transcript-index API + HtmlMessage typing fixes,
+#        while KEEPING our own added routes.
+#      - commands/agents.ts should be clean (lifted); if a union error appears
+#        (AutoAgentBackend vs grok), it's a one-line fix.
+
+# 5. Smoke-test: create session → send turn → interrupt → resume.
 ```
-Report exactly what conflicts, then decide scope for the real branch.
