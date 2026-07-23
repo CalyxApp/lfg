@@ -255,6 +255,34 @@ because it sits in the `App.tsx` we've diverged on — likely rebuild in our own
 
 ---
 
+## ✅ P2 executed + test deployment (2026-07-23, branch `upstream/p0-engine-lift`)
+
+**P2 backend** — lifted `shipped.ts`, `artifact-previews.ts`, `artifact-refresh.ts` (+4 test
+files, 28/28 pass), added `sharp`; ported the full artifact route cluster into our `serve.ts`
+(gallery, file serving with webp previews / sandboxed live-HTML CSP / byte-range video,
+owner-scoped delete, publish image/video/html, refresh config + refresh-now, real
+`/api/shipped`). Note: `POST /api/shipped` with an `id` only *updates* an existing post —
+omit `id` to create.
+
+**P2 UI** — built in our own shell (no `App.tsx` merge, as planned): new `ArtifactsView` +
+`ShippedView` components, routable as `#artifacts` / `#shipped`, in the desktop icon tabs and
+the mobile "Also under Agents" chips. Session-brain *entry points* removed (chips, Settings
+row); the dead deep plumbing (swipe-to-brain, `SessionBrainView`) is unreachable and left for
+a dedicated cleanup pass.
+
+**Deployment (test, parallel to production)** — this box:
+- Checkout: `/home/openclaw/lfg-next` (clone of the branch; `.env` copied from
+  `lfg-fork` with `LFG_PORT=8768`). Gotcha: systemd reads `EnvironmentFile` *after*
+  `Environment=`, so the port lives in `.env`, not the unit.
+- Service: `systemd --user` unit `lfg-next.service` (enabled; mirror of `lfg-fork.service`).
+- URL: **https://chiron-server.tail5226b1.ts.net:8446** (tailscale serve → 127.0.0.1:8768;
+  added via passwordless `sudo tailscale serve --bg --https 8446 …`).
+- Production (`lfg-fork.service`, :8444/:8445 → 8767) untouched. Both instances share the
+  tmux server + transcript discovery, so the fleet is visible from both; data dirs
+  (asks, artifacts, shipped, titles) are per-checkout.
+- Seeded: one live HTML artifact ("Adoption build status") + one Shipped post, so the new
+  views render real content on first open.
+
 ## Sequencing & risks
 
 1. **P0 first.** Subsystem lift per the canonical recipe below (NOT cherry-picks — see Spike 1),
