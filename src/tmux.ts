@@ -1,9 +1,10 @@
 // Map a live process to its tmux pane and inject input. Claude Code sessions
 // run inside tmux panes; we discover the `claude` pid via pgrep/proc, walk up
 // its parent chain to the pane's top process, and `send-keys` into that pane.
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, realpathSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { reposRoot } from "./projects";
+import { LFG_CAPABILITY_VERSION, withLfgRuntimeContract } from "./lfg-capabilities.ts";
 
 // Known-good Claude model alias to launch with when a caller doesn't specify
 // one. Never launch a managed `claude` bare — see spawnManagedSession. Opus is
@@ -33,6 +34,97 @@ export function ensureFolderTrusted(cwd: string): void {
   } catch {
     // best-effort — if we can't patch the config the worst case is the old hang
   }
+}
+
+// cursor-agent shows a blocking "Workspace Trust Required" dialog the first time
+// it opens an untrusted cwd — and its --trust flag only applies to --print mode,
+// so a spawned TUI session hangs on the dialog forever, never runs a turn, and
+// never writes its transcript (so it also never streams). Pre-write the trust
+// marker cursor persists on accept: ~/.cursor/projects/<enc-cwd>/.workspace-trusted,
+// where <enc-cwd> is the abs cwd with the leading slash dropped and remaining
+// slashes turned into dashes. Idempotent; best-effort.
+function ensureCursorFolderTrusted(cwd: string): void {
+  try {
+    if (!cwd.startsWith("/")) return;
+    const enc = cwd.replace(/^\/+/, "").replace(/\//g, "-");
+    const dir = `${homedir()}/.cursor/projects/${enc}`;
+    const marker = `${dir}/.workspace-trusted`;
+    if (existsSync(marker)) return;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      marker,
+      JSON.stringify({ trustedAt: new Date().toISOString(), workspacePath: cwd }, null, 2),
+    );
+  } catch {
+    // best-effort — worst case is the old trust-dialog hang
+  }
+}
+
+function addSessionEnv(argv: string[], sessionId?: string | null, user?: string | null): void {
+  const i = argv.indexOf("new-session");
+  if (i < 0) return;
+  const env: string[] = [];
+  if (sessionId) env.push("-e", `LFG_SESSION_ID=${sessionId}`);
+  env.push("-e", `LFG_CAPABILITY_VERSION=${LFG_CAPABILITY_VERSION}`);
+  // The assigned user rides along so anything the session spawns (lfg MCP,
+  // `lfg subagent`) can tag ITS children to the same user even when the parent
+  // chain isn't resolvable at create time (headless/cron callers).
+  if (user) env.push("-e", `LFG_USER=${user}`);
+  if (env.length) argv.splice(i + 1, 0, ...env);
+}
+
+type AgentContainment = {
+  name: string;
+  cwd: string;
+  lfgSessionId?: string | null;
+  lfgUser?: string | null;
+};
+
+/**
+ * Run a subagent as a transient user service in the aggregate agent slice.
+ * A service (rather than a scope) gives systemd a main process: when it exits,
+ * KillMode=control-group reaps helper daemons such as agent-browser. Blocking
+ * the service's session bus also prevents Chromium from moving itself into an
+ * unrestricted app-org.chromium scope outside the slice.
+ */
+export function containedAgentCommand(command: string[], opts: AgentContainment): string[] {
+  if (process.platform !== "linux") return command;
+  const systemdRun = Bun.which("systemd-run") ?? "/usr/bin/systemd-run";
+  const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
+  const argv = [
+    systemdRun,
+    "--user",
+    "--quiet",
+    "--pty",
+    "--wait",
+    "--collect",
+    `--unit=lfg-agent-${opts.name}`,
+    "--slice=lfg-agents.slice",
+    `--working-directory=${opts.cwd}`,
+    "--property=Type=exec",
+    "--property=KillMode=control-group",
+    "--property=OOMScoreAdjust=200",
+    `--setenv=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/lfg-agent-no-session-bus`,
+    `--setenv=AGENT_BROWSER_SESSION=${opts.name}`,
+    "--setenv=AGENT_BROWSER_IDLE_TIMEOUT_MS=300000",
+  ];
+  if (process.env.PATH) argv.push(`--setenv=PATH=${process.env.PATH}`);
+  if (opts.lfgSessionId) argv.push(`--setenv=LFG_SESSION_ID=${opts.lfgSessionId}`);
+  argv.push(`--setenv=LFG_CAPABILITY_VERSION=${LFG_CAPABILITY_VERSION}`);
+  if (opts.lfgUser) argv.push(`--setenv=LFG_USER=${opts.lfgUser}`);
+  return [...argv, "--", ...command];
+}
+
+function containTmuxCommand(
+  argv: string[],
+  executable: string,
+  enabled: boolean | undefined,
+  opts: AgentContainment,
+): void {
+  if (!enabled) return;
+  const commandIndex = argv.indexOf(executable);
+  if (commandIndex < 0) throw new Error(`agent executable not found in tmux argv: ${executable}`);
+  argv.splice(commandIndex, argv.length - commandIndex, ...containedAgentCommand(argv.slice(commandIndex), opts));
 }
 
 // Resolve the `claude` executable to an absolute path. We must NOT rely on a
@@ -87,6 +179,55 @@ export function grokBin(): string {
     if (existsSync(p)) return (_grokBin = p);
   }
   return (_grokBin = "grok");
+}
+
+let _copilotBin: string | null = null;
+export function copilotBin(): string {
+  if (_copilotBin) return _copilotBin;
+  const onPath = Bun.which("copilot");
+  if (onPath) return (_copilotBin = onPath);
+  const home = process.env.HOME ?? homedir();
+  const candidates = [
+    process.env.LFG_COPILOT_PATH ?? "",
+    `${home}/.local/bin/copilot`,
+    `${home}/.bun/bin/copilot`,
+    "/usr/local/bin/copilot",
+  ];
+  for (const p of candidates) {
+    if (existsSync(p)) return (_copilotBin = p);
+  }
+  return (_copilotBin = "copilot");
+}
+
+let _cursorBin: string | null = null;
+function isGrokAgentPath(path: string): boolean {
+  try {
+    const real = realpathSync(path);
+    return real.includes("/.grok/") || real.endsWith("/grok-linux-x86_64");
+  } catch {
+    return path.includes("/.grok/");
+  }
+}
+
+export function cursorBin(): string {
+  if (_cursorBin) return _cursorBin;
+  const cursorAgent = Bun.which("cursor-agent");
+  if (cursorAgent) return (_cursorBin = cursorAgent);
+  const agentOnPath = Bun.which("agent");
+  if (agentOnPath && !isGrokAgentPath(agentOnPath)) return (_cursorBin = agentOnPath);
+  const home = process.env.HOME ?? homedir();
+  for (const p of [
+    process.env.LFG_CURSOR_PATH ?? "",
+    `${home}/.local/bin/cursor-agent`,
+    `${home}/.bun/bin/cursor-agent`,
+    "/usr/local/bin/cursor-agent",
+    `${home}/.local/bin/agent`,
+    `${home}/.bun/bin/agent`,
+    "/usr/local/bin/agent",
+  ]) {
+    if (p && existsSync(p) && !isGrokAgentPath(p)) return (_cursorBin = p);
+  }
+  return (_cursorBin = "cursor-agent");
 }
 
 let _hermesBin: string | null = null;
@@ -147,6 +288,22 @@ function ppidOf(pid: number): number | null {
   }
 }
 
+// A subagent launched via `containedAgentCommand` runs as a systemd transient
+// service (`systemd-run --user --unit=lfg-agent-<tmuxName> --slice=lfg-agents.slice`).
+// systemd reparents it under the `systemd --user` manager, so its /proc parent
+// chain never passes through the tmux pane pid — the ppid walk below can't find
+// the pane. But the cgroup records the unit, and by construction the unit suffix
+// IS the tmux session name (see containedAgentCommand). Recover it from there.
+function tmuxSessionFromAgentCgroup(pid: number): string | null {
+  try {
+    const cg = readFileSync(`/proc/${pid}/cgroup`, "utf8");
+    const m = cg.match(/lfg-agent-([^./\s]+)\.service/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 export function tmuxTargetForPid(pid: number | null): string | null {
   if (!pid) return null;
   const panes = paneMap();
@@ -154,6 +311,17 @@ export function tmuxTargetForPid(pid: number | null): string | null {
   for (let i = 0; i < 12 && cur && cur > 1; i++) {
     if (panes.has(cur)) return panes.get(cur) as string;
     cur = ppidOf(cur);
+  }
+  // Fallback for slice-contained subagents whose parent chain leaves the pane
+  // tree (see tmuxSessionFromAgentCgroup). Map the cgroup unit → its tmux
+  // session's pane target. The pane still runs the `systemd-run` wrapper, so it
+  // is the correct capture/send target for the agent's TUI.
+  const session = tmuxSessionFromAgentCgroup(pid);
+  if (session) {
+    const prefix = `${session}:`;
+    for (const target of panes.values()) {
+      if (target.startsWith(prefix)) return target;
+    }
   }
   return null;
 }
@@ -277,6 +445,9 @@ export function spawnManagedSession(opts: {
   // sessionId/transcript, so the caller resolves the live id from the pidfile
   // afterwards (same as a fresh spawn). The full prior history is preserved.
   resume?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  containInAgentSlice?: boolean;
 }): { ok: boolean; error?: string } {
   const dec = new TextDecoder();
   ensureFolderTrusted(opts.cwd);
@@ -300,7 +471,10 @@ export function spawnManagedSession(opts: {
   // `--` terminates option parsing so the variadic --add-dir can't swallow the
   // positional prompt as a second directory (which strands the new session at
   // an empty composer — the first message never gets submitted).
-  if (opts.prompt && opts.prompt.trim()) argv.push("--", opts.prompt);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push("--", prompt);
+  addSessionEnv(argv, opts.lfgSessionId, opts.lfgUser);
+  containTmuxCommand(argv, claudeBin(), opts.containInAgentSlice, opts);
   const create = Bun.spawnSync(argv);
   if (create.exitCode !== 0)
     return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
@@ -341,6 +515,9 @@ export function spawnManagedCodexSession(opts: {
   prompt?: string;
   model?: string;
   thinkingLevel?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  containInAgentSlice?: boolean;
 }): { ok: boolean; error?: string } {
   const dec = new TextDecoder();
   const argv = [
@@ -363,7 +540,10 @@ export function spawnManagedCodexSession(opts: {
   ];
   if (opts.model) argv.push("--model", opts.model);
   if (opts.thinkingLevel) argv.push("-c", `reasoning_effort=${JSON.stringify(opts.thinkingLevel)}`);
-  if (opts.prompt && opts.prompt.trim()) argv.push("--", opts.prompt);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push("--", prompt);
+  addSessionEnv(argv, opts.lfgSessionId, opts.lfgUser);
+  containTmuxCommand(argv, codexBin(), opts.containInAgentSlice, opts);
   const create = Bun.spawnSync(argv);
   if (create.exitCode !== 0)
     return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
@@ -376,6 +556,9 @@ export function spawnManagedGrokSession(opts: {
   prompt?: string;
   model?: string;
   thinkingLevel?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  containInAgentSlice?: boolean;
 }): { ok: boolean; error?: string } {
   const dec = new TextDecoder();
   const argv = [
@@ -396,11 +579,133 @@ export function spawnManagedGrokSession(opts: {
   if (opts.model) argv.push("--model", opts.model);
   const effort = claudeEffortFor(opts.thinkingLevel);
   if (effort) argv.push("--effort", effort);
-  if (opts.prompt && opts.prompt.trim()) argv.push("--", opts.prompt);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push("--", prompt);
+  addSessionEnv(argv, opts.lfgSessionId, opts.lfgUser);
+  containTmuxCommand(argv, grokBin(), opts.containInAgentSlice, opts);
   const create = Bun.spawnSync(argv);
   if (create.exitCode !== 0)
     return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
   return { ok: true };
+}
+
+export type ManagedCopilotSessionOptions = {
+  name: string;
+  cwd: string;
+  prompt?: string;
+  model?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  containInAgentSlice?: boolean;
+};
+
+// The Copilot TUI has two prompt-delivery flags:
+//   -p / --prompt <text>      programmatic one-shot; exits after the turn
+//   -i / --interactive <text> starts interactive mode and auto-executes <text>
+// LFG wants a long-lived, steerable session, so use -i. It preserves the whole
+// downstream contract (send/steer/answer) that the rest of tmux.ts drives.
+//
+// --allow-all-tools bypasses per-tool approvals. GitHub explicitly recommends
+// it only in isolated environments; LFG's agent slice is resource-only, so it
+// is opt-in through LFG_COPILOT_ALLOW_ALL_TOOLS=1 rather than always-on.
+export function managedCopilotSessionArgv(opts: ManagedCopilotSessionOptions): string[] {
+  const argv = [
+    "tmux",
+    "new-session",
+    "-d",
+    "-s",
+    opts.name,
+    "-c",
+    opts.cwd,
+    copilotBin(),
+  ];
+  if (process.env.LFG_COPILOT_ALLOW_ALL_TOOLS === "1") argv.push("--allow-all-tools");
+  if (opts.model) argv.push("--model", opts.model);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push("-i", prompt);
+  addSessionEnv(argv, opts.lfgSessionId, opts.lfgUser);
+  return argv;
+}
+
+export function spawnManagedCopilotSession(opts: ManagedCopilotSessionOptions): { ok: boolean; error?: string } {
+  const dec = new TextDecoder();
+  const argv = managedCopilotSessionArgv(opts);
+  containTmuxCommand(argv, copilotBin(), opts.containInAgentSlice, opts);
+  const create = Bun.spawnSync(argv);
+  if (create.exitCode !== 0)
+    return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
+  return { ok: true };
+}
+
+export type ManagedCursorSessionOptions = {
+  name: string;
+  cwd: string;
+  prompt?: string;
+  model?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  nativeSessionId?: string;
+  containInAgentSlice?: boolean;
+};
+
+export function managedCursorSessionArgv(opts: ManagedCursorSessionOptions): string[] {
+  const argv = [
+    "tmux",
+    "new-session",
+    "-d",
+    "-s",
+    opts.name,
+    "-c",
+    opts.cwd,
+    cursorBin(),
+    "--yolo",
+    "--sandbox",
+    "disabled",
+  ];
+  if (opts.nativeSessionId) argv.push("--resume", opts.nativeSessionId);
+  if (opts.model && opts.model !== "auto") argv.push("--model", opts.model);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push(prompt);
+  addSessionEnv(argv, opts.lfgSessionId, opts.lfgUser);
+  return argv;
+}
+
+export function cursorChatIdFromOutput(output: string): string | null {
+  return output.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i)?.[0] ?? null;
+}
+
+export function spawnManagedCursorSession(opts: ManagedCursorSessionOptions): {
+  ok: boolean;
+  error?: string;
+  nativeSessionId?: string;
+} {
+  const dec = new TextDecoder();
+  // Pre-accept workspace trust so the TUI doesn't hang on the trust dialog
+  // (which would also block the transcript that the live view streams). `--yolo`
+  // suppresses Cursor's per-command approval selector; `--sandbox disabled`
+  // alone still asks before shell calls and can strand a live session mid-turn.
+  ensureCursorFolderTrusted(opts.cwd);
+  // Allocate Cursor's native chat id before starting the TUI. Discovering it as
+  // "the newest transcript in cwd" races with old chats: until the new file is
+  // created, newest is necessarily a previous session and the live view
+  // backfills that conversation. An explicit id makes the mapping deterministic.
+  const chat = Bun.spawnSync({
+    cmd: [cursorBin(), "create-chat"],
+    cwd: opts.cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (chat.exitCode !== 0) {
+    return { ok: false, error: dec.decode(chat.stderr) || "failed to create cursor chat" };
+  }
+  const nativeSessionId = cursorChatIdFromOutput(dec.decode(chat.stdout));
+  if (!nativeSessionId) return { ok: false, error: "cursor create-chat returned no chat id" };
+  const argv = managedCursorSessionArgv({ ...opts, nativeSessionId });
+  containTmuxCommand(argv, cursorBin(), opts.containInAgentSlice, opts);
+  const create = Bun.spawnSync(argv);
+  if (create.exitCode !== 0)
+    return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
+  return { ok: true, nativeSessionId };
 }
 
 export function spawnManagedHermesSession(opts: {
@@ -408,6 +713,8 @@ export function spawnManagedHermesSession(opts: {
   cwd: string;
   model?: string;
   provider?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
 }): { ok: boolean; error?: string } {
   const dec = new TextDecoder();
   const argv = [
@@ -425,6 +732,7 @@ export function spawnManagedHermesSession(opts: {
   ];
   if (opts.model) argv.push("--model", opts.model);
   if (opts.provider) argv.push("--provider", opts.provider);
+  addSessionEnv(argv, opts.lfgSessionId, opts.lfgUser);
   const create = Bun.spawnSync(argv);
   if (create.exitCode !== 0)
     return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
@@ -443,6 +751,9 @@ export function spawnManagedAisdkSession(opts: {
   model: string;
   sessionId: string;
   thinkingLevel?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  containInAgentSlice?: boolean;
 }): { ok: boolean; error?: string } {
   const dec = new TextDecoder();
   // The provider drives the bundled claude binary, which still honors the trust
@@ -462,7 +773,13 @@ export function spawnManagedAisdkSession(opts: {
   // Forward the requested thinking level; the harness maps it onto the
   // claude-code provider's `effort` option (see aisdk-session.ts).
   if (opts.thinkingLevel) argv.push("--thinking-level", opts.thinkingLevel);
-  if (opts.prompt && opts.prompt.trim()) argv.push("--", opts.prompt);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push("--", prompt);
+  addSessionEnv(argv, opts.lfgSessionId ?? opts.sessionId, opts.lfgUser);
+  containTmuxCommand(argv, process.execPath, opts.containInAgentSlice, {
+    ...opts,
+    lfgSessionId: opts.lfgSessionId ?? opts.sessionId,
+  });
   const create = Bun.spawnSync(argv);
   if (create.exitCode !== 0)
     return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
@@ -481,6 +798,9 @@ export function spawnManagedCodexAisdkSession(opts: {
   model: string;
   key: string;
   thinkingLevel?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  containInAgentSlice?: boolean;
   // When set, resume this existing codex rollout/thread instead of starting a
   // fresh persistent thread — the harness seeds its threadId with it.
   resume?: string;
@@ -504,7 +824,62 @@ export function spawnManagedCodexAisdkSession(opts: {
   ];
   if (opts.thinkingLevel) argv.push("--thinking-level", opts.thinkingLevel);
   if (opts.resume) argv.push("--resume", opts.resume);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push("--", prompt);
+  addSessionEnv(argv, opts.lfgSessionId ?? opts.key, opts.lfgUser);
+  containTmuxCommand(argv, process.execPath, opts.containInAgentSlice, {
+    ...opts,
+    lfgSessionId: opts.lfgSessionId ?? opts.key,
+  });
+  const create = Bun.spawnSync(argv);
+  if (create.exitCode !== 0)
+    return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
+  return { ok: true };
+}
+
+// Spawn a headless "pi" session: the lfg pi-session harness, supervised by a
+// tmux session. Mirrors spawnManagedCodexAisdkSession exactly except it points
+// at the pi harness and passes a control-plane KEY (--key) — pi's own session
+// id (like codex's threadId) is only known once the harness starts the RpcClient,
+// so the key is all we know up front (see the harness header).
+export function spawnManagedPiSession(opts: {
+  name: string;
+  cwd: string;
+  prompt?: string;
+  model: string;
+  key: string;
+  thinkingLevel?: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  containInAgentSlice?: boolean;
+  // When set, resume this existing pi session file instead of starting a fresh
+  // one — the harness passes it through as `--session <id>`.
+  resume?: string;
+}): { ok: boolean; error?: string } {
+  const dec = new TextDecoder();
+  // Harmless for pi: ensureFolderTrusted only patches ~/.claude.json and is a
+  // no-op when that file (or the project entry) is absent. Kept in lockstep
+  // with the other AI-SDK spawn helpers.
+  ensureFolderTrusted(opts.cwd);
+  // Spawn the harness module directly (not via the lfg CLI) so it has no
+  // dependency on the rest of the command surface.
+  const harnessPath = `${import.meta.dir}/agents/backends/pi-session.ts`;
+  const argv = [
+    "tmux", "new-session", "-d", "-s", opts.name, "-c", opts.cwd,
+    process.execPath, harnessPath,
+    "--key", opts.key,
+    "--model", opts.model,
+    "--cwd", opts.cwd,
+    "--tmux", opts.name,
+  ];
+  if (opts.thinkingLevel) argv.push("--thinking-level", opts.thinkingLevel);
+  if (opts.resume) argv.push("--resume", opts.resume);
   if (opts.prompt && opts.prompt.trim()) argv.push("--", opts.prompt);
+  addSessionEnv(argv, opts.lfgSessionId ?? opts.key, opts.lfgUser);
+  containTmuxCommand(argv, process.execPath, opts.containInAgentSlice, {
+    ...opts,
+    lfgSessionId: opts.lfgSessionId ?? opts.key,
+  });
   const create = Bun.spawnSync(argv);
   if (create.exitCode !== 0)
     return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
@@ -523,6 +898,10 @@ export function spawnManagedOpencodeAisdkSession(opts: {
   prompt?: string;
   model: string;
   key: string;
+  lfgSessionId?: string;
+  lfgUser?: string | null;
+  resume?: string;
+  containInAgentSlice?: boolean;
 }): { ok: boolean; error?: string } {
   const dec = new TextDecoder();
   // Harmless for opencode: ensureFolderTrusted only patches ~/.claude.json and
@@ -540,7 +919,14 @@ export function spawnManagedOpencodeAisdkSession(opts: {
     "--cwd", opts.cwd,
     "--tmux", opts.name,
   ];
-  if (opts.prompt && opts.prompt.trim()) argv.push("--", opts.prompt);
+  if (opts.resume) argv.push("--resume", opts.resume);
+  const prompt = withLfgRuntimeContract(opts.prompt);
+  if (prompt?.trim()) argv.push("--", prompt);
+  addSessionEnv(argv, opts.lfgSessionId ?? opts.key, opts.lfgUser);
+  containTmuxCommand(argv, process.execPath, opts.containInAgentSlice, {
+    ...opts,
+    lfgSessionId: opts.lfgSessionId ?? opts.key,
+  });
   const create = Bun.spawnSync(argv);
   if (create.exitCode !== 0)
     return { ok: false, error: dec.decode(create.stderr) || "new-session failed" };
@@ -558,6 +944,58 @@ export function dismissCodexUpdatePrompt(target: string): boolean {
   Bun.spawnSync(["tmux", "send-keys", "-t", target, "-l", "2"]);
   Bun.spawnSync(["tmux", "send-keys", "-t", target, "Enter"]);
   return true;
+}
+
+// cursor-agent shows a blocking "⚠ Workspace Trust Required" dialog before the
+// composer for any untrusted cwd. spawnManagedCursorSession pre-writes the trust
+// marker so it normally never appears, but this is the belt-and-suspenders: if a
+// dialog slips through (marker race, a cwd whose encoding we didn't anticipate,
+// or a session spawned before the marker fix), a dashboard-spawned pane would
+// hang here forever, never run a turn, and never write the transcript the live
+// view streams — i.e. "cursor streaming is broken". Answer it by pressing `a`
+// ("Trust this workspace"). Only that exact dialog; other selectors are left for
+// the dashboard's prompt-answer flow.
+export function dismissCursorTrustPrompt(target: string): boolean {
+  const pane = capturePane(target);
+  if (!pane || !/Workspace Trust Required/i.test(pane) || !/\[a\]\s+Trust this workspace/i.test(pane))
+    return false;
+  Bun.spawnSync(["tmux", "send-keys", "-t", target, "-l", "a"]);
+  return true;
+}
+
+// Claude Code 2.1+ interrupts `claude --resume` of a large/old transcript with a
+// blocking selector ("Resume from summary (recommended) / Resume full session
+// as-is / Don't ask me again") before it reaches the composer. A managed resume
+// has nobody to answer it, so the pane freezes at the menu forever and the
+// session never comes alive — every resume of a big/old session hangs, which
+// reads as "resume is completely broken". Watch the freshly-spawned pane and
+// auto-pick option 2, "Resume full session as-is", which preserves the full
+// prior history — the exact contract spawnManagedSession/relaunch document (and
+// what resume meant before this gate existed). Returns:
+//   "dismissed" — gate found and answered
+//   "ready"     — no gate; composer came up on its own (small/new session)
+//   "timeout"   — neither within the budget (caller proceeds anyway)
+export async function dismissResumeSummaryGate(
+  target: string,
+  opts: { tries?: number; delayMs?: number } = {},
+): Promise<"dismissed" | "ready" | "timeout"> {
+  const tries = opts.tries ?? 24; // ~6s at 250ms — covers a cold, heavy transcript
+  const delayMs = opts.delayMs ?? 250;
+  for (let i = 0; i < tries; i++) {
+    const pane = capturePane(target);
+    if (pane && /Resume from summary/i.test(pane) && /Resume full session as-is/i.test(pane)) {
+      // -l sends the literal "2" (numeric selection), then Enter confirms — same
+      // shape as dismissCodexUpdatePrompt.
+      Bun.spawnSync(["tmux", "send-keys", "-t", target, "-l", "2"]);
+      Bun.spawnSync(["tmux", "send-keys", "-t", target, "Enter"]);
+      return "dismissed";
+    }
+    // Composer reached without a gate → nothing to answer, bail early so small
+    // sessions don't eat the full timeout.
+    if (pane && /bypass permissions on|\? for shortcuts/i.test(pane)) return "ready";
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  return "timeout";
 }
 
 export function capturePane(target: string): string | null {
@@ -630,8 +1068,35 @@ export type PanePrompt = { question: string; options: PromptOption[] };
 // carries the cursor.
 const OPT_RE = /^\s*(❯|›)?\s*(\d+)\.\s+(\S.*?)\s*$/;
 
+function parseCursorApprovalPrompt(lines: string[]): PanePrompt | null {
+  const questionLine = lines.findIndex((line) => /^\s*Run this command\?\s*$/i.test(line));
+  if (questionLine < 0) return null;
+  const window = lines.slice(questionLine + 1, questionLine + 8);
+  if (!window.some((line) => /Not in allowlist/i.test(line))) return null;
+
+  const options: PromptOption[] = [
+    { index: 0, label: "Run once", selected: false },
+    { index: 1, label: "Add command to allowlist", selected: false },
+    { index: 2, label: "Run everything", selected: false },
+    { index: 3, label: "Skip", selected: false },
+  ];
+
+  for (const line of window) {
+    const selected = /^\s*→/.test(line);
+    if (/Run \(once\)/i.test(line)) options[0].selected = selected;
+    else if (/Add Shell\(/i.test(line)) options[1].selected = selected;
+    else if (/Run Everything/i.test(line)) options[2].selected = selected;
+    else if (/Skip/i.test(line)) options[3].selected = selected;
+  }
+
+  return { question: "Run this command?", options };
+}
+
 export function parsePrompt(pane: string): PanePrompt | null {
   const lines = pane.replace(/\s+$/, "").split("\n");
+  const cursorPrompt = parseCursorApprovalPrompt(lines);
+  if (cursorPrompt) return cursorPrompt;
+
   type Hit = { line: number; index: number; label: string; selected: boolean };
   const hits: Hit[] = [];
   for (let i = 0; i < lines.length; i++) {
@@ -698,6 +1163,15 @@ const BUSY_METER = /\(\d+m?\s?\d*s\b[^)]*\btokens?\b/i;
 const GROK_SPINNER = "[⠋⠙⠹⠸⠼⠴⠦⠧]";
 const GROK_QUEUED_WORK = new RegExp(`${GROK_SPINNER}\\s+MCP\\s+\\(\\d+\\/\\d+\\).*?\\+\\d+`);
 const GROK_TURN_STATUS = new RegExp(`${GROK_SPINNER}\\s+\\S.*\\b\\d+(?:\\.\\d+)?s\\b.*\\[stop\\]`);
+// cursor-agent (not Grok CLI): mid-turn the composer row shows "ctrl+c to stop"
+// on the right of the → prompt, and a status line like "Editing  46.74k tokens"
+// sits above it. Idle drops the stop hint and the live token meter. Distinct
+// from Grok's "Ctrl+c:cancel" footer pair below.
+const CURSOR_STOP_HINT = /ctrl\+c to stop/i;
+// Live activity + token meter (e.g. "Reading  48.19k tokens", "Editing  12k tokens").
+// Keep this secondary: only match when the stop hint is also present, or when the
+// spinner-prefixed status line is clearly the cursor live meter (not a transcript).
+const CURSOR_TOKEN_METER = /\b(?:Reading|Editing|Thinking|Generating|Planning|Searching|Running|Working)\b\s+[\d.]+k?\s+tokens?\b/i;
 export function isBusy(pane: string): boolean {
   return (
     BUSY_METER.test(pane) ||
@@ -705,7 +1179,11 @@ export function isBusy(pane: string): boolean {
     GROK_QUEUED_WORK.test(pane) ||
     GROK_TURN_STATUS.test(pane) ||
     (/\b(Thinking|Running|Working|Calling|Executing)\b/i.test(pane) && /\bHermes\b/i.test(pane)) ||
-    (/Ctrl\+c:cancel/i.test(pane) && /Ctrl\+Enter:interject/i.test(pane))
+    (/Ctrl\+c:cancel/i.test(pane) && /Ctrl\+Enter:interject/i.test(pane)) ||
+    // cursor-agent: "ctrl+c to stop" is the stable mid-turn interrupt hint.
+    CURSOR_STOP_HINT.test(pane) ||
+    // Fallback if the stop hint is briefly absent while the token meter is up.
+    CURSOR_TOKEN_METER.test(pane)
   );
 }
 
@@ -756,6 +1234,20 @@ export async function answerPrompt(
       return { ok: true };
     }
     return { ok: false, error: "no active prompt in pane" };
+  }
+  if (/^Run this command\?$/i.test(p.question)) {
+    let key: string | null = null;
+    if (index === 0) key = "y";
+    else if (index === 1) key = "Tab";
+    else if (index === 2) key = "BTab";
+    else if (index === 3) key = "n";
+    if (!key) return { ok: false, error: "option not found" };
+    const r = key.length === 1
+      ? Bun.spawnSync(["tmux", "send-keys", "-t", target, "-l", key])
+      : Bun.spawnSync(["tmux", "send-keys", "-t", target, key]);
+    if (r.exitCode !== 0)
+      return { ok: false, error: new TextDecoder().decode(r.stderr) || "answer failed" };
+    return { ok: true };
   }
   const order = p.options.map((o) => o.index);
   const cur = p.options.find((o) => o.selected)?.index ?? order[0];
@@ -894,8 +1386,49 @@ export function inputBoxText(target: string): string | null {
   const grokBox = grokInputBoxText(lines);
   if (grokBox != null) return grokBox;
 
+  // Codex renders the composer as a `›`-prefixed prompt line at the bottom.
+  // A multi-line draft (explicit newlines or wrap) continues on the following
+  // lines WITHOUT the `›` prefix, then a blank line separates the draft from
+  // the status footer — so collect continuation lines up to that blank line.
+  // Returning only the `›` line made every multi-line send look "never typed"
+  // and the queue clear-retype-fail'd it. Ignore numbered selector rows
+  // (`› 1. ...`) so open prompts don't look like an editable composer.
+  //
+  // This branch must run BEFORE the generic Hermes `>`-prompt fallback below:
+  // that regex matches any transcript line starting with `>` (quotes, diffs,
+  // shell output), which would hijack composer detection in a codex pane.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^\s*›\s*(.*?)\s*$/);
+    if (!m) continue;
+    const text = m[1] ?? "";
+    if (/^\d+\.\s+/.test(text)) return null;
+    const parts = [text];
+    for (let j = i + 1; j < lines.length; j++) {
+      if (!lines[j].trim()) break; // blank line = end of draft, footer follows
+      parts.push(lines[j].trim());
+    }
+    return parts.join("\n");
+  }
+
+  // cursor-agent renders the composer as a single bottom line prefixed with a
+  // right-arrow (U+2192), e.g. `→ message text`, or `→ Add a follow-up` when
+  // empty (the placeholder just won't match the caller's needle). Without this
+  // branch inputBoxText returns null for cursor, boxHasNeedle reads "composer
+  // not visible", and every send retries type-then-clear and fails with
+  // "message never left the input box after retries". Scan bottom-up (the two
+  // status lines below the composer don't start with →) and skip numbered
+  // selector rows the same way the codex branch does.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^\s*→\s*(.*?)\s*$/);
+    if (!m) continue;
+    const text = m[1] ?? "";
+    if (/^\d+\.\s+/.test(text)) return null;
+    return text;
+  }
+
   // Hermes' classic CLI is prompt_toolkit-based and commonly renders a simple
-  // bottom prompt rather than a boxed composer.
+  // bottom prompt rather than a boxed composer. Keep this fallback LAST: `>`
+  // also matches quoted/diff lines in other agents' transcripts.
   for (let i = lines.length - 1; i >= 0; i--) {
     const m = lines[i].match(/^\s*(?:You|User|Human|>>>|❯|>)\s*:?\s*(.*?)\s*$/i);
     if (!m) continue;
@@ -904,12 +1437,16 @@ export function inputBoxText(target: string): string | null {
     return text;
   }
 
-  // Codex renders the composer as a single bottom prompt line:
-  //   › message text
-  // Ignore numbered selector rows (`› 1. ...`) so open prompts don't look like
-  // an editable composer to the send queue.
+  // cursor-agent renders the composer as a single bottom line prefixed with a
+  // right-arrow (U+2192), e.g. `→ message text`, or `→ Add a follow-up` when
+  // empty (the placeholder just won't match the caller's needle). Without this
+  // branch inputBoxText returns null for cursor, boxHasNeedle reads "composer
+  // not visible", and every send retries type-then-clear and fails with
+  // "message never left the input box after retries". Scan bottom-up (the two
+  // status lines below the composer don't start with →) and skip numbered
+  // selector rows the same way the codex branch does.
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = lines[i].match(/^\s*›\s*(.*?)\s*$/);
+    const m = lines[i].match(/^\s*→\s*(.*?)\s*$/);
     if (!m) continue;
     const text = m[1] ?? "";
     if (/^\d+\.\s+/.test(text)) return null;

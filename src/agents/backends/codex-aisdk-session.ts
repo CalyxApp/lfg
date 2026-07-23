@@ -1,12 +1,17 @@
 // Headless interactive session harness for the "codex-aisdk" agent kind.
 //
-// This is the long-lived process behind a "codex (ai sdk)" session. Like its
+// This is the long-lived process behind a managed codex session. Like its
 // Claude sibling (./aisdk-session.ts) it runs inside a tmux pane used purely as
 // a process supervisor + lifecycle handle (we never drive I/O through the pane),
-// and drives a multi-turn conversation through the Vercel AI SDK — here via the
-// ai-sdk-provider-codex-cli app-server provider, which talks JSON-RPC to a
-// `codex app-server` child over stdio. ChatGPT-subscription auth comes from
-// ~/.codex/auth.json; there is NO API key.
+// and drives a multi-turn conversation through the OFFICIAL @openai/codex-sdk
+// (`Codex` → `startThread`/`resumeThread` → `runStreamed`). ChatGPT-subscription
+// auth comes from ~/.codex/auth.json; there is NO API key.
+//
+// History: this harness previously went through the Vercel AI SDK
+// (ai-sdk-provider-codex-cli app-server provider). The official SDK removes the
+// adapter's contortions: `thread.started` reports the thread id the moment the
+// first turn starts (the old path learned it via onSessionCreated + resolved
+// providerMetadata after the turn), and turns take a plain AbortSignal.
 //
 // Control plane is identical to the Claude harness:
 //   - control IN: we tail a command file (data/aisdk/<key>.cmd) for
@@ -14,21 +19,9 @@
 //   - busy + discovery: a registry entry (data/aisdk/<key>.json) we keep
 //     updated; serve reads it for the live-view busy dot and session list.
 //
-// The KEY DIFFERENCE from the Claude harness is the id model. Claude lets us
-// choose a deterministic sessionId up front and writes the transcript JSONL
-// there. Codex does NOT: the `app-server` mints a `threadId` we only learn AFTER
-// turn 1 (from result.providerMetadata['codex-app-server'].threadId), and it
-// persists the rollout under ~/.codex/sessions/... named by that id. So:
-//   - We mint a control-plane KEY (a uuid) up front, used ONLY to name the
-//     registry/command files. serve routes sends/interrupts through it.
-//   - Turn 1 runs with providerOptions { threadMode: 'persistent' }; afterwards
-//     we read the threadId and patch it into the registry.
-//   - Later turns resume with providerOptions { threadId }.
-// The transcript itself is discovered by the EXISTING findCodexTranscriptById /
-// codexThreads once the threadId is known — we never write a custom transcript.
-//
-// Interrupt is an AbortController on the current turn — staying purely on the AI
-// SDK surface (the provider aborts the in-flight RPC turn for us).
+// We mint a control-plane KEY (a uuid) up front for the registry/command files.
+// Codex still reports its own threadId for SDK resume, but lfg indexes the SDK
+// stream directly under the control-plane key instead of reading rollout JSONL.
 import {
   type AisdkCommand,
   cmdPath,
@@ -36,39 +29,115 @@ import {
   removeEntry,
   writeEntry,
 } from "../../aisdk-registry.ts";
+import type { SessionMsg } from "../../sessions.ts";
+import { indexSessionMessagesDirect, reindexFileHistoryUnderSessionKey } from "../../transcript-index.ts";
 import { makeDraftPublisher } from "./draft.ts";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 
 function arg(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-function resolveCodexPath(): string | undefined {
-  const usable = (path: string | undefined | null): string | undefined => {
-    if (!path) return undefined;
-    try {
-      const real = realpathSync(path);
-      return existsSync(real) ? real : undefined;
-    } catch {
-      return undefined;
-    }
-  };
+// Only an EXPLICIT override redirects the SDK away from its bundled codex
+// binary. The SDK pins a matching @openai/codex dependency (protocol-tested
+// pairing); pointing it at an older global CLI risks a protocol mismatch, so —
+// unlike the old provider — we no longer prefer the global binary by default.
+function resolveCodexPathOverride(): string | undefined {
+  const explicit = process.env.LFG_CODEX_PATH;
+  if (!explicit) return undefined;
   try {
-    const explicit = usable(process.env.LFG_CODEX_PATH);
-    if (explicit) return explicit;
-    // The provider defaults to its optional local @openai/codex dependency when
-    // codexPath is absent. Prefer the user's global CLI so resumed app-server
-    // sessions do not get pinned to an older repo-local wrapper.
-    const global = usable(`${homedir()}/.bun/bin/codex`);
-    if (global) return global;
-    return usable(Bun.which("codex")) ?? undefined;
+    const real = realpathSync(explicit);
+    return existsSync(real) ? real : undefined;
   } catch {
     return undefined;
   }
 }
 
+// Shared thread options for both the interactive harness and the one-shot
+// runner: full access + never-approve mirrors the tmux codex session's
+// `--sandbox danger-full-access --ask-for-approval never`.
+function threadOptions(model: string, cwd: string, thinkingLevel?: string) {
+  return {
+    model,
+    workingDirectory: cwd,
+    sandboxMode: "danger-full-access" as const,
+    approvalPolicy: "never" as const,
+    // Managed worktrees live under /tmp — codex refuses non-git dirs otherwise.
+    skipGitRepoCheck: true,
+    ...(thinkingLevel
+      ? { modelReasoningEffort: thinkingLevel as "low" | "medium" | "high" }
+      : {}),
+  };
+}
+
+function compactText(value: string, max = 8_000): string {
+  if (value.length <= max) return value;
+  const head = Math.floor(max * 0.7);
+  const tail = max - head;
+  return `${value.slice(0, head)}\n\n...[${value.length - head - tail} chars omitted]...\n\n${value.slice(-tail)}`;
+}
+
+function stringifyValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function codexCompletedItemMessage(item: Record<string, unknown>, turnNonce: string): SessionMsg | null {
+  // Codex item ids are per-turn counters ("item_0", "item_1", …) that RESET
+  // every turn. The direct index dedupes rows by message id, so without a
+  // per-turn nonce every message of turn 2+ collided with turn 1's ids and
+  // was silently dropped (INSERT OR IGNORE) — the session answered but the
+  // transcript never showed it. The nonce is minted once per runTurn, so
+  // re-emitted item.completed events within a turn still dedupe correctly.
+  const rawId = typeof item.id === "string" && item.id ? item.id : crypto.randomUUID();
+  const id = `${turnNonce}/${rawId}`;
+  const type = typeof item.type === "string" ? item.type : "item";
+  const ts = Date.now();
+  if (type === "agent_message") {
+    const text = typeof item.text === "string" ? item.text.trim() : "";
+    return text ? { id, role: "assistant", kind: "text", text, ts } : null;
+  }
+  if (type === "command_execution") {
+    const command = typeof item.command === "string" ? item.command : "";
+    const output = stringifyValue(item.output ?? item.stdout ?? item.stderr).trim();
+    const text = compactText([command ? `$ ${command}` : "command_execution", output].filter(Boolean).join("\n"));
+    return { id, role: "assistant", kind: "tool_use", text, ts };
+  }
+  if (type === "web_search") {
+    const query = typeof item.query === "string" ? item.query : "";
+    const result = stringifyValue(item.results ?? item.result ?? item.output).trim();
+    const text = compactText([query ? `web_search: ${query}` : "web_search", result].filter(Boolean).join("\n"));
+    return { id, role: "assistant", kind: "tool_use", text, ts };
+  }
+  if (type === "file_change") {
+    const path = typeof item.path === "string" ? item.path : "";
+    const text = compactText([path ? `file_change: ${path}` : "file_change", stringifyValue(item).trim()].filter(Boolean).join("\n"));
+    return { id, role: "assistant", kind: "tool_use", text, ts };
+  }
+  if (type === "reasoning") {
+    const text = stringifyValue(item.summary ?? item.text).trim();
+    return text ? { id, role: "assistant", kind: "thinking", text: compactText(text), ts } : null;
+  }
+  if (type === "error") {
+    // Surface codex error items (e.g. "Model metadata for `X` not found") as a
+    // readable assistant error line, not a raw tool_result JSON blob. apiError
+    // marks it as a genuine upstream failure for status classification.
+    const msg = (typeof item.message === "string" ? item.message : stringifyValue(item)).trim();
+    return msg
+      ? { id, role: "assistant", kind: "text", text: `⚠️ Codex error: ${msg}`, ts, apiError: true }
+      : null;
+  }
+  const text = compactText([type, stringifyValue(item).trim()].filter(Boolean).join("\n"));
+  return text.trim() ? { id, role: "tool", kind: "tool_result", text, ts } : null;
+}
+
+// One-shot headless run for the auto/report runner: single thread, single turn.
 export async function pipeToCodexAiSdk(
   prompt: string,
   log: (s: string) => void,
@@ -76,81 +145,54 @@ export async function pipeToCodexAiSdk(
 ): Promise<string> {
   const model = opts.model ?? "gpt-5.5";
   const cwd = opts.cwd ?? process.cwd();
-  const thinkingLevel = opts.thinkingLevel;
-  const codexPath = resolveCodexPath();
-  const { streamText } = await import("ai");
-  const { createCodexAppServer } = await import("ai-sdk-provider-codex-cli");
+  const { Codex } = await import("@openai/codex-sdk");
+  const codexPathOverride = resolveCodexPathOverride();
+  const codex = new Codex(codexPathOverride ? { codexPathOverride } : {});
 
-  log(`[runner] piping ${prompt.length} chars to codex via ai-sdk (${model})`);
-  const provider = createCodexAppServer({
-    defaultSettings: {
-      cwd,
-      sandboxPolicy: "danger-full-access",
-      approvalPolicy: "never",
-      autoApprove: true,
-      ...(codexPath ? { codexPath } : {}),
-    },
-  });
-
-  try {
-    const llm = provider(
-      model,
-      thinkingLevel ? { effort: thinkingLevel as any } : undefined,
-    );
-    const result = streamText({
-      model: llm,
-      prompt,
-      providerOptions: {
-        "codex-app-server": {
-          threadMode: "stateless",
-          ...(thinkingLevel ? { effort: thinkingLevel } : {}),
-        },
-      },
-    } as any);
-    let chars = 0;
-    let lastEmit = 0;
-    const flush = (force = false) => {
-      const now = Date.now();
-      if (force || now - lastEmit > 800) {
-        lastEmit = now;
-        const k = chars >= 1000 ? `${(chars / 1000).toFixed(1)}k` : String(chars);
-        log(`[runner] codex generating… ${k} chars`);
-      }
-    };
-    for await (const part of result.fullStream as any) {
-      if (part?.type === "text-delta") {
-        chars += String(part.text ?? part.textDelta ?? part.delta ?? "").length;
-        flush();
-      } else if (part?.type === "tool-call") {
-        log(`[runner] codex running tool: ${part.toolName ?? "?"}`);
-      } else if (part?.type === "error") {
-        throw new Error(String((part as any).error).slice(0, 800));
-      }
+  log(`[runner] piping ${prompt.length} chars to codex via codex-sdk (${model})`);
+  const thread = codex.startThread(threadOptions(model, cwd, opts.thinkingLevel));
+  const { events } = await thread.runStreamed(prompt);
+  let text = "";
+  let chars = 0;
+  let lastEmit = 0;
+  const flush = (force = false) => {
+    const now = Date.now();
+    if (force || now - lastEmit > 800) {
+      lastEmit = now;
+      const k = chars >= 1000 ? `${(chars / 1000).toFixed(1)}k` : String(chars);
+      log(`[runner] codex generating… ${k} chars`);
     }
-    const text = await result.text;
-    flush(true);
-    if (!text || !text.trim()) throw new Error("codex ai-sdk backend produced empty result");
-    log(`[runner] codex ai-sdk done (${text.length} chars)`);
-    return text;
-  } finally {
-    await provider.dispose?.().catch(() => {});
+  };
+  for await (const event of events) {
+    if (event.type === "item.completed" && event.item.type === "agent_message") {
+      text += (text ? "\n\n" : "") + event.item.text;
+      chars = text.length;
+      flush();
+    } else if (event.type === "item.started" && event.item.type === "command_execution") {
+      log(`[runner] codex running: ${(event.item as { command?: string }).command ?? "?"}`);
+    } else if (event.type === "turn.failed") {
+      throw new Error(String(event.error?.message ?? "codex turn failed").slice(0, 800));
+    } else if (event.type === "error") {
+      throw new Error(String(event.message ?? "codex thread error").slice(0, 800));
+    }
   }
+  flush(true);
+  if (!text.trim()) throw new Error("codex sdk backend produced empty result");
+  log(`[runner] codex sdk done (${text.length} chars)`);
+  return text;
 }
 
 export async function cmdCodexAisdkSession(argv: string[]): Promise<void> {
   // The control-plane key (a uuid) — names the registry/command files. NOT the
-  // codex thread id (which we don't know until after turn 1).
+  // codex thread id (which we learn at thread.started on turn 1).
   const keyArg = arg(argv, "--key");
   const model = arg(argv, "--model") ?? "gpt-5.5";
   const thinkingLevel = arg(argv, "--thinking-level");
   const cwd = arg(argv, "--cwd") ?? process.cwd();
   const tmuxName = arg(argv, "--tmux") ?? "";
-  // Resuming a closed codex session: the rollout's threadId is known up front, so
-  // we seed `threadId` with it (below) and turn 1 resumes that thread instead of
-  // minting a new persistent one. Absent on a fresh session.
+  // Resuming a closed codex session: the rollout's threadId is known up front.
   const resumeThreadId = arg(argv, "--resume");
-  // Everything after `--` is the initial prompt (mirrors how the Claude harness
-  // and the tmux codex session pass the first message).
+  // Everything after `--` is the initial prompt.
   const dashI = argv.indexOf("--");
   const initialPrompt = dashI >= 0 ? argv.slice(dashI + 1).join(" ").trim() : "";
 
@@ -164,51 +206,32 @@ export async function cmdCodexAisdkSession(argv: string[]): Promise<void> {
     process.chdir(cwd);
   } catch {}
 
-  const codexPath = resolveCodexPath();
-  const { streamText } = await import("ai");
-  // Lazy-import the provider so the rest of the CLI never hard-depends on it.
-  const { createCodexAppServer } = await import("ai-sdk-provider-codex-cli");
-  // When resuming, the threadId is the rollout id we were handed; seed it so the
-  // first turn resumes that thread. Otherwise it's learned early via
-  // onSessionCreated, then reused to resume on later turns.
+  // Resuming a codex thread under a fresh control-plane key: the thread's history
+  // was tailed into the index under its native threadId, so the pane keyed by
+  // `key` would render empty. Seed the synthetic key from the threadId's history
+  // (no-op if the key already has rows or the thread has none) — visible history
+  // now, new turns append after it. See reindexFileHistoryUnderSessionKey.
+  if (resumeThreadId && resumeThreadId !== key) {
+    reindexFileHistoryUnderSessionKey(key, resumeThreadId);
+  }
+
+  const { Codex } = await import("@openai/codex-sdk");
+  const codexPathOverride = resolveCodexPathOverride();
+  // Omitting `env` inherits process.env (HOME → ~/.codex auth, LFG_* for MCP).
+  const codex = new Codex(codexPathOverride ? { codexPathOverride } : {});
+  const opts = threadOptions(model, cwd, thinkingLevel ?? undefined);
+  const thread = resumeThreadId
+    ? codex.resumeThread(resumeThreadId, opts)
+    : codex.startThread(opts);
+
   let threadId: string | null = resumeThreadId ?? null;
 
-  // One provider per harness: it owns a shared `codex app-server` child process
-  // reused across every turn (and resumed thread). Full-access + never-approve
-  // mirrors the tmux codex session's `--sandbox danger-full-access
-  // --ask-for-approval never`. (NB: the app-server settings name these
-  // `sandboxPolicy`/`approvalPolicy`, not the exec-mode `sandboxMode`/
-  // `approvalMode` — see the installed types.)
-  const provider = createCodexAppServer({
-    defaultSettings: {
-      cwd,
-      sandboxPolicy: "danger-full-access",
-      approvalPolicy: "never",
-      // Auto-answer any approval request the provider can't route through a
-      // handler, so an unattended turn never blocks waiting on stdin.
-      autoApprove: true,
-      // Codex creates the persistent app-server thread before the turn
-      // completes. Publish that id immediately so lfg can tail the rollout
-      // transcript while the first response is still running.
-      onSessionCreated: (session: { threadId?: string }) => {
-        if (typeof session.threadId === "string" && session.threadId) {
-          threadId = session.threadId;
-          patchEntry(key, { threadId });
-        }
-      },
-      ...(codexPath ? { codexPath } : {}),
-    },
-  });
-
-  // Control-plane registry entry — the moment this exists (and our pid is alive),
-  // serve surfaces the session in the live view. threadId starts null: the live
-  // view falls back to the control-plane key until turn 1 reports the real id.
+  // Control-plane registry entry — the moment this exists (and our pid is
+  // alive), serve surfaces the session in the live view. threadId starts null
+  // on fresh sessions and is patched at turn 1's thread.started event.
   writeEntry({
     sessionId: key,
     agent: "codex",
-    // Resumed sessions already know their threadId, so publish it now (the live
-    // view + transcript discovery key off it). Fresh sessions start null and get
-    // patched once turn 1 reports the id.
     threadId,
     harnessPid: process.pid,
     tmuxName,
@@ -227,64 +250,64 @@ export async function cmdCodexAisdkSession(argv: string[]): Promise<void> {
   const publishDraft = makeDraftPublisher(key);
 
   async function runTurn(prompt: string, signal: AbortSignal): Promise<void> {
-    // No AskUserQuestion handling needed here: the codex app-server provider
-    // auto-responds {answers:{}} to any interactive question, so this headless
-    // turn never blocks waiting on an answer (unlike the Claude/opencode paths).
-    // First turn: ask the app-server to start a PERSISTENT thread so we can
-    // resume it. Every later turn: resume the known threadId. (The provider
-    // rejects an unknown threadId, so we only pass it once we've captured one.)
-    const codexOpts = threadId
-      ? { threadId }
-      : { threadMode: "persistent" as const };
-    const llm = provider(
-      model,
-      thinkingLevel ? { effort: thinkingLevel as any } : undefined,
-    );
-
-    const result = streamText({
-      model: llm,
-      prompt,
-      abortSignal: signal,
-      providerOptions: {
-        "codex-app-server": {
-          ...codexOpts,
-          ...(thinkingLevel ? { effort: thinkingLevel } : {}),
-        },
-      },
-    } as any);
+    // Codex turns are explicit request/response — no streaming-input merge —
+    // so per-turn busy handling in drain() below cannot drift.
+    // Unique per turn AND per harness process, so item_N ids never collide
+    // across turns or across a restart that resumes the same session.
+    const turnNonce = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    indexSessionMessagesDirect(key, [
+      { id: crypto.randomUUID(), role: "user", kind: "text", text: prompt, ts: Date.now() },
+    ]);
     try {
-      let draft = "";
+      const { events } = await thread.runStreamed(prompt, { signal });
       publishDraft("", true);
-      for await (const part of result.fullStream as any) {
-        if (part?.type === "text-delta") {
-          const delta = String(part.text ?? part.textDelta ?? part.delta ?? "");
-          if (delta) {
-            draft += delta;
-            publishDraft(draft);
-          }
-        } else if (part?.type === "error") {
-          throw new Error(String((part as any).error).slice(0, 800));
-        }
-      }
-      publishDraft(draft, true);
-      await result.text; // surfaces a failed generation
-      // The threadId only appears once a persistent turn has completed; read it
-      // from the resolved metadata and pin it for resume + transcript discovery.
-      if (!threadId) {
-        try {
-          const meta = (await result.providerMetadata) as any;
-          const id = meta?.["codex-app-server"]?.threadId;
-          if (typeof id === "string" && id) {
-            threadId = id;
+      for await (const event of events) {
+        if (event.type === "thread.started") {
+          if (event.thread_id && event.thread_id !== threadId) {
+            threadId = event.thread_id;
             patchEntry(key, { threadId });
           }
-        } catch {}
+        } else if (
+          (event.type === "item.updated" || event.type === "item.completed") &&
+          event.item.type === "agent_message"
+        ) {
+          // The draft is only the in-progress message. Completed items are
+          // indexed directly (and published as real msg frames), so keeping
+          // them in the draft — as the JSONL-lag era code did — would render
+          // an ever-growing blob duplicating the finalized messages.
+          if (event.type === "item.completed") {
+            const message = codexCompletedItemMessage(event.item as Record<string, unknown>, turnNonce);
+            if (message) indexSessionMessagesDirect(key, [message]);
+            publishDraft("", true);
+          } else if (event.item.text) {
+            publishDraft(event.item.text);
+          }
+        } else if (event.type === "item.completed") {
+          const message = codexCompletedItemMessage(event.item as Record<string, unknown>, turnNonce);
+          if (message) indexSessionMessagesDirect(key, [message]);
+        } else if (event.type === "turn.failed") {
+          throw new Error(String(event.error?.message ?? "turn failed").slice(0, 800));
+        } else if (event.type === "error") {
+          throw new Error(String(event.message ?? "thread error").slice(0, 800));
+        }
       }
     } catch (e) {
       if (signal.aborted) return; // interrupted on purpose — not an error
-      console.error(
-        `codex-aisdk-session turn failed: ${e instanceof Error ? e.message : e}`,
-      );
+      const msg = (e instanceof Error ? e.message : String(e)).trim() || "unknown error";
+      console.error(`codex-aisdk-session turn failed: ${msg}`);
+      // Surface the failure in the transcript — a turn that dies silently
+      // (turn.failed, thread error, SDK crash) otherwise leaves the user
+      // staring at a session that just "stopped" with no visible reason.
+      indexSessionMessagesDirect(key, [
+        {
+          id: `${turnNonce}/turn_failed`,
+          role: "assistant",
+          kind: "text",
+          text: `⚠️ Codex turn failed: ${msg.slice(0, 800)}`,
+          ts: Date.now(),
+          apiError: true,
+        },
+      ]);
     } finally {
       publishDraft("", true);
     }
@@ -314,13 +337,9 @@ export async function cmdCodexAisdkSession(argv: string[]): Promise<void> {
     closing = true;
     currentAc?.abort();
     removeEntry(key);
-    // Close the shared app-server child so the codex process doesn't linger.
-    void Promise.resolve()
-      .then(() => provider.close?.())
-      .catch(() => {})
-      // Give the registry write + provider close a tick, then exit so the tmux
-      // pane closes.
-      .finally(() => setTimeout(() => process.exit(0), 50));
+    // Give the registry write a tick to flush, then exit so the tmux pane
+    // closes (the SDK's codex child exits with us).
+    setTimeout(() => process.exit(0), 50);
   }
 
   function dispatch(cmd: AisdkCommand): void {
@@ -340,6 +359,10 @@ export async function cmdCodexAisdkSession(argv: string[]): Promise<void> {
   // harness (simple + reliable across filesystems; 250ms is interactive enough).
   const cmdFile = cmdPath(key);
   let cmdOffset = 0;
+  // Start tailing from the CURRENT end of the command file. Commands before
+  // this process started belong to a previous harness incarnation — replaying
+  // them on restart would re-send every historical message as a new turn.
+  try { cmdOffset = statSync(cmdFile).size; } catch {}
   const poll = setInterval(() => {
     let raw = "";
     try {

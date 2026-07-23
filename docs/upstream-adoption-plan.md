@@ -268,7 +268,8 @@ git checkout FETCH_HEAD -- \
     src/coding-agents.ts src/coding-agent-adapters.ts src/agent-catalog.ts src/tmux.ts \
     src/managed.ts src/lfg-capabilities.ts src/model-discovery.ts src/resume-cache.ts \
     src/trace-log.ts src/artifacts.ts src/settings.ts src/session-cache.ts \
-    src/actions/index.ts src/commands/whatsapp.ts src/sendq.ts src/commands/agents.ts
+    src/actions/index.ts src/commands/whatsapp.ts src/sendq.ts src/commands/agents.ts \
+    src/auto/store.ts
 
 # 2. Deps: add @anthropic-ai/claude-agent-sdk ^0.3.205, @openai/codex-sdk 0.144.1,
 #    @opencode-ai/sdk ^1.17.7, @mariozechner/pi-coding-agent 0.73.1; then bun install.
@@ -286,3 +287,21 @@ git checkout FETCH_HEAD -- \
 
 # 5. Smoke-test: create session → send turn → interrupt → resume.
 ```
+
+### ✅ P0 executed (2026-07-23, branch `upstream/p0-engine-lift`)
+
+Ran exactly as mapped. Deltas vs Spike 2, for the record:
+- **`src/auto/store.ts` also belongs in the closure** (ours: 0): upstream widened
+  `AutoAgentBackend` with `grok`/`cursor`; without it the lifted `commands/agents.ts`
+  fails the union check. Added to the recipe above.
+- The predicted `HtmlMessage` errors were **cascades** from the unresolved old imports —
+  they vanished once the ~10 call sites migrated to `indexedMessagePage`/`indexedRecentMessages`
+  (the new API needs `(path, sessionId)`; every site already had a session id in scope).
+- `/api/sessions` warming: `warmRecentMessages` → `warmTranscriptIndexes(sessions)`.
+- session-brain: routes + scheduler wiring removed from `serve.ts`. The web Brain panel
+  polls with `.catch(() => {})` so it degrades silently — **follow-up: remove the Brain UI
+  section from our shell.**
+- Verified: `tsc --noEmit` clean; server boots; `/api/sessions`, `/messages`,
+  `/transcript/search` all serve real data off the new SQLite index path.
+- **Still to verify live** (needs a real agent run, not done headlessly on the shared box):
+  create → turn → **interrupt** → **managed resume**.

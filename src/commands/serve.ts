@@ -32,26 +32,12 @@ import {
 } from "../auto/store.ts";
 import { runAutoAgent } from "../auto/runner.ts";
 import { startAutoScheduler } from "../auto/scheduler.ts";
-import { runSessionBrain, runSessionBrainForSession } from "../session-brain/runner.ts";
-import { startSessionBrainScheduler } from "../session-brain/scheduler.ts";
-import { setBrainPromptSender } from "../session-brain/merge-guard.ts";
 import {
   computeSessionDiff,
   computeSessionDiffStat,
   computeSessionDiffSummary,
   computeSessionFilePatch,
 } from "../session-diff.ts";
-import {
-  listPatternSuggestions,
-  listSessionBrainRuns,
-  listSessionNotes,
-  readSessionBrainConfig,
-  updatePatternSuggestionStatus,
-  updateSessionBrainConfig,
-  updateSessionNoteStatus,
-  type PatternSuggestionStatus,
-  type SessionNoteStatus,
-} from "../session-brain/store.ts";
 import { reportClientError, listClientErrors } from "../client-errors.ts";
 import { getAllUsage } from "../usage.ts";
 import {
@@ -73,11 +59,6 @@ import {
 import {
   listSessions,
   resolveTranscript,
-  recentMessages,
-  recentMessagesCached,
-  warmRecentMessages,
-  searchTranscript,
-  messagePage,
   normalizeLineMessages,
   setSessionTitle,
   sessionIdForPid,
@@ -91,9 +72,11 @@ import {
 import {
   enqueueTranscriptIndex,
   indexedMessagePage,
+  indexedRecentMessages,
   indexTranscript,
   searchAllTranscriptIndexes,
   searchTranscriptIndex,
+  warmTranscriptIndexes,
 } from "../transcript-index.ts";
 import {
   capturePane,
@@ -723,8 +706,9 @@ function liveSessionIds(sessions: Session[]): Set<string> {
 function warmRenderedBacklogs(sessions: Session[], limit = 40): void {
   for (const session of sessions.slice(0, MESSAGE_HTML_CACHE_MAX)) {
     const path = session.transcriptPath;
-    if (!path) continue;
-    void recentMessagesCached(path, limit)
+    const sessionId = session.sessionId;
+    if (!path || !sessionId) continue;
+    void indexedRecentMessages(path, sessionId, limit)
       .then((messages) => {
         for (const message of visibleTranscriptMessages(messages)) msgWithHtml(message);
       })
@@ -805,7 +789,7 @@ async function sessionSummaryContext(sessionId: string, transcriptPath: string):
   fallback: string;
 }> {
   const [msgs, live] = await Promise.all([
-    recentMessages(transcriptPath, 64, { maxBytes: 192 * 1024 }),
+    indexedRecentMessages(transcriptPath, sessionId, 64),
     listSessions().catch(() => []),
   ]);
   const session = live.find((s) => s.sessionId === sessionId) ?? null;
@@ -1075,7 +1059,7 @@ async function waitForAdvisorAnswer(
     await new Promise((r) => setTimeout(r, 1200));
     const tp = await resolveTranscript(id);
     if (!tp) continue;
-    const answers = (await recentMessages(tp, 0, { maxBytes: null })).filter(
+    const answers = (await indexedRecentMessages(tp, id, 2_000)).filter(
       isAdvisorAnswer,
     );
     if (answers.length > baseline) {
@@ -1124,7 +1108,7 @@ async function voiceConsult(
   if (!id) throw new Error("advisor unexpectedly missing");
   const tp = await resolveTranscript(id);
   const baseline = tp
-    ? (await recentMessages(tp, 0, { maxBytes: null })).filter(isAdvisorAnswer)
+    ? (await indexedRecentMessages(tp, id, 2_000)).filter(isAdvisorAnswer)
         .length
     : 0;
   appendAisdkCmd(id, { type: "send", text: question });
@@ -2129,87 +2113,10 @@ export async function cmdServe() {
         return json({ findings: await listFindings(status) });
       }
 
-      if (path === "/api/session-brain/notes" && req.method === "GET") {
-        const status = url.searchParams.get("status") || undefined;
-        return json({ notes: await listSessionNotes(status) });
-      }
-      if (path === "/api/session-brain/config" && req.method === "GET") {
-        return json({ config: await readSessionBrainConfig() });
-      }
-      if (path === "/api/session-brain/config" && req.method === "POST") {
-        const b = (await req.json().catch(() => null)) as {
-          enabled?: boolean;
-          autoClose?: boolean;
-          intervalMin?: number;
-          minIdleMin?: number;
-          model?: string;
-        } | null;
-        if (!b || typeof b !== "object") return err(400, "config patch required");
-        const enabled = typeof b.enabled === "boolean" ? b.enabled : undefined;
-        const config = await updateSessionBrainConfig({
-          enabled,
-          // One visible switch controls the whole session-brain system. If a
-          // caller explicitly patches autoClose we still honor it for
-          // compatibility, otherwise enabling/disabling the brain carries the
-          // cleanup behavior with it.
-          autoClose: typeof b.autoClose === "boolean" ? b.autoClose : enabled,
-          intervalMin: typeof b.intervalMin === "number" ? b.intervalMin : undefined,
-          minIdleMin: typeof b.minIdleMin === "number" ? b.minIdleMin : undefined,
-          model: typeof b.model === "string" && b.model.trim() ? b.model.trim() : undefined,
-        });
-        return json({ config });
-      }
-      if (path === "/api/session-brain/suggestions" && req.method === "GET") {
-        const status = url.searchParams.get("status") || undefined;
-        return json({ suggestions: await listPatternSuggestions(status) });
-      }
-      if (path === "/api/session-brain/runs" && req.method === "GET") {
-        const limit = Number(url.searchParams.get("limit")) || 20;
-        return json({ runs: await listSessionBrainRuns(limit) });
-      }
-      if (path === "/api/session-brain/run" && req.method === "POST") {
-        const b = (await req.json().catch(() => null)) as {
-          autoClose?: boolean;
-          limit?: number;
-        } | null;
-        const run = await runSessionBrain(
-          { autoClose: b?.autoClose, limit: b?.limit },
-          (l) => console.log(l),
-        );
-        return json({ run });
-      }
-      {
-        const m = path.match(/^\/api\/session-brain\/notes\/([a-z0-9]+)\/status$/);
-        if (m && req.method === "POST") {
-          const b = (await req.json().catch(() => null)) as { status?: string } | null;
-          const status = b?.status;
-          if (
-            status !== "open" &&
-            status !== "snoozed" &&
-            status !== "done" &&
-            status !== "dismissed"
-          )
-            return err(400, "invalid note status");
-          const note = await updateSessionNoteStatus(m[1], status as SessionNoteStatus);
-          if (!note) return err(404, "note not found");
-          return json({ note });
-        }
-      }
-      {
-        const m = path.match(/^\/api\/session-brain\/suggestions\/([a-z0-9]+)\/status$/);
-        if (m && req.method === "POST") {
-          const b = (await req.json().catch(() => null)) as { status?: string } | null;
-          const status = b?.status;
-          if (status !== "open" && status !== "accepted" && status !== "dismissed")
-            return err(400, "invalid suggestion status");
-          const suggestion = await updatePatternSuggestionStatus(
-            m[1],
-            status as PatternSuggestionStatus,
-          );
-          if (!suggestion) return err(404, "suggestion not found");
-          return json({ suggestion });
-        }
-      }
+      // session-brain routes removed — upstream deleted the subsystem (we never
+      // modified it; adopted upstream's engine as of 8c86d77). The web app's
+      // Brain panel polls these with .catch(() => {}) so it degrades gracefully;
+      // remove that UI section in our shell as follow-up.
 
       // ── Client (frontend) error auto-report → auto-fix ────────────────────
       // The web app funnels uncaught errors here. Each report is stored, shown
@@ -2827,12 +2734,7 @@ export async function cmdServe() {
 
       if (path === "/api/sessions") {
         const sessions = await listSessions();
-        warmRecentMessages(
-          sessions
-            .map((session) => session.transcriptPath)
-            .filter((path): path is string => !!path),
-          40,
-        );
+        warmTranscriptIndexes(sessions);
         warmRenderedBacklogs(sessions, 40);
         return json({ sessions });
       }
@@ -3489,15 +3391,10 @@ export async function cmdServe() {
             const rawBefore = url.searchParams.get("before");
             const before =
               rawBefore == null ? null : Math.max(0, parseInt(rawBefore, 10) || 0);
-            const page =
-              (await indexedMessagePage(tp, m[1], {
-                before,
-                limit: Number.isFinite(rawLimit) ? rawLimit : 220,
-              })) ??
-              (await messagePage(tp, {
-                before,
-                limit: Number.isFinite(rawLimit) ? rawLimit : 220,
-              }));
+            const page = await indexedMessagePage(tp, m[1], {
+              before,
+              limit: Number.isFinite(rawLimit) ? rawLimit : 220,
+            });
             return json({
               id: m[1],
               total: page.total,
@@ -3510,22 +3407,18 @@ export async function cmdServe() {
           const lim = full
             ? Math.max(0, Math.min(20000, Number.isFinite(rawLimit) ? rawLimit : 0))
             : Math.min(200, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 30));
+          const page = await indexedMessagePage(tp, m[1], {
+            limit: full && lim === 0 ? 20_000 : lim,
+          });
           if (!full) {
-            const page = await indexedMessagePage(tp, m[1], { limit: lim });
-            if (page) {
-              return json({
-                id: m[1],
-                messages: page.messages.map(msgWithHtml),
-              });
-            }
+            return json({
+              id: m[1],
+              messages: page.messages.map(msgWithHtml),
+            });
           }
           return json({
             id: m[1],
-            messages: visibleTranscriptMessages(
-              await (full ? recentMessages : recentMessagesCached)(tp, lim, {
-                maxBytes: full ? null : undefined,
-              }),
-            ).map(msgWithHtml),
+            messages: visibleTranscriptMessages(page.messages).map(msgWithHtml),
           });
         }
       }
@@ -3546,9 +3439,7 @@ export async function cmdServe() {
           } | null;
           const query = body?.query?.trim();
           if (!query) return err(400, "expected { query }");
-          const r = await searchTranscriptIndex(tp, m[1], query, { limit: body?.limit }).catch(() =>
-            searchTranscript(tp, query, { limit: body?.limit }),
-          );
+          const r = await searchTranscriptIndex(tp, m[1], query, { limit: body?.limit });
           return json({ id: m[1], query, ...r });
         }
       }
@@ -3757,15 +3648,6 @@ export async function cmdServe() {
       }
 
       {
-        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/brain$/);
-        if (m && req.method === "POST") {
-          const run = await runSessionBrainForSession(m[1], (l) => console.log(l));
-          if (run.errors.length && !run.decisions.length) return err(404, run.errors[0] || "session not found");
-          return json({ run, decision: run.decisions[0] ?? null });
-        }
-      }
-
-      {
         const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/close$/);
         if (m && req.method === "POST") {
           const sess = (await listSessions()).find((s) => s.sessionId === m[1]);
@@ -3825,7 +3707,7 @@ export async function cmdServe() {
           if (!tp) return err(404, "session transcript not found");
           enqueueTranscriptIndex(tp, m[1]);
           const page = await indexedMessagePage(tp, m[1], { limit: 60 });
-          const msgs = (page?.messages ?? visibleTranscriptMessages(await recentMessagesCached(tp, 60))).map(msgWithHtml);
+          const msgs = page.messages.map(msgWithHtml);
           return json({ id: m[1], messages: msgs });
         }
       }
@@ -4084,9 +3966,7 @@ export async function cmdServe() {
                     return;
                   }
                   const backlogT0 = performance.now();
-                  const page =
-                    (await indexedMessagePage(p.tp, p.sid, { limit: 40 })) ??
-                    (await messagePage(p.tp, { limit: 40 }));
+                  const page = await indexedMessagePage(p.tp, p.sid, { limit: 40 });
                   const readMs = performance.now() - backlogT0;
                   const renderT0 = performance.now();
                   const msgs = visibleTranscriptMessages(page.messages).map(msgWithHtml);
@@ -4210,7 +4090,7 @@ export async function cmdServe() {
               // backlog, then tail
               (async () => {
                 const page = await indexedMessagePage(tp, sid, { limit: 40 });
-                const msgs = (page?.messages ?? visibleTranscriptMessages(await recentMessagesCached(tp, 40))).map(msgWithHtml);
+                const msgs = page.messages.map(msgWithHtml);
                 for (const msg of msgs)
                   send(`event: msg\ndata: ${JSON.stringify(msg)}\n\n`);
                 offset = Bun.file(tp).size;
@@ -4320,10 +4200,6 @@ export async function cmdServe() {
   });
 
   startAutoScheduler((l) => console.log(l));
-  // Let the session-brain merge-guard nudge a live session's agent (queue mode)
-  // when it detects unmerged worktree work before archiving.
-  setBrainPromptSender((session, text, opts) => sendPromptToLiveSession(session, text, opts));
-  startSessionBrainScheduler((l) => console.log(l));
   startWorktreeSweep((l) => console.log(l));
   // Watch the fleet for busy -> idle transitions and fan "completed" events out
   // to voice subscribers (/api/voice/events). Idempotent + best-effort.
