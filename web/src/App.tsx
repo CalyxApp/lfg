@@ -8912,6 +8912,16 @@ function NewSessionDialog({
   const [usage, setUsage] = useState<ProviderUsage | null>(null);
   const [pendingCreates, setPendingCreates] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // Kickoff dictation: same waveform voice-to-text used in the running-session
+  // composer (tap mic → recorder row with ✕/✓/↑), replacing the old red
+  // active-mic MicButton so starting a session matches ongoing chats.
+  const rec = useWaveformDictation({
+    baseText: prompt,
+    onText: setPrompt,
+    onInterim: setPrompt,
+    onSend: (t) => void submit(undefined, t),
+    onCancel: (b) => setPrompt(b),
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewUrls = useRef<string[]>([]);
   // Resumable (closed / rebooted-away) sessions. Fetched lazily when the user
@@ -9566,6 +9576,10 @@ function NewSessionDialog({
         )}
         ref={fieldRef}
       >
+        {rec.active ? (
+          <WaveformRecorderRow rec={rec} />
+        ) : (
+          <>
         {variant === "inline" ? agentPopover : null}
         <SkillTextarea
           value={prompt}
@@ -9591,27 +9605,19 @@ function NewSessionDialog({
               : "min-h-40 max-h-[42dvh] px-1 py-1 pr-10",
           )}
         />
-        <MicButton
-          minimal
+        <Button
+          size="icon"
+          type="button"
+          variant="tint"
           className={cn("size-9 shrink-0", variant !== "inline" && "absolute bottom-1 right-1")}
-          silenceMs={2500}
-          // Phase 1 of unified-chat-and-voice: tap-dictation is review-before-
-          // send — the transcript lands here as editable text and the user sends
-          // it; press-and-hold release-to-send remains the hands-free path.
-          reviewOnStop
-          baseText={prompt}
-          onText={(text, base) =>
-            setPrompt(base.trim() ? `${base.trimEnd()} ${text}` : text)
-          }
-          onInterim={(text, base) =>
-            setPrompt(base.trim() ? `${base.trimEnd()} ${text}` : text)
-          }
-          onAutoSubmit={(text, base) => {
-            const combined = base.trim() ? `${base.trimEnd()} ${text}` : text;
-            void submit(undefined, combined);
-          }}
-          onCancel={(base) => setPrompt(base)}
-        />
+          onClick={() => void rec.start()}
+          aria-label="Dictate"
+          title="Dictate — you review before sending"
+        >
+          <Mic className="size-4" />
+        </Button>
+          </>
+        )}
       </div>
 
       {attachments.length ? (
