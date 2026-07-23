@@ -52,6 +52,7 @@ import {
   GitFork,
   Loader2,
   MessageSquare,
+  MessageCircle,
   Mic,
   Bell,
   MoreVertical,
@@ -95,12 +96,17 @@ const TermView = lazyWithReload("TermView", () =>
 const VoiceCall = lazyWithReload("VoiceCall", () =>
   import("./voice-call").then((m) => ({ default: m.VoiceCall })),
 );
+// Converse — a SEPARATE realtime voice interface (OpenAI gpt-realtime), additive
+// to VoiceCall above. Own overlay, own state; shares only the server tool backend.
+const Converse = lazyWithReload("Converse", () =>
+  import("./converse").then((m) => ({ default: m.Converse })),
+);
 const BrowserProfiles = lazyWithReload("BrowserProfiles", () => import("./BrowserProfiles"));
 import { Badge } from "@/components/ui/badge";
 import { ImageAnnotator } from "@/components/ImageAnnotator";
 import { SessionDiffBar } from "@/components/SessionDiffView";
 import { VaultView } from "@/components/VaultView";
-import { MicButton, recordingButtonStyle, useDictation, MIC_LONG_PRESS_MS, MIC_CANCEL_DRAG_PX, type MicHandle } from "@/components/dictation";
+import { MicButton, recordingButtonStyle, useDictation, useWaveformDictation, WaveformRecorderRow, MIC_LONG_PRESS_MS, MIC_CANCEL_DRAG_PX, type MicHandle } from "@/components/dictation";
 import { CaptureView } from "@/components/CaptureView";
 import { HomeView } from "@/components/HomeView";
 import { SearchView } from "@/components/SearchView";
@@ -1916,6 +1922,7 @@ export function App() {
   const [composerFocusNonce, setComposerFocusNonce] = useState(0);
   const [notepadOpen, setNotepadOpen] = useState(false);
   const [callOpen, setCallOpen] = useState(false);
+  const [converseOpen, setConverseOpen] = useState(false);
   const [runLog, setRunLog] = useState<string | null>(null);
   // Auto agents
   // Tabs are "live" | "settings" | "ask" | "term" | "browser". Auto agents and runtime
@@ -3189,6 +3196,26 @@ export function App() {
                 onOpenCall={() => setCallOpen(true)}
               />
             ) : null}
+            {/* Desktop-only: on mobile the Chat entry lives in the bottom tab bar. */}
+            {!isMobile && !converseOpen ? (
+              <button
+                type="button"
+                onClick={() => setConverseOpen(true)}
+                title="Converse — chat & voice, one thread (type, dictate, or talk)"
+                aria-label="Open Converse chat"
+                style={{
+                  width: 34,
+                  height: 34,
+                  borderRadius: 999,
+                  border: "none",
+                  background: "transparent",
+                  cursor: "pointer",
+                  fontSize: 16,
+                }}
+              >
+                💬
+              </button>
+            ) : null}
             <AskNavButton active={tab === "ask"} onOpen={() => setTab("ask")} />
             {!isMobile ? (
               <>
@@ -3431,7 +3458,9 @@ export function App() {
 
       {/* Bottom tab bar — mobile only; tucks away while the keyboard is up or
           during a voice call so it never fights the composer for the bottom. */}
-      {isMobile && !callOpen && !keyboardOpen ? <TabBar tab={tab} onSelect={setTab} /> : null}
+      {isMobile && !callOpen && !keyboardOpen ? (
+        <TabBar tab={tab} onSelect={setTab} onChat={() => setConverseOpen(true)} />
+      ) : null}
 
       {callOpen ? (
         <Suspense fallback={null}>
@@ -3439,6 +3468,12 @@ export function App() {
             onClose={() => setCallOpen(false)}
             onCompose={() => setNewOpen(true)}
           />
+        </Suspense>
+      ) : null}
+
+      {converseOpen ? (
+        <Suspense fallback={null}>
+          <Converse onClose={() => setConverseOpen(false)} />
         </Suspense>
       ) : null}
 
@@ -3910,10 +3945,22 @@ function AgentToolChips({ onOpen }: { onOpen: (tab: string) => void }) {
 // NavIsland pill as the header so the chrome reads as one matched set. Sits
 // in-flow at the end of the root flex column: content and the inline composer
 // stack above it, nothing can hide beneath it.
-function TabBar({ tab, onSelect }: { tab: string; onSelect: (tab: string) => void }) {
+function TabBar({
+  tab,
+  onSelect,
+  onChat,
+}: {
+  tab: string;
+  onSelect: (tab: string) => void;
+  // Chat (Converse) is an overlay, not a tab — it opens on top of whatever tab
+  // is active. Sam (2026-07-22): the entry belongs in the bottom menu, not a
+  // corner icon.
+  onChat: () => void;
+}) {
   const items = [
     { id: "home", label: "Home", icon: House, active: tab === "home" || tab === "files" },
     { id: "live", label: "Agents", icon: Bot, active: AGENT_FAMILY_TABS.has(tab) },
+    { id: "chat", label: "Chat", icon: MessageCircle, active: false },
     { id: "capture", label: "Capture", icon: Plus, active: tab === "capture" },
     { id: "search", label: "Search", icon: Search, active: tab === "search" },
     {
@@ -3934,7 +3981,7 @@ function TabBar({ tab, onSelect }: { tab: string; onSelect: (tab: string) => voi
             <button
               key={it.id}
               type="button"
-              onClick={() => onSelect(it.id)}
+              onClick={() => (it.id === "chat" ? onChat() : onSelect(it.id))}
               aria-label={it.label}
               aria-current={it.active ? "page" : undefined}
               className={cn(
@@ -6182,6 +6229,21 @@ function SessionChat({
   const sid = session.sessionId;
   const [messageText, setMessageText] = useState("");
   const [sending, setSending] = useState(false);
+  // Waveform dictation for session follow-ups ("sick of having to type" —
+  // Sam, 2026-07-22): tap the mic → the composer row swaps to the shared
+  // recorder (✕ / waveform / ✓ review / ↑ send). ✓ lands the transcript in
+  // the box (review, then steer/queue as usual); ↑ sends as a steer.
+  const rec = useWaveformDictation({
+    baseText: messageText,
+    onText: setMessageText,
+    onInterim: setMessageText,
+    onSend: (t) => void sendMessage(undefined, t),
+    onCancel: (b) => setMessageText(b),
+  });
+  const recRecording = rec.state === "recording";
+  useEffect(() => {
+    onDictatingChange?.(recRecording);
+  }, [recRecording, onDictatingChange]);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [annotatingId, setAnnotatingId] = useState<string | null>(null);
@@ -6436,6 +6498,10 @@ function SessionChat({
             </div>
           ) : null}
           <div className="flex items-end gap-2">
+            {rec.active ? (
+              <WaveformRecorderRow rec={rec} />
+            ) : (
+              <>
             <Button
               size="icon"
               type="button"
@@ -6487,6 +6553,21 @@ function SessionChat({
                 <Pause className="size-4" />
               </Button>
             ) : null}
+            {/* Waveform dictation for follow-ups: tap → recorder row (✕/✓/↑). */}
+            {rec.supported ? (
+              <Button
+                size="icon"
+                type="button"
+                variant="tint"
+                className="size-11 md:size-9"
+                onClick={() => void rec.start()}
+                aria-label="Dictate"
+                title="Dictate — you review before sending"
+                disabled={sending}
+              >
+                <Mic className="size-4" />
+              </Button>
+            ) : null}
             {/* Tap steers the active turn; long-press queues without interrupting. */}
             <ComposerSendButton
               className="size-11 md:size-9"
@@ -6508,6 +6589,8 @@ function SessionChat({
               }}
               onCancel={(base) => setMessageText(base)}
             />
+              </>
+            )}
           </div>
         </form>
       ) : null}
@@ -8829,6 +8912,16 @@ function NewSessionDialog({
   const [usage, setUsage] = useState<ProviderUsage | null>(null);
   const [pendingCreates, setPendingCreates] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // Kickoff dictation: same waveform voice-to-text used in the running-session
+  // composer (tap mic → recorder row with ✕/✓/↑), replacing the old red
+  // active-mic MicButton so starting a session matches ongoing chats.
+  const rec = useWaveformDictation({
+    baseText: prompt,
+    onText: setPrompt,
+    onInterim: setPrompt,
+    onSend: (t) => void submit(undefined, t),
+    onCancel: (b) => setPrompt(b),
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewUrls = useRef<string[]>([]);
   // Resumable (closed / rebooted-away) sessions. Fetched lazily when the user
@@ -9483,6 +9576,10 @@ function NewSessionDialog({
         )}
         ref={fieldRef}
       >
+        {rec.active ? (
+          <WaveformRecorderRow rec={rec} />
+        ) : (
+          <>
         {variant === "inline" ? agentPopover : null}
         <SkillTextarea
           value={prompt}
@@ -9508,23 +9605,19 @@ function NewSessionDialog({
               : "min-h-40 max-h-[42dvh] px-1 py-1 pr-10",
           )}
         />
-        <MicButton
-          minimal
+        <Button
+          size="icon"
+          type="button"
+          variant="tint"
           className={cn("size-9 shrink-0", variant !== "inline" && "absolute bottom-1 right-1")}
-          silenceMs={2500}
-          baseText={prompt}
-          onText={(text, base) =>
-            setPrompt(base.trim() ? `${base.trimEnd()} ${text}` : text)
-          }
-          onInterim={(text, base) =>
-            setPrompt(base.trim() ? `${base.trimEnd()} ${text}` : text)
-          }
-          onAutoSubmit={(text, base) => {
-            const combined = base.trim() ? `${base.trimEnd()} ${text}` : text;
-            void submit(undefined, combined);
-          }}
-          onCancel={(base) => setPrompt(base)}
-        />
+          onClick={() => void rec.start()}
+          aria-label="Dictate"
+          title="Dictate — you review before sending"
+        >
+          <Mic className="size-4" />
+        </Button>
+          </>
+        )}
       </div>
 
       {attachments.length ? (

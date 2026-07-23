@@ -41,7 +41,10 @@ export type SttStreamBridge = {
 
 const DEFAULTS: VoiceSettings = {
   ttsProvider: "elevenlabs",
-  sttProvider: "elevenlabs",
+  // Deepgram is the dictation default (Sam's pick — unified-chat-and-voice
+  // plan, 2026-07-22). pickStt/openSttStream still fall back to ElevenLabs
+  // whenever DEEPGRAM_API_KEY is missing, so this can never break voice.
+  sttProvider: "deepgram",
 };
 
 const TIMEOUT_MS = 30000;
@@ -424,6 +427,178 @@ const sttElevenLabs: SttProvider = {
   },
 };
 
+// Deepgram Nova streaming STT — Sam's pick for dictation (fast/cheap streaming;
+// unified-chat-and-voice Phase 1). Realtime protocol (verified live 2026-07-22):
+//   URL  : wss://api.deepgram.com/v1/listen?model=…&encoding=linear16&sample_rate=16000
+//          &channels=1&interim_results=true&smart_format=true
+//   auth : Authorization: Token <key> header
+//   c→s  : raw s16le PCM as BINARY frames; {"type":"Finalize"} force-commits the
+//          buffered audio, {"type":"CloseStream"} ends the stream.
+//   s→c  : {type:"Results", is_final, channel:{alternatives:[{transcript}]}}
+// Bridge mapping: interim results (is_final:false) carry the CURRENT utterance
+// hypothesis → onPartial; is_final:true results are finalized segments the
+// client accumulates → onFinal (same committed+partial join as Scribe). Same
+// ~100 ms outbound buffering as the Scribe adapter, but binary frames — no
+// base64 inflation.
+function deepgramRealtimeStream(handlers: SttStreamHandlers): SttStreamBridge | null {
+  const key = process.env.DEEPGRAM_API_KEY;
+  if (!key) return null;
+  const model = process.env.DEEPGRAM_STT_MODEL || "nova-3";
+  const qs = new URLSearchParams({
+    model,
+    encoding: "linear16",
+    sample_rate: "16000",
+    channels: "1",
+    interim_results: "true",
+    smart_format: "true",
+  });
+  const url = `wss://api.deepgram.com/v1/listen?${qs.toString()}`;
+  let up: WebSocket;
+  try {
+    up = new WebSocket(url, { headers: { Authorization: `Token ${key}` } } as unknown as string[]);
+  } catch {
+    return null;
+  }
+  let open = false;
+  let closed = false;
+  const outbox: (string | Uint8Array)[] = [];
+  let buf: Uint8Array[] = [];
+  let bufBytes = 0;
+  const FLUSH_BYTES = 3200; // ~100 ms @ 16 kHz mono s16le
+
+  const sendRaw = (m: string | Uint8Array) => {
+    if (closed) return;
+    if (open) {
+      try {
+        up.send(m);
+      } catch {}
+    } else outbox.push(m);
+  };
+
+  // Deepgram closes the socket with NET-0001 after ~10 s without audio OR a
+  // {"type":"KeepAlive"} TEXT frame (docs: send one every 3-5 s of silence;
+  // harmless while audio flows). Silent gaps are normal here — mic permission
+  // prompts delay the first frame, and review-mode dictation has no silence
+  // auto-stop, so a user pausing to think mid-take must not kill the stream.
+  const keepAlive = setInterval(() => {
+    if (open && !closed) sendRaw(JSON.stringify({ type: "KeepAlive" }));
+  }, 4000) as unknown as number;
+  const drain = () => {
+    if (bufBytes === 0) return;
+    const merged = new Uint8Array(bufBytes);
+    let off = 0;
+    for (const c of buf) {
+      merged.set(c, off);
+      off += c.length;
+    }
+    buf = [];
+    bufBytes = 0;
+    sendRaw(merged);
+  };
+
+  up.addEventListener("open", () => {
+    open = true;
+    console.log(`[voice] deepgram realtime open (model=${model})`);
+    for (const m of outbox) {
+      try {
+        up.send(m);
+      } catch {}
+    }
+    outbox.length = 0;
+  });
+  up.addEventListener("message", (ev: MessageEvent) => {
+    let d: {
+      type?: string;
+      is_final?: boolean;
+      channel?: { alternatives?: { transcript?: string }[] };
+      description?: string;
+    };
+    try {
+      d = JSON.parse(typeof ev.data === "string" ? ev.data : "");
+    } catch {
+      return;
+    }
+    if (d?.type === "Results") {
+      const text = (d.channel?.alternatives?.[0]?.transcript || "").trim();
+      if (d.is_final) {
+        if (text) handlers.onFinal(text);
+      } else handlers.onPartial(text);
+    } else if (d?.type && d.type !== "Metadata" && d.type !== "SpeechStarted" && d.type !== "UtteranceEnd")
+      // Surface upstream errors/warnings instead of swallowing them (auth,
+      // quota, unsupported params) — silent failures look like "STT stopped".
+      console.log(`[voice] deepgram realtime ${d.type}: ${JSON.stringify(d).slice(0, 200)}`);
+  });
+  up.addEventListener("close", () => {
+    closed = true;
+    clearInterval(keepAlive);
+    handlers.onClose?.();
+  });
+  up.addEventListener("error", (e: unknown) => {
+    console.log(`[voice] deepgram realtime ws error: ${(e as { message?: string })?.message || e}`);
+  });
+
+  return {
+    pushPcm: (pcm) => {
+      const copy = new Uint8Array(pcm.length);
+      copy.set(pcm);
+      buf.push(copy);
+      bufBytes += copy.length;
+      if (bufBytes >= FLUSH_BYTES) drain();
+    },
+    flush: () => {
+      drain();
+      sendRaw(JSON.stringify({ type: "Finalize" }));
+    },
+    close: () => {
+      if (closed) return;
+      drain();
+      sendRaw(JSON.stringify({ type: "CloseStream" }));
+      // Only block further OUTBOUND sends — after CloseStream, Deepgram flushes
+      // the remaining audio as final Results + Metadata and then closes (1000).
+      // Slamming up.close() here loses that tail (verified live); the timer
+      // only covers a wedged upstream that never closes.
+      closed = true;
+      clearInterval(keepAlive);
+      setTimeout(() => {
+        try {
+          up.close();
+        } catch {}
+      }, 5000);
+    },
+  };
+}
+
+const sttDeepgram: SttProvider = {
+  id: "deepgram",
+  label: "Deepgram (Nova)",
+  available: () => !!process.env.DEEPGRAM_API_KEY,
+  openStream: (handlers) => deepgramRealtimeStream(handlers),
+  async transcribe(audio) {
+    const key = process.env.DEEPGRAM_API_KEY;
+    if (!key) return eres(503, "deepgram not configured");
+    const model = process.env.DEEPGRAM_STT_MODEL || "nova-3";
+    try {
+      const r = await fetch(
+        `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(model)}&smart_format=true`,
+        {
+          method: "POST",
+          headers: { Authorization: `Token ${key}`, "Content-Type": "audio/wav" },
+          body: audio,
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+        },
+      );
+      if (!r.ok) return eres(502, `deepgram stt ${r.status}`);
+      const j = (await r.json().catch(() => ({}))) as {
+        results?: { channels?: { alternatives?: { transcript?: string }[] }[] };
+      };
+      const text = j.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
+      return jres({ text: text.trim() });
+    } catch {
+      return eres(502, "deepgram unreachable");
+    }
+  },
+};
+
 const sttOpenAI: SttProvider = {
   id: "openai",
   label: "OpenAI (Whisper)",
@@ -456,6 +631,7 @@ const TTS: Record<string, TtsProvider> = {
 };
 
 const STT: Record<string, SttProvider> = {
+  [sttDeepgram.id]: sttDeepgram,
   [sttElevenLabs.id]: sttElevenLabs,
   [sttOpenAI.id]: sttOpenAI,
 };

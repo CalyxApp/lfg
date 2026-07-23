@@ -135,13 +135,23 @@ const CALYX_FACTORY_PATH =
     : null) ??
   "/home/openclaw/repos/mdEditorTestExtenstionVscode/cli/src/lib/contentFactory.js";
 
-type CreatePayload = {
-  contentType: "task";
-  title: string;
-  status: string;
-  priority: string;
-  due?: string;
-};
+type CreatePayload =
+  | {
+      contentType: "task";
+      title: string;
+      status: string;
+      priority: string;
+      due?: string;
+    }
+  | {
+      // Converse saves conversations as a custom content type (ai-voice-conversation).
+      contentType: "custom";
+      type: string;
+      title: string;
+      content?: string;
+      tags?: string[];
+      extraProperties?: Record<string, unknown>;
+    };
 
 type CreateResult = {
   absolutePath: string;
@@ -154,7 +164,7 @@ type CreateResult = {
 type CreateContentFn = (
   payload: CreatePayload,
   vaultRoot: string,
-  layout: { tasksFolder: string },
+  layout: { tasksFolder: string; projectsFolder?: string; typeFolders?: Record<string, string> },
 ) => CreateResult;
 
 let _createContent: CreateContentFn | null | undefined = undefined; // undefined = not yet tried
@@ -306,6 +316,15 @@ import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
+import { handleRtToken, runRtTool, saveConversation } from "../voice-rt.ts";
+import {
+  getChatSettings,
+  setChatSettings,
+  listChatProviders,
+  runChatTurn,
+  type ChatSettings,
+  type ChatTurnMessage,
+} from "../chat-providers.ts";
 
 const PORT = Number(process.env.LFG_PORT ?? process.env.PORT ?? 8766);
 // Bind to loopback by default — the UI is meant to be reached over Tailscale
@@ -1564,6 +1583,93 @@ export async function cmdServe() {
       // the ElevenLabs API key server-side).
       if (path === "/api/voice/eleven-token" && req.method === "GET") {
         return handleElevenToken(req);
+      }
+
+      // ---- Converse (OpenAI gpt-realtime): a SEPARATE realtime voice interface,
+      // additive to the ElevenLabs cascade above (shares only the tool backend).
+      // The browser holds WebRTC directly to OpenAI; these two routes just mint
+      // the ephemeral token and run the relayed tool calls. See voice-rt.ts.
+      if (path === "/api/voice/rt/token" && req.method === "POST") {
+        return handleRtToken(req);
+      }
+      {
+        const m = path.match(/^\/api\/voice\/rt\/tools\/([a-z0-9_]+)$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            repo?: string;
+            args?: Record<string, unknown>;
+          } | null;
+          const repos = await listRepos();
+          // Converse is scoped to a SINGLE workspace (default PlatosRaveCave) — other
+          // lfg surfaces stay multi-repo, but voice notes/search all land in the one
+          // vault. Overridable via CONVERSE_WORKSPACE; explicit body.repo still wins.
+          const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+          const repo = body?.repo
+            ? repos.find((r) => r.name === body.repo)
+            : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+          if (!repo) return err(404, "no repo available for tool call");
+          return runRtTool(m[1], repo.cwd, body?.args ?? {});
+        }
+      }
+
+      // Persist a finished Converse session as an `ai-voice-conversation` note in
+      // the workspace vault (frontmatter properties + transcript body), committed.
+      if (path === "/api/voice/rt/save-conversation" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          title?: string;
+          transcript?: string;
+          tags?: string[];
+          properties?: Record<string, unknown>;
+          repo?: string;
+        } | null;
+        if (!body?.title?.trim() || !body.transcript) return err(400, "title and transcript are required");
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo = body.repo
+          ? repos.find((r) => r.name === body.repo)
+          : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        if (!repo) return err(404, "no repo available");
+        return saveConversation(repo.cwd, {
+          title: body.title,
+          transcript: body.transcript,
+          tags: body.tags,
+          properties: body.properties,
+        });
+      }
+
+      // ---- Converse text mode (the "unified chat"): one typed turn against the
+      // same assistant persona + vault tool suite as the voice call, but powered
+      // by a user-selectable chat-completions provider (OpenAI first; Gemini and
+      // Claude are registered as coming-soon). Same workspace scoping as the rt
+      // tool relay above. Body { messages:[{role,content}...], repo? } →
+      // { text, toolCalls, provider, model }. See chat-providers.ts.
+      if (path === "/api/voice/rt/chat" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          messages?: ChatTurnMessage[];
+          repo?: string;
+        } | null;
+        if (!body?.messages) return err(400, "expected { messages }");
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo = body.repo
+          ? repos.find((r) => r.name === body.repo)
+          : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        if (!repo) return err(404, "no repo available for chat turn");
+        return runChatTurn(repo.cwd, body.messages);
+      }
+
+      // ---- chat model config: which provider/model powers typed turns of the
+      // unified chat. Mirrors /api/voice/config — the choice persists server-side
+      // (data/chat-settings.json); keys stay in env. GET also returns the provider
+      // list (with availability + implemented flags) so the picker can grey out
+      // the not-yet-wired ones.
+      if (path === "/api/chat/config" && req.method === "GET") {
+        return json({ settings: await getChatSettings(), providers: listChatProviders() });
+      }
+      if (path === "/api/chat/config" && req.method === "POST") {
+        const b = (await req.json().catch(() => null)) as Partial<ChatSettings> | null;
+        if (!b) return err(400, "expected body");
+        return json({ settings: await setChatSettings(b) });
       }
 
       // ---- voice TTS proxy: synthesize via the configured cloud provider

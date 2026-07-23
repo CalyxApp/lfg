@@ -8,7 +8,7 @@
 
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import { Loader2, Mic, X } from "lucide-react";
+import { ArrowUp, Check, Loader2, Mic, X } from "lucide-react";
 import { haptic } from "@/lib/haptics";
 import { cn } from "@/lib/utils";
 
@@ -163,6 +163,13 @@ export function useDictation(opts: {
   onCancel?: (base: string) => void;
   baseText?: string;
   silenceMs?: number;
+  // Review-before-send (unified-chat-and-voice Phase 1): when true, tap-mode
+  // dictation never auto-submits — the silence VAD is disabled (the take runs
+  // until the user acts) and tapping stop routes the transcript through onText
+  // as editable input instead of onAutoSubmit. Press-and-hold release-to-send
+  // (an explicit stop(true)) still auto-submits, so both affordances survive:
+  // tap = speak → review → send yourself; hold = speak → release sends.
+  reviewOnStop?: boolean;
 }) {
   const [state, setState] = useState<DictationState>("idle");
   // Live 0..1 microphone level, smoothed by an envelope follower. Drives the
@@ -227,6 +234,7 @@ export function useDictation(opts: {
   const onAutoSubmitRef = useRef(opts.onAutoSubmit);
   const onInterimRef = useRef(opts.onInterim);
   const onCancelRef = useRef(opts.onCancel);
+  const reviewOnStopRef = useRef(opts.reviewOnStop ?? false);
   const baseTextRef = useRef(opts.baseText ?? "");
   // Base text snapshotted at record-start, shared by interim + final so the
   // final transcript cleanly replaces the live partial without double-appending.
@@ -236,6 +244,7 @@ export function useDictation(opts: {
   onAutoSubmitRef.current = opts.onAutoSubmit;
   onInterimRef.current = opts.onInterim;
   onCancelRef.current = opts.onCancel;
+  reviewOnStopRef.current = opts.reviewOnStop ?? false;
   baseTextRef.current = opts.baseText ?? "";
 
   const supported =
@@ -506,7 +515,7 @@ export function useDictation(opts: {
         }
       };
       const vad =
-        autoStop && onAutoSubmitRef.current
+        autoStop && onAutoSubmitRef.current && !reviewOnStopRef.current
           ? (setInterval(() => {
               if (!sessionRef.current || !spoke) return;
               if (Date.now() - lastVoiceAt >= silenceMs) void stop(true);
@@ -570,10 +579,12 @@ export function useDictation(opts: {
 
   const toggle = useCallback(() => {
     if (state === "transcribing") return;
-    // Tapping the button to stop submits the request (stop(auto=true) → routes
-    // the transcript through onAutoSubmit), matching the silence-triggered and
-    // release-to-send paths. Falls back to onText if no onAutoSubmit is wired.
-    if (sessionRef.current) void stop(true);
+    // Tapping the button to stop normally submits the request (stop(auto=true)
+    // → routes the transcript through onAutoSubmit), matching the silence-
+    // triggered and release-to-send paths; falls back to onText if no
+    // onAutoSubmit is wired. In reviewOnStop mode the tap-stop instead delivers
+    // via onText — the transcript lands in the input for the user to edit/send.
+    if (sessionRef.current) void stop(!reviewOnStopRef.current);
     else void start();
   }, [state, start, stop]);
 
@@ -622,6 +633,8 @@ export const MicButton = forwardRef<
     onCancel?: (base: string) => void;
     baseText?: string;
     silenceMs?: number;
+    // Tap-mode dictation reviews instead of auto-sending (see useDictation).
+    reviewOnStop?: boolean;
     className?: string;
     minimal?: boolean;
     // Fires true while actively recording (tap or hold), false otherwise — lets a
@@ -629,7 +642,7 @@ export const MicButton = forwardRef<
     onRecordingChange?: (recording: boolean) => void;
   }
 >(function MicButton(
-  { onText, onAutoSubmit, onInterim, onCancel, baseText, silenceMs, className, minimal = false, onRecordingChange },
+  { onText, onAutoSubmit, onInterim, onCancel, baseText, silenceMs, reviewOnStop, className, minimal = false, onRecordingChange },
   ref,
 ) {
   const { state, toggle, start, stop, cancel, supported, level } = useDictation({
@@ -639,6 +652,7 @@ export const MicButton = forwardRef<
     onCancel,
     baseText,
     silenceMs,
+    reviewOnStop,
   });
   useImperativeHandle(
     ref,
@@ -875,3 +889,106 @@ export const MicButton = forwardRef<
     </button>
   );
 });
+
+// ---------------------------------------------------------------------------
+// Waveform dictation (unified-chat-and-voice Phase 1, shared) — the ChatGPT-
+// style recorder first built for Converse, extracted so the agent-session
+// composer (and future surfaces) get the same experience: tap the mic, the
+// composer swaps to a live waveform strip with ✕ cancel, ✓ stop-to-review
+// (transcript lands as editable text) and ↑ stop-&-send. reviewOnStop means
+// no silence auto-stop — the take runs until the user acts.
+
+export function useWaveformDictation(opts: {
+  baseText: string;
+  onText: (joined: string) => void; // final transcript joined onto base → put in the box
+  onInterim?: (joined: string) => void; // live hypothesis joined onto base
+  onCancel?: (base: string) => void; // restore the box to pre-recording text
+  onSend: (joined: string) => void; // ↑ stop-&-send
+}) {
+  const join = (t: string, b: string) => (b.trim() ? `${b.trimEnd()} ${t}` : t);
+  const dict = useDictation({
+    baseText: opts.baseText,
+    reviewOnStop: true,
+    onText: (t, b) => opts.onText(join(t, b)),
+    onInterim: (t, b) => opts.onInterim?.(join(t, b)),
+    onAutoSubmit: (t, b) => opts.onSend(join(t, b)),
+    onCancel: (b) => opts.onCancel?.(b),
+  });
+  // Sample the hook's smoothed 0..1 level into a scrolling bar history.
+  const levelRef = useRef(0);
+  levelRef.current = dict.level;
+  const [bars, setBars] = useState<number[]>([]);
+  useEffect(() => {
+    if (dict.state !== "recording") {
+      setBars([]);
+      return;
+    }
+    const t = setInterval(() => setBars((b) => [...b.slice(-41), levelRef.current]), 90);
+    return () => clearInterval(t);
+  }, [dict.state]);
+  return { ...dict, bars, active: dict.state !== "idle" };
+}
+
+/** The in-composer recorder row: ✕ cancel · waveform · ✓ review · ↑ send. */
+export function WaveformRecorderRow({
+  rec,
+  className,
+}: {
+  rec: ReturnType<typeof useWaveformDictation>;
+  className?: string;
+}) {
+  const transcribing = rec.state === "transcribing";
+  return (
+    <div className={cn("flex w-full items-center gap-2", className)}>
+      <button
+        type="button"
+        className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground disabled:opacity-50 md:size-9"
+        onClick={() => rec.cancel()}
+        disabled={transcribing}
+        aria-label="Cancel dictation"
+        title="Cancel"
+      >
+        <X className="size-5 md:size-4" />
+      </button>
+      <div className="flex h-11 min-w-0 flex-1 items-center justify-center gap-[3px] overflow-hidden rounded-2xl border border-border bg-muted/50 px-3 md:h-9">
+        {transcribing ? (
+          <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" /> transcribing…
+          </span>
+        ) : rec.bars.length === 0 ? (
+          <span className="text-sm text-muted-foreground">listening…</span>
+        ) : (
+          rec.bars.map((v, i) => (
+            <div
+              key={i}
+              className="w-[3px] shrink-0 rounded-full bg-foreground/70"
+              style={{ height: `${4 + Math.round(v * 26)}px` }}
+            />
+          ))
+        )}
+      </div>
+      {/* ✓ stop → transcript lands in the box for review */}
+      <button
+        type="button"
+        className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+        onClick={() => void rec.stop(false)}
+        disabled={transcribing}
+        aria-label="Stop and review"
+        title="Stop — review before sending"
+      >
+        <Check className="size-5 md:size-4" />
+      </button>
+      {/* ↑ stop → transcript sends immediately */}
+      <button
+        type="button"
+        className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
+        onClick={() => void rec.stop(true)}
+        disabled={transcribing}
+        aria-label="Stop and send"
+        title="Stop and send"
+      >
+        <ArrowUp className="size-5 md:size-4" />
+      </button>
+    </div>
+  );
+}
