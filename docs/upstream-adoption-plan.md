@@ -33,7 +33,47 @@ Cherry-picking the engine work gives us the good parts with small, contained `se
 
 ---
 
-## ⚠️ Spike results (2026-07-23) — P0 strategy corrected
+## ✅ Spike 2 (2026-07-23) — full engine lift driven to typecheck; surface is MAPPED
+
+I did the actual subsystem lift on a throwaway branch and ran `tsc --noEmit` to find the real
+integration surface. **Result: the blast radius converges to essentially ONE file (`serve.ts`).**
+
+**What I lifted (all `ours: 0` — we never touched any of them, so "take upstream's version" is
+conflict-free):** ~25 files. `bun install` of the 4 SDK deps was clean. The dependency closure is:
+- **Engine (13):** `agents/backends/{aisdk,codex-aisdk,opencode-aisdk,pi}-session.ts`, `draft.ts`,
+  `agent-profile.ts`, `aisdk-registry.ts`, `sessions.ts`, `transcript-index.ts`, `coding-agents.ts`,
+  `coding-agent-adapters.ts`, `agent-catalog.ts`, `tmux.ts`
+- **Transitive ring (8):** `managed.ts`, `lfg-capabilities.ts`, `model-discovery.ts`, `resume-cache.ts`,
+  `trace-log.ts`, `artifacts.ts`, `settings.ts`, `session-cache.ts`
+- **Non-serve callers of the changed API (3):** `actions/index.ts`, `commands/whatsapp.ts`, `sendq.ts`,
+  `commands/agents.ts` — also `ours: 0`, take upstream's.
+
+**Notable coupling discovery:** lifting the engine **pulls in `artifacts.ts` (a P2 file)** because the
+new `transcript-index.ts` imports it. So P0 and P2 are coupled through the new transcript index — you
+can't take the modern engine without at least the artifacts *module* (the UI is still separate).
+
+**Residual typecheck errors after the lift — the actual work, and it's tiny + localized:**
+1. **`src/commands/serve.ts` (~12 errors) — THE reconciliation, and it's ours.** Upstream *deleted*
+   the old transcript-read helpers (`recentMessages`, `recentMessagesCached`, `warmRecentMessages`,
+   `messagePage` — 0 occurrences left upstream; `searchTranscript` relocated) as part of the
+   direct-indexing rewrite. Our `serve.ts` still imports them from `sessions.ts`. So this is a small
+   **API migration** (map ~5 old transcript calls onto the new transcript API), plus a couple of
+   `HtmlMessage` typing fixes — **on top of** re-applying our own 5 commits of added routes.
+2. **`src/session-brain/*` — upstream deleted this whole subsystem.** Our `runner.ts` uses the removed
+   API. We never modified it (`ours: 0`), so follow upstream and **delete session-brain** (or adapt if
+   we still want it). Trivial.
+3. **`src/commands/agents.ts` — one union touch-up** (`AutoAgentBackend` vs `grok`). One line.
+
+### Bottom line
+The subsystem lift is **real but bounded and low-risk**: ~25 files adopted wholesale with **zero
+conflicts against our work**, and the *entire* manual reconciliation collapses to (a) a small
+transcript-API migration in `serve.ts` where our routes also live, (b) deleting `session-brain`,
+(c) one union fix. No sprawling merge. **Revised effort: Medium, concentrated almost entirely in
+`serve.ts`.** The spike branch was discarded (findings captured here); reproduce via the recipe below.
+
+---
+
+## ⚠️ Spike 1 results (2026-07-23) — P0 strategy corrected
 
 I ran the suggested P0 spike (`git cherry-pick 20e85f0 ae03092` on a throwaway branch off
 `main`). **The naive cherry-pick does NOT work — but for a reassuring reason.** Findings:
