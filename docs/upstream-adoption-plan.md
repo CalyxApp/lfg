@@ -207,6 +207,27 @@ and pointing the "notify me" step at our own notification path.
 **Why now:** ask-user and send-to-origin are almost tailor-made for a phone/voice front-end. High
 strategic fit for us.
 
+### ✅ P1 executed (2026-07-23, branch `upstream/p0-engine-lift`)
+
+Much smaller than scoped — **most of P1 rode in with P0** (`lfg-capabilities.ts`, `tmux.ts`
+contract injection, and the whole MCP registration/doctor layer inside `coding-agents.ts` were in
+the P0 transitive ring; the fork already had `src/ask/` + `/api/ask` + `/api/voice/consult` from
+its own earlier work). What remained:
+- **Lifted** (`ours: 0` / new): `ask/store.ts` (+`pushback` field), `commands/mcp.ts` (+test,
+  23 tools), `origin-deliveries.ts` (+test).
+- **Wired**: `cli.ts` `mcp` case; `serve.ts` — ask `pushback` fire-and-forget + verbatim
+  steer-injection on answer, `/api/sessions/reparent`, origin-deliveries GET/POST
+  (owner-scoped via `x-lfg-session-id`), and an honest `/api/shipped` **501 stub**
+  (Shipped is P2; GET returns an empty feed so clients don't break).
+- **Verified live**: tsc clean; both lifted test files pass (6/6); `lfg mcp` serves all 23 tools
+  over stdio; full pushback loop on a real haiku session (ask → instant id → answer → injected
+  as steer → agent acted on it) ; origin-delivery 403-without-owner-header + create/list
+  roundtrip; shipped stub responses.
+- **Not done (deliberate)**: registering the LFG MCP server into each agent CLI's config on this
+  box (`claude mcp add lfg …` etc.) — that's per-machine setup, not repo code; the doctor
+  output in `lfg agents doctor` shows the exact commands. And the "notify me" step already
+  rides our existing push path (`notifyAll`).
+
 ---
 
 ## Priority 3 (P2) — Artifacts + "Shipped"  (feature project, not a quick pick)
@@ -303,5 +324,7 @@ Ran exactly as mapped. Deltas vs Spike 2, for the record:
   section from our shell.**
 - Verified: `tsc --noEmit` clean; server boots; `/api/sessions`, `/messages`,
   `/transcript/search` all serve real data off the new SQLite index path.
-- **Still to verify live** (needs a real agent run, not done headlessly on the shared box):
-  create → turn → **interrupt** → **managed resume**.
+- **Live smoke passed** (real haiku session on this box): create → turn (streamed reply) →
+  long turn → **native interrupt** (busy→idle, output cut) → follow-up turn answered on the
+  **same persistent session** → close. The disconnect/reconnect flavor of managed resume
+  (`/api/sessions/resume`) is still unexercised but rides the same registry path.

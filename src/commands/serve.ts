@@ -38,6 +38,17 @@ import {
   computeSessionDiffSummary,
   computeSessionFilePatch,
 } from "../session-diff.ts";
+import {
+  createOriginDelivery,
+  listOriginDeliveries,
+  type OriginDeliveryMedia,
+} from "../origin-deliveries.ts";
+import {
+  createImageArtifact,
+  createVideoArtifact,
+  getImageArtifact,
+  type ImageArtifact,
+} from "../artifacts.ts";
 import { reportClientError, listClientErrors } from "../client-errors.ts";
 import { getAllUsage } from "../usage.ts";
 import {
@@ -2199,6 +2210,7 @@ export async function cmdServe() {
           agentId?: string | null;
           sessionId?: string | null;
           user?: string | null;
+          pushback?: boolean;
           wait?: boolean;
           timeoutMs?: number;
         } | null;
@@ -2209,12 +2221,14 @@ export async function cmdServe() {
           agentId: b.agentId,
           sessionId: b.sessionId,
           user: b.user,
+          pushback: b.pushback === true,
         });
         // Wake the user with a push (user-scoped). Voice talk-back happens when
         // they engage: open questions are surfaced in the voice snapshot below,
         // so the voice agent can read them out and answer on the user's behalf.
         void notifyAll({ user: q.user }).catch(() => {});
-        if (b.wait === false) return json({ id: q.id, status: q.status });
+        // Pushback asks never block — the answer arrives via session injection.
+        if (q.pushback || b.wait === false) return json({ id: q.id, status: q.status });
         // Cap the block so a stuck request can't pin a connection forever.
         const timeoutMs = Math.min(Math.max(b.timeoutMs ?? 180_000, 1_000), 600_000);
         const answered = await waitForAnswer(q.id, timeoutMs);
@@ -2249,7 +2263,36 @@ export async function cmdServe() {
           // next run to re-interpret it. Reuse the validated /send and /close
           // routes via a loopback call. On any failure we leave the question
           // "answered" so the supervisor's STEP 1 still backstops it.
-          if (q.sessionId) {
+          if (q.sessionId && q.pushback) {
+            // Fire-and-forget ask (MCP lfg_ask_user): the asking agent ended its
+            // turn and is NOT polling, so this injection is the only way the
+            // answer reaches it. Always deliver verbatim — no interpretation, a
+            // plain "no" is a real answer here. Steer mode wakes an idle session.
+            const clip = (t: string, n: number) => {
+              const c = t.replace(/\s+/g, " ").trim();
+              return c.length > n ? c.slice(0, n - 1).trimEnd() + "…" : c;
+            };
+            const text =
+              `[ask-user answer ${q.id}] The user answered the question you asked earlier.\n` +
+              `Question: ${clip(q.question, 300)}\n` +
+              `Answer: ${q.answer ?? ""}\n` +
+              `Act on this answer now; it is the user's decision.`;
+            try {
+              const r = await fetch(
+                `http://127.0.0.1:${PORT}/api/sessions/${q.sessionId}/send`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ text, mode: "steer" }),
+                },
+              );
+              if (r.ok) await markHandled(q.id);
+              // On failure the question stays "answered" and is visible in the
+              // ask feed; the supervisor backstop can still deliver it.
+            } catch {
+              // loopback failed — leave answered
+            }
+          } else if (q.sessionId) {
             const plan = plannedSessionAction(q.answer ?? "");
             try {
               if (plan.kind === "send") {
@@ -3611,6 +3654,122 @@ export async function cmdServe() {
             return err(interrupted.status ?? 502, interrupted.error || "interrupt failed");
           return json({ ok: true });
         }
+      }
+
+      // Move a session under a different parent (or detach it to a root). Used
+      // by the LFG MCP delegate tools to keep subagent lineage truthful.
+      if (path === "/api/sessions/reparent" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          sessionId?: string;
+          parentSessionId?: string | null;
+        } | null;
+        const childId = body?.sessionId?.trim();
+        if (!childId) return err(400, "sessionId required");
+        const sessions = await listSessions();
+        const matches = (s: (typeof sessions)[number], id: string) =>
+          s.sessionId === id || s.nativeSessionId === id;
+        const child = sessions.find((s) => matches(s, childId));
+        if (!child) return err(404, "session not found");
+        if (!child.managed || !child.tmuxName)
+          return err(400, "session is not lfg-managed; its parentage cannot be changed");
+
+        const newParentId = body?.parentSessionId?.trim() || null;
+        if (!newParentId) {
+          // Detach to a root: clear the parent fields.
+          patchManaged(child.tmuxName, {
+            parentSessionId: undefined,
+            parentNativeSessionId: undefined,
+            parentAgent: undefined,
+          });
+          return json({ ok: true, sessionId: childId, parentSessionId: null });
+        }
+
+        const parent = sessions.find((s) => matches(s, newParentId));
+        if (!parent) return err(404, "parent session not found");
+        if (matches(parent, childId)) return err(400, "cannot parent a session to itself");
+        // Cycle guard: walk up from the proposed parent; if we reach the child,
+        // the move would form a loop. Bounded by session count as a backstop
+        // against a pre-existing cycle in the data.
+        let cursor: (typeof sessions)[number] | undefined = parent;
+        for (let hops = 0; cursor && hops <= sessions.length; hops++) {
+          if (matches(cursor, childId)) return err(400, "reparent would create a cycle");
+          const up: string | null | undefined =
+            cursor.parentSessionId ?? cursor.parentNativeSessionId;
+          cursor = up ? sessions.find((s) => matches(s, up)) : undefined;
+        }
+
+        patchManaged(child.tmuxName, {
+          parentSessionId: parent.sessionId ?? undefined,
+          parentNativeSessionId: parent.nativeSessionId ?? undefined,
+          parentAgent: parent.agent ?? undefined,
+        });
+        return json({
+          ok: true,
+          sessionId: childId,
+          parentSessionId: parent.sessionId ?? parent.nativeSessionId ?? newParentId,
+        });
+      }
+
+      // Origin deliveries — an agent sends a result "back to where the job came
+      // from" (text + media). LFG stores only the payload; an external adapter
+      // (iMessage/Slack/voice bridge) polls the list and delivers it.
+      {
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/origin-deliveries$/);
+        if (m && req.method === "GET") {
+          const limit = Number(url.searchParams.get("limit") ?? 50);
+          return json({ deliveries: listOriginDeliveries(m[1], limit) });
+        }
+        if (m && req.method === "POST") {
+          if (req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "origin delivery requires the owning LFG session");
+          }
+          const body = (await req.json().catch(() => null)) as {
+            text?: string;
+            mediaPaths?: string[];
+            artifactIds?: string[];
+          } | null;
+          if (!body) return err(400, "request body required");
+          try {
+            const artifacts: ImageArtifact[] = [];
+            for (const id of (body.artifactIds ?? []).slice(0, 3)) {
+              const artifact = getImageArtifact(id);
+              if (!artifact || artifact.sessionId !== m[1]) {
+                throw new Error(`artifact ${id} does not belong to this session`);
+              }
+              if (artifact.media !== "video" && (artifact.media ?? "image") !== "image") {
+                throw new Error(`artifact ${id} is not image or video media`);
+              }
+              artifacts.push(artifact);
+            }
+            for (const mediaPath of (body.mediaPaths ?? []).slice(0, Math.max(0, 3 - artifacts.length))) {
+              const extension = extname(mediaPath).toLowerCase();
+              const artifact = [".mp4", ".m4v", ".webm", ".mov", ".ogv"].includes(extension)
+                ? createVideoArtifact({ sessionId: m[1], path: mediaPath })
+                : createImageArtifact({ sessionId: m[1], path: mediaPath });
+              artifacts.push(artifact);
+            }
+            const media: OriginDeliveryMedia[] = artifacts.map((artifact) => ({
+              path: `/api/artifacts/${artifact.id}`,
+              kind: artifact.media === "video" ? "video" : "image",
+              mimeType: artifact.mimeType,
+            }));
+            const delivery = createOriginDelivery({
+              sessionId: m[1],
+              text: body.text,
+              media,
+            });
+            return json({ ok: true, delivery });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not create origin delivery");
+          }
+        }
+      }
+
+      // Shipped feed is P2 (docs/upstream-adoption-plan.md) — honest stub so the
+      // MCP lfg_ship tool gets a clear message instead of a bare 404.
+      if (path === "/api/shipped") {
+        if (req.method === "GET") return json({ posts: [] });
+        return err(501, "the Shipped feed is not adopted yet (P2 in docs/upstream-adoption-plan.md)");
       }
 
       {
