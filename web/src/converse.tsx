@@ -18,7 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
-import { ArrowUp, AudioLines, Mic, X } from "lucide-react";
+import { ArrowUp, AudioLines, Mic, MicOff, Square, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
 
@@ -79,6 +79,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const [mode, setMode] = useState<Mode>("chat");
   const [phase, setPhase] = useState<Phase>("live");
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("connecting");
+  const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<LogEntry[]>([]);
 
@@ -246,6 +247,18 @@ export function Converse({ onClose }: { onClose: () => void }) {
     dcRef.current = null;
     pcRef.current = null;
     micRef.current = null;
+    setMuted(false);
+  }
+
+  // Mute/unmute the outgoing mic without tearing down the session. Disabling the
+  // track stops audio reaching the model (so it won't hear you or ambient noise)
+  // while the connection stays live.
+  function toggleMute() {
+    const stream = micRef.current;
+    if (!stream) return;
+    const next = !muted;
+    for (const t of stream.getAudioTracks()) t.enabled = !next;
+    setMuted(next);
   }
 
   // run a tool call the model relays over the data channel
@@ -656,19 +669,35 @@ export function Converse({ onClose }: { onClose: () => void }) {
         <div className="flex items-center justify-center gap-3 border-t border-border px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           <span className="text-sm text-muted-foreground">
             {voiceStatus === "live"
-              ? "voice is live — just talk"
+              ? muted
+                ? "muted — tap the mic to talk"
+                : "voice is live — just talk"
               : voiceStatus === "connecting"
                 ? "connecting…"
                 : "voice error"}
           </span>
           <button
             type="button"
-            className="rounded-full border border-border px-5 py-2 text-sm font-medium text-foreground"
-            onClick={() => setMode("chat")}
-            title="Back to keyboard — keeps the conversation"
-            aria-label="Back to chat"
+            onClick={toggleMute}
+            disabled={voiceStatus !== "live"}
+            className={
+              muted
+                ? "flex size-11 items-center justify-center rounded-full bg-destructive text-destructive-foreground disabled:opacity-50 md:size-9"
+                : "flex size-11 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+            }
+            title={muted ? "Unmute microphone" : "Mute microphone"}
+            aria-label={muted ? "Unmute microphone" : "Mute microphone"}
           >
-            Back to chat
+            {muted ? <MicOff className="size-5 md:size-4" /> : <Mic className="size-5 md:size-4" />}
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("chat")}
+            className="flex items-center gap-1.5 rounded-full border border-border px-4 py-2 text-sm font-medium text-foreground"
+            title="Stop voice — back to the keyboard, keeps the conversation"
+            aria-label="Stop voice"
+          >
+            <Square className="size-4" /> Stop
           </button>
         </div>
       ) : dict.active ? (
