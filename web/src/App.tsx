@@ -112,7 +112,7 @@ import { MicButton, recordingButtonStyle, useDictation, useWaveformDictation, Wa
 import { CaptureView } from "@/components/CaptureView";
 import { HomeView } from "@/components/HomeView";
 import { SearchView } from "@/components/SearchView";
-import { ArtifactsView } from "@/components/ArtifactsView";
+import { ArtifactInlineCard, ArtifactsView } from "@/components/ArtifactsView";
 import { ShippedView } from "@/components/ShippedView";
 
 // Injected by Vite `define` at build time (see vite.config.ts).
@@ -337,6 +337,14 @@ type Message = {
   ts?: number;
   pending?: boolean;
   seed?: boolean;
+  // Artifact placement messages (kind image/video/html) — appended into the
+  // transcript when an agent publishes; hydrated by the artifacts JOIN.
+  artifactId?: string;
+  url?: string;
+  title?: string;
+  caption?: string;
+  version?: number;
+  mimeType?: string;
   // A draft assistant turn we joined mid-stream: its text was already fully
   // accumulated when we connected, so it renders settled instead of replaying
   // the word-by-word streaming reveal. See DRAFT_CATCHUP_MIN_CHARS.
@@ -8383,6 +8391,19 @@ function MessageBubble({
             <ReasoningContent>{message.text || "thinking..."}</ReasoningContent>
           </Reasoning>
         </MessageContent>
+      </AiMessage>
+    );
+  }
+
+  // Artifact placements render as inline media cards at the point in the
+  // conversation where the agent published them (images, videos, live HTML).
+  if (
+    (message.kind === "image" || message.kind === "video" || message.kind === "html") &&
+    message.url
+  ) {
+    return (
+      <AiMessage className={cn("msg", entering && "lfg-msg-in")} from="assistant">
+        <ArtifactInlineCard artifact={message} />
       </AiMessage>
     );
   }

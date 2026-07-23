@@ -101,6 +101,63 @@ function ArtifactMedia({ artifact, full }: { artifact: ArtifactCard; full?: bool
   );
 }
 
+// Inline chat card — how an artifact renders at its placement point inside a
+// session transcript (the backend appends an artifact message when an agent
+// publishes). Media + label row; tap opens the raw artifact in a new tab.
+export function ArtifactInlineCard({
+  artifact,
+}: {
+  artifact: {
+    kind?: string;
+    url?: string;
+    artifactId?: string;
+    title?: string;
+    caption?: string;
+    text?: string;
+    version?: number;
+  };
+}) {
+  if (!artifact.url) return null;
+  const kind = (artifact.kind === "video" || artifact.kind === "html" ? artifact.kind : "image") as
+    | "image"
+    | "video"
+    | "html";
+  const card: ArtifactCard = {
+    id: artifact.artifactId ?? artifact.url,
+    kind,
+    url: artifact.url,
+    title: artifact.title,
+    caption: artifact.caption ?? artifact.text,
+    sessionId: "",
+    version: artifact.version,
+  };
+  const label = artifact.title || artifact.caption || artifact.text;
+  return (
+    <div className="my-1.5 w-full max-w-md overflow-hidden rounded-xl border bg-card shadow-sm">
+      <ArtifactMedia artifact={card} full={kind === "html"} />
+      <div className="flex items-center gap-1.5 px-3 py-2">
+        <KindIcon kind={kind} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <span className="min-w-0 flex-1 truncate text-xs font-medium">
+          {label || card.id}
+          {artifact.version && artifact.version > 1 ? (
+            <span className="ml-2 rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
+              v{artifact.version}
+            </span>
+          ) : null}
+        </span>
+        <a
+          href={artifact.url}
+          target="_blank"
+          rel="noreferrer"
+          className="shrink-0 rounded-md border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent"
+        >
+          Open
+        </a>
+      </div>
+    </div>
+  );
+}
+
 export function ArtifactsView({
   onOpenSession,
 }: {
