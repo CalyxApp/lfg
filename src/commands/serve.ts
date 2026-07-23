@@ -46,9 +46,21 @@ import {
 import {
   createImageArtifact,
   createVideoArtifact,
+  deleteArtifact,
   getImageArtifact,
+  imageArtifactToMessage,
+  listAllArtifacts,
+  publishHtmlArtifact,
   type ImageArtifact,
 } from "../artifacts.ts";
+import { deleteImagePreview, getOrCreateImagePreview } from "../artifact-previews.ts";
+import { addShipPost, listShipPosts } from "../shipped.ts";
+import {
+  artifactRefreshManager,
+  prepareArtifactRefreshConfig,
+  startArtifactRefreshScheduler,
+  type ArtifactRefreshChanges,
+} from "../artifact-refresh.ts";
 import { reportClientError, listClientErrors } from "../client-errors.ts";
 import { getAllUsage } from "../usage.ts";
 import {
@@ -70,6 +82,7 @@ import {
 import {
   listSessions,
   resolveTranscript,
+  readTitleOverrides,
   normalizeLineMessages,
   setSessionTitle,
   sessionIdForPid,
@@ -82,11 +95,15 @@ import {
 } from "../sessions.ts";
 import {
   enqueueTranscriptIndex,
+  indexArtifactMessage,
+  indexedArtifactPlacement,
   indexedMessagePage,
   indexedRecentMessages,
   indexTranscript,
+  removeIndexedArtifact,
   searchAllTranscriptIndexes,
   searchTranscriptIndex,
+  sessionIndexKey,
   warmTranscriptIndexes,
 } from "../transcript-index.ts";
 import {
@@ -110,7 +127,7 @@ import {
   panePidForSession,
   isBusy,
 } from "../tmux.ts";
-import { addManaged, patchManaged, removeManaged } from "../managed.ts";
+import { addManaged, listManaged, patchManaged, removeManaged } from "../managed.ts";
 import { PtyBridge, termSessionName } from "../pty.ts";
 import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
@@ -725,6 +742,34 @@ function warmRenderedBacklogs(sessions: Session[], limit = 40): void {
       })
       .catch(() => {});
   }
+}
+
+function artifactDirExists(path: string | null | undefined): path is string {
+  if (!path) return false;
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// Where an artifact-owning session actually runs — refresh scripts are scoped
+// to this directory so a session can only execute code under its own cwd.
+async function artifactOwnerCwd(sessionId: string): Promise<string | null> {
+  const sessions = await listSessions().catch(() => []);
+  const session = sessions.find(
+    (row) => row.sessionId === sessionId || row.nativeSessionId === sessionId,
+  );
+  if (artifactDirExists(session?.cwd)) return session.cwd;
+  const managed = listManaged().find(
+    (row) => row.sessionId === sessionId || row.nativeSessionId === sessionId,
+  );
+  if (artifactDirExists(managed?.cwd)) return managed.cwd;
+  const transcript = await resolveTranscript(sessionId).catch(() => null);
+  if (!transcript) return null;
+  const cwd = await cwdForTranscript(transcript).catch(() => null) ??
+    await cwdForCodexTranscript(transcript).catch(() => null);
+  return artifactDirExists(cwd) ? cwd : null;
 }
 
 function compactForSpeech(text: string, max = 700): string {
@@ -3765,11 +3810,392 @@ export async function cmdServe() {
         }
       }
 
-      // Shipped feed is P2 (docs/upstream-adoption-plan.md) — honest stub so the
-      // MCP lfg_ship tool gets a clear message instead of a bare 404.
-      if (path === "/api/shipped") {
-        if (req.method === "GET") return json({ posts: [] });
-        return err(501, "the Shipped feed is not adopted yet (P2 in docs/upstream-adoption-plan.md)");
+      {
+        // Gallery: every artifact across sessions, newest first. Powers the
+        // Artifacts view so agent output is browsable in one place.
+        if (path === "/api/artifacts" && req.method === "GET") {
+          const limit = Math.min(Number(url.searchParams.get("limit")) || 120, 500);
+          const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
+          // Optional kind filter (image | video | html) applied before paging
+          // so offset/total always describe the filtered set.
+          const kindFilter = url.searchParams.get("kind");
+          const titles = await readTitleOverrides();
+          const managed = listManaged();
+          const all = listAllArtifacts().filter(
+            (artifact) => !kindFilter || (artifact.media ?? "image") === kindFilter,
+          );
+          // listAllArtifacts is oldest-first; page newest-first with an offset
+          // so the gallery can load incrementally instead of all up front.
+          const artifacts = all
+            .slice()
+            .reverse()
+            .slice(offset, offset + limit)
+            .map((artifact) => ({
+              id: artifact.id,
+              kind: artifact.media ?? "image",
+              url: `/api/artifacts/${encodeURIComponent(artifact.id)}`,
+              name: artifact.name,
+              title: artifact.title,
+              caption: artifact.caption,
+              sessionId: artifact.sessionId,
+              sessionTitle:
+                titles[artifact.sessionId] ??
+                managed.find(
+                  (m2) => m2.sessionId === artifact.sessionId || m2.nativeSessionId === artifact.sessionId,
+                )?.title,
+              ts: artifact.updatedAt ?? artifact.createdAt,
+              lastRefreshedAt: artifact.refresh?.lastSuccessAt,
+              refreshStatus: artifact.refresh?.status,
+              refreshEnabled: artifact.refresh?.enabled,
+              version: artifact.version,
+              size: artifact.size,
+              mimeType: artifact.mimeType,
+            }));
+          return json({ ok: true, artifacts, total: all.length });
+        }
+        const m = path.match(/^\/api\/artifacts\/([a-z0-9-]+)$/);
+        if (m && req.method === "GET") {
+          const artifact = getImageArtifact(m[1]);
+          if (!artifact) return err(404, "artifact not found");
+          const wantsPreview = url.searchParams.get("preview") === "1";
+          let filePath = artifact.filePath;
+          let contentType = artifact.mimeType;
+          if (wantsPreview && (artifact.media ?? "image") === "image") {
+            try {
+              filePath = await getOrCreateImagePreview(artifact);
+              contentType = "image/webp";
+            } catch (error) {
+              // A corrupt/unsupported input should not leave the transcript with
+              // a broken image. The immutable original remains a safe fallback.
+              console.warn("artifact preview generation failed", artifact.id, error);
+            }
+          }
+          const file = Bun.file(filePath);
+          if (!(await file.exists())) return err(404, "artifact file not found");
+          if (artifact.media === "html") {
+            // Updatable + rendered in a sandboxed iframe: never cache (the same
+            // URL serves newer versions), and lock the document down — inline
+            // script/style only, no network, no parent-frame access.
+            // A tiny reporter is injected so embeds can match content height
+            // (the sandboxed frame is cross-origin; postMessage is the only channel).
+            const reporter =
+              '<script>(function(){var last=0;var send=function(){var b=document.body;var h=Math.max(document.documentElement.scrollHeight,b?b.scrollHeight:0);if(Math.abs(h-last)>2){last=h;try{parent.postMessage({type:"lfg-artifact-height",height:h},"*")}catch(e){}}};addEventListener("load",send);setTimeout(send,60);setInterval(send,1000);try{new ResizeObserver(send).observe(document.documentElement)}catch(e){}})();</scr' + "ipt>";
+            let doc = await file.text();
+            doc = doc.includes("</body>")
+              ? doc.replace("</body>", reporter + "</body>")
+              : doc + reporter;
+            return new Response(doc, {
+              headers: {
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy":
+                  "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'",
+              },
+            });
+          }
+          const baseHeaders: Record<string, string> = {
+            "Content-Type": contentType,
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+            // Video seeking (and Safari playback) needs byte-range support.
+            "Accept-Ranges": "bytes",
+          };
+          // Honor a single-range request so the <video> element can seek without
+          // re-downloading the whole file. Bun.file().slice() streams the slice.
+          const range = req.headers.get("range");
+          const rangeMatch = range?.match(/^bytes=(\d*)-(\d*)$/);
+          if (rangeMatch) {
+            const total = file.size;
+            const startRaw = rangeMatch[1];
+            const endRaw = rangeMatch[2];
+            let start = startRaw ? Number(startRaw) : 0;
+            let end = endRaw ? Number(endRaw) : total - 1;
+            if (!startRaw && endRaw) {
+              // Suffix range: bytes=-N → the final N bytes.
+              start = Math.max(0, total - Number(endRaw));
+              end = total - 1;
+            }
+            if (
+              Number.isFinite(start) &&
+              Number.isFinite(end) &&
+              start <= end &&
+              start < total
+            ) {
+              end = Math.min(end, total - 1);
+              return new Response(file.slice(start, end + 1), {
+                status: 206,
+                headers: {
+                  ...baseHeaders,
+                  "Content-Range": `bytes ${start}-${end}/${total}`,
+                  "Content-Length": String(end - start + 1),
+                },
+              });
+            }
+            return new Response("range not satisfiable", {
+              status: 416,
+              headers: { ...baseHeaders, "Content-Range": `bytes */${total}` },
+            });
+          }
+          return new Response(file, { headers: baseHeaders });
+        }
+      }
+
+      {
+        // Destructive artifact changes are owner-scoped just like refresh
+        // configuration. Removing an HTML artifact cancels any active script
+        // before its stable id and file disappear.
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/([a-z0-9-]+)$/);
+        if (m && req.method === "DELETE") {
+          if (req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "artifact deletion requires the owning LFG session");
+          }
+          const artifact = getImageArtifact(m[2]);
+          if (!artifact) return err(404, "artifact not found");
+          if (artifact.sessionId !== m[1]) return err(403, "artifact belongs to a different session");
+          try {
+            const placementPath = indexedArtifactPlacement(artifact.id);
+            if (artifact.media === "html") artifactRefreshManager.cancel(artifact.id);
+            // Remove the visible placement first. If file/catalog deletion
+            // fails, restore exactly that placement before returning failure.
+            removeIndexedArtifact(artifact.id);
+            let deleted;
+            try {
+              deleted = deleteArtifact({ id: artifact.id, sessionId: m[1] });
+            } catch (deleteError) {
+              if (placementPath) indexArtifactMessage(placementPath, m[1], artifact);
+              throw deleteError;
+            }
+            await deleteImagePreview(deleted.id);
+            return json({ ok: true, artifact: deleted });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not delete artifact");
+          }
+        }
+      }
+
+      {
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/images$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            path?: string;
+            caption?: string;
+            alt?: string;
+          } | null;
+          if (!body?.path?.trim()) return err(400, "path required");
+          try {
+            const transcriptPath = await resolveTranscript(m[1]);
+            const indexPath = transcriptPath ?? sessionIndexKey(m[1]);
+            const artifact = createImageArtifact({
+              sessionId: m[1],
+              path: body.path,
+              caption: body.caption,
+              alt: body.alt,
+            });
+            // One ordered append + joined artifacts row — same source the
+            // transcript page reads via JOIN. Never acknowledge a display until
+            // metadata + placement commit atomically in SQLite.
+            indexArtifactMessage(indexPath, m[1], artifact);
+            return json({ ok: true, artifact, message: imageArtifactToMessage(artifact), indexed: true });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not create image artifact");
+          }
+        }
+      }
+
+      {
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/videos$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            path?: string;
+            caption?: string;
+            alt?: string;
+          } | null;
+          if (!body?.path?.trim()) return err(400, "path required");
+          try {
+            const transcriptPath = await resolveTranscript(m[1]);
+            const indexPath = transcriptPath ?? sessionIndexKey(m[1]);
+            const artifact = createVideoArtifact({
+              sessionId: m[1],
+              path: body.path,
+              caption: body.caption,
+              alt: body.alt,
+            });
+            indexArtifactMessage(indexPath, m[1], artifact);
+            return json({ ok: true, artifact, message: imageArtifactToMessage(artifact), indexed: true });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not create video artifact");
+          }
+        }
+      }
+
+      {
+        // Publish/re-publish HTML and optionally attach a server-side refresh
+        // script. The script path is scoped to the owning session cwd; the
+        // sandboxed iframe has no route to invoke it (no forms, network, or
+        // same-origin capability under the artifact CSP).
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/html$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            html?: string;
+            id?: string;
+            title?: string;
+            caption?: string;
+            refreshScriptPath?: string | null;
+            refreshArgv?: string[];
+            refreshIntervalSeconds?: number;
+            refreshTimeoutSeconds?: number;
+            refreshEnabled?: boolean;
+          } | null;
+          if (!body) return err(400, "request body required");
+          const hasRefreshChanges = [
+            "refreshScriptPath",
+            "refreshArgv",
+            "refreshIntervalSeconds",
+            "refreshTimeoutSeconds",
+            "refreshEnabled",
+          ].some((key) => Object.prototype.hasOwnProperty.call(body, key));
+          if (hasRefreshChanges && req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "refresh configuration requires the owning LFG session");
+          }
+          if (!body.html?.trim() && (!body.id || !hasRefreshChanges)) {
+            return err(400, "html required unless updating an existing refresh configuration");
+          }
+          try {
+            const changes: ArtifactRefreshChanges = {
+              scriptPath: body.refreshScriptPath,
+              argv: body.refreshArgv,
+              intervalMs: body.refreshIntervalSeconds === undefined
+                ? undefined
+                : body.refreshIntervalSeconds * 1_000,
+              timeoutMs: body.refreshTimeoutSeconds === undefined
+                ? undefined
+                : body.refreshTimeoutSeconds * 1_000,
+              enabled: body.refreshEnabled,
+            };
+            let artifact;
+            if (body.html?.trim()) {
+              const existing = body.id ? getImageArtifact(body.id) : null;
+              let refresh = undefined;
+              if (hasRefreshChanges) {
+                const scopeRoot = typeof body.refreshScriptPath === "string"
+                  ? await artifactOwnerCwd(m[1]) ?? undefined
+                  : undefined;
+                refresh = prepareArtifactRefreshConfig({
+                  changes,
+                  existing: existing?.refresh,
+                  scopeRoot,
+                });
+                if (!refresh || !refresh.enabled) artifactRefreshManager.cancel(body.id ?? "");
+              }
+              const transcriptPath = await resolveTranscript(m[1]);
+              artifact = publishHtmlArtifact({
+                sessionId: m[1],
+                html: body.html,
+                id: body.id,
+                title: body.title,
+                caption: body.caption,
+                refresh: hasRefreshChanges ? refresh : undefined,
+              });
+              indexArtifactMessage(transcriptPath ?? sessionIndexKey(m[1]), m[1], artifact);
+            } else {
+              const scopeRoot = typeof body.refreshScriptPath === "string"
+                ? await artifactOwnerCwd(m[1]) ?? undefined
+                : undefined;
+              artifact = artifactRefreshManager.configure({
+                id: body.id!,
+                sessionId: m[1],
+                scopeRoot,
+                changes,
+              });
+            }
+            return json({ ok: true, artifact, message: imageArtifactToMessage(artifact) });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not publish html artifact");
+          }
+        }
+      }
+
+      {
+        // Status + manual refresh. Ownership is enforced by both the route
+        // session and the durable artifact owner before host execution begins.
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/html\/([a-z0-9-]+)\/refresh$/);
+        if (m && (req.method === "GET" || req.method === "POST")) {
+          if (req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "artifact refresh requires the owning LFG session");
+          }
+          const artifact = getImageArtifact(m[2]);
+          if (!artifact || artifact.media !== "html") return err(404, "html artifact not found");
+          if (artifact.sessionId !== m[1]) return err(403, "artifact belongs to a different session");
+          if (req.method === "GET") {
+            return json({ ok: true, artifact, refresh: artifact.refresh ?? null });
+          }
+          try {
+            const result = await artifactRefreshManager.refreshNow(m[2], m[1]);
+            return json({ ...result, refresh: result.artifact.refresh ?? null });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not refresh html artifact");
+          }
+        }
+      }
+
+      {
+        // The Shipped channel: agents post finished work here (title, summary,
+        // media). Media are ordinary artifacts, so images/videos/live html
+        // dashboards all embed the same way.
+        if (path === "/api/shipped" && req.method === "GET") {
+          const limit = Math.min(Number(url.searchParams.get("limit")) || 50, 200);
+          const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
+          const titles = await readTitleOverrides();
+          const managed = listManaged();
+          const page = listShipPosts(limit, offset);
+          const posts = page.posts.map((post) => {
+            const source = post.sessionId
+              ? managed.find(
+                  (s) => s.sessionId === post.sessionId || s.nativeSessionId === post.sessionId,
+                )
+              : undefined;
+            return {
+              ...post,
+              sessionTitle: post.sessionId
+                ? (titles[post.sessionId] ?? source?.title)
+                : undefined,
+              // The feed's avatar/byline reflect the session that actually did
+              // the work — the registry is authoritative over whatever the post
+              // was stored with (lfg_ship never sends an agent kind).
+              agent: source?.agent ?? post.agent,
+            };
+          });
+          return json({ ok: true, posts, total: page.total });
+        }
+        if (path === "/api/shipped" && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            title?: string;
+            summary?: string;
+            id?: string;
+            sessionId?: string;
+            agent?: string;
+            project?: string;
+            mediaPaths?: Array<{ path: string; caption?: string }>;
+            artifactIds?: string[];
+          } | null;
+          const shipTitle = body?.title?.trim();
+          if (!body || !shipTitle) return err(400, "title required");
+          try {
+            // Stamp the posting session's agent kind at write time so the feed
+            // byline survives registry pruning; the GET hydration still prefers
+            // the live registry when the session is known.
+            const sourceAgent = body.sessionId
+              ? listManaged().find(
+                  (s) => s.sessionId === body.sessionId || s.nativeSessionId === body.sessionId,
+                )?.agent
+              : undefined;
+            const post = await addShipPost({ ...body, agent: body.agent ?? sourceAgent, title: shipTitle });
+            return json({ ok: true, post });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not add shipped post");
+          }
+        }
       }
 
       {
@@ -4360,6 +4786,8 @@ export async function cmdServe() {
 
   startAutoScheduler((l) => console.log(l));
   startWorktreeSweep((l) => console.log(l));
+  // Re-arm server-side refresh scripts for live HTML artifacts.
+  startArtifactRefreshScheduler((l) => console.log(l));
   // Watch the fleet for busy -> idle transitions and fan "completed" events out
   // to voice subscribers (/api/voice/events). Idempotent + best-effort.
   startFleetWatcher();
