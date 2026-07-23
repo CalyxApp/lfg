@@ -84,6 +84,16 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
   // chat-mode state
   const [input, setInput] = useState("");
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Auto-grow the chat box with its content (iOS Safari lacks CSS field-sizing),
+  // capped at ~40vh then it scrolls. Runs on every value change so it also
+  // shrinks back to one line after the box is cleared on send.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight * 0.4))}px`;
+  }, [input]);
   const [sending, setSending] = useState(false);
   const [cfg, setCfg] = useState<ChatConfig | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -652,10 +662,13 @@ export function Converse({ onClose }: { onClose: () => void }) {
                 : "voice error"}
           </span>
           <button
-            className="rounded-full bg-destructive px-5 py-2 text-sm font-medium text-destructive-foreground"
+            type="button"
+            className="rounded-full border border-border px-5 py-2 text-sm font-medium text-foreground"
             onClick={() => setMode("chat")}
+            title="Back to keyboard — keeps the conversation"
+            aria-label="Back to chat"
           >
-            End voice
+            Back to chat
           </button>
         </div>
       ) : dict.active ? (
@@ -671,10 +684,19 @@ export function Converse({ onClose }: { onClose: () => void }) {
             void sendChatText(input);
           }}
         >
-          <input
-            className="lfg-gfield h-11 min-h-11 min-w-0 flex-1 rounded-2xl border-transparent px-4 text-base shadow-sm placeholder:text-muted-foreground"
+          <textarea
+            ref={inputRef}
+            rows={1}
+            className="lfg-gfield max-h-[40vh] min-h-11 min-w-0 flex-1 resize-none overflow-y-auto rounded-2xl border-transparent px-4 py-2.5 text-base leading-6 shadow-sm placeholder:text-muted-foreground"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter sends; Shift+Enter (or ⌘/Ctrl+Enter) inserts a newline.
+              if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+                e.preventDefault();
+                void sendChatText(input);
+              }
+            }}
             placeholder="Ask…"
             disabled={sending}
           />

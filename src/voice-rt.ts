@@ -51,9 +51,15 @@ function buildSessionConfig() {
     audio: {
       input: {
         transcription: { model: "gpt-4o-transcribe" },
+        // Server-side ambient-noise filter so background sound doesn't get read
+        // as speech and barge in on the assistant. near_field = phone held close.
+        noise_reduction: { type: "near_field" },
         turn_detection: {
           type: "semantic_vad",
-          eagerness: "auto",
+          // "low" is less eager to treat incidental sound as the user taking a
+          // turn, which cut the assistant off mid-reply. If noise still barges
+          // in, switch to server_vad with an explicit numeric `threshold`.
+          eagerness: "low",
           create_response: true,
           interrupt_response: true,
         },
