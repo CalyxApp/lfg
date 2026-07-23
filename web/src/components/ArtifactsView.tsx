@@ -4,9 +4,10 @@
 // backend enforces via CSP; re-published ids show a version badge.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Film, Globe, Image as ImageIcon, Loader2, RefreshCw, X } from "lucide-react";
+import { Film, Globe, Image as ImageIcon, Loader2, Maximize2, RefreshCw, X } from "lucide-react";
 import { getJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
 
 export type ArtifactCard = {
   id: string;
@@ -117,6 +118,7 @@ export function ArtifactInlineCard({
     version?: number;
   };
 }) {
+  const [reader, setReader] = useState(false);
   if (!artifact.url) return null;
   const kind = (artifact.kind === "video" || artifact.kind === "html" ? artifact.kind : "image") as
     | "image"
@@ -132,9 +134,51 @@ export function ArtifactInlineCard({
     version: artifact.version,
   };
   const label = artifact.title || artifact.caption || artifact.text;
+
+  // HTML documents: compact tappable preview → full-screen reader, the same
+  // doc-open gesture as tapping an .html file in Files.
+  if (kind === "html") {
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => setReader(true)}
+          className="my-1.5 block w-full max-w-md overflow-hidden rounded-xl border bg-card text-left shadow-sm transition-shadow active:scale-[0.99] hover:shadow-md"
+        >
+          <div className="relative h-40 overflow-hidden">
+            <HtmlEmbed artifact={card} />
+            {/* scrim so the mini preview reads as a tappable card, not a live page */}
+            <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-black/25" />
+            <span className="absolute bottom-2 right-2 flex items-center gap-1 rounded-full bg-black/60 px-2 py-1 text-[10px] font-medium text-white">
+              <Maximize2 className="h-3 w-3" /> Tap to open
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 px-3 py-2">
+            <Globe className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span className="min-w-0 flex-1 truncate text-xs font-medium">
+              {label || card.id}
+              {artifact.version && artifact.version > 1 ? (
+                <span className="ml-2 rounded-full bg-accent px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
+                  v{artifact.version}
+                </span>
+              ) : null}
+            </span>
+          </div>
+        </button>
+        {reader ? (
+          <HtmlViewerOverlay
+            title={label || card.id}
+            src={artifact.url}
+            onClose={() => setReader(false)}
+          />
+        ) : null}
+      </>
+    );
+  }
+
   return (
     <div className="my-1.5 w-full max-w-md overflow-hidden rounded-xl border bg-card shadow-sm">
-      <ArtifactMedia artifact={card} full={kind === "html"} />
+      <ArtifactMedia artifact={card} />
       <div className="flex items-center gap-1.5 px-3 py-2">
         <KindIcon kind={kind} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         <span className="min-w-0 flex-1 truncate text-xs font-medium">
