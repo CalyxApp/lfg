@@ -33,6 +33,67 @@ Cherry-picking the engine work gives us the good parts with small, contained `se
 
 ---
 
+## ⚠️ Spike results (2026-07-23) — P0 strategy corrected
+
+I ran the suggested P0 spike (`git cherry-pick 20e85f0 ae03092` on a throwaway branch off
+`main`). **The naive cherry-pick does NOT work — but for a reassuring reason.** Findings:
+
+1. **Cherry-picking individual commits conflicts.** `20e85f0` conflicted on
+   `codex-aisdk-session.ts` and `opencode-aisdk-session.ts`. Cause: those files **already
+   existed at our fork base** and upstream evolved them across a *chain* of commits (codex: 7,
+   opencode: 5). A single cherry-pick applies one commit's diff onto a baseline that has moved,
+   so the context doesn't match. This is a sequencing artifact, **not** a conflict with our work.
+
+2. **We have made ZERO changes to the entire agent-engine subsystem.** Across all core files —
+   `aisdk-session.ts`, `codex-aisdk-session.ts`, `opencode-aisdk-session.ts`, `draft.ts`,
+   `aisdk-registry.ts`, `sessions.ts`, `transcript-index.ts`, `coding-agents.ts`,
+   `coding-agent-adapters.ts`, `agent-catalog.ts`, `tmux.ts` — **our fork = 0 commits**, while
+   upstream changed them a lot (`sessions.ts` 25, `transcript-index.ts` 20, `tmux.ts` 16,
+   `agent-catalog.ts` 12, `coding-agents.ts` 11…). **So there are no true semantic conflicts
+   with our own code here.** Every conflict is just "we're behind upstream on files we never edited."
+
+3. **Taking upstream's final file versions wholesale is clean** (valid precisely because we have
+   no local changes to them). I did this for the 5 backend files + `agent-profile.ts` with zero
+   conflicts. The only genuinely *missing* module our fork lacks is **`src/agent-profile.ts`**
+   (one small new file — grab it too). Everything else the harnesses import already exists.
+
+4. **New npm deps required (all absent in our fork):**
+   `@anthropic-ai/claude-agent-sdk ^0.3.205`, `@openai/codex-sdk 0.144.1`,
+   `@opencode-ai/sdk ^1.17.7`, `@mariozechner/pi-coding-agent 0.73.1` (last one only if we take pi).
+
+### Corrected P0 strategy: **subsystem lift, not commit cherry-pick**
+
+Because we've never touched this subsystem, don't fight `git cherry-pick`. Instead:
+
+- **Take upstream's final versions of the whole engine cluster wholesale** (`git checkout 8c86d77 -- <files>`):
+  the 5 backends + `agent-profile.ts`, and — because the harnesses call into them and upstream
+  rewrote them heavily — likely also `aisdk-registry.ts`, `sessions.ts`, `transcript-index.ts`,
+  `coding-agents.ts`, `coding-agent-adapters.ts`, `agent-catalog.ts`, `tmux.ts`. All are 0-local-change,
+  so "take theirs" is safe *content-wise*.
+- **The one real integration seam is `src/commands/serve.ts`** — the only engine-adjacent file we
+  *both* changed (upstream +2427/−470, us +358). This is where our routes meet their engine. Budget
+  the real effort here: reconcile our added routes against their rewritten dispatch by hand.
+- **Ripple risk:** `sessions.ts` (25 upstream commits) and `tmux.ts` (16) are central files called
+  widely; lifting them may pull adjustments in other callers. Do it on a branch and let the
+  typechecker/tests drive the fixups.
+
+**Revised effort: Medium** (not Low) — dominated by the `serve.ts` reconciliation and the
+`sessions.ts`/`tmux.ts` ripple. Still low *risk*, because none of it competes with our own changes.
+
+### Corrected first action
+```
+git fetch https://github.com/BennyKok/lfg.git main         # -> FETCH_HEAD @ 8c86d77+
+git checkout -b spike/upstream-agent-engine main
+git checkout FETCH_HEAD -- src/agents/backends/{aisdk,codex-aisdk,opencode-aisdk,pi}-session.ts \
+    src/agents/backends/draft.ts src/agent-profile.ts \
+    src/aisdk-registry.ts src/sessions.ts src/transcript-index.ts \
+    src/coding-agents.ts src/coding-agent-adapters.ts src/agent-catalog.ts src/tmux.ts
+# add the 4 SDK deps to package.json, then:  bun install  && bun run typecheck
+# then hand-reconcile src/commands/serve.ts dispatch (new-session / resume / send-interrupt)
+```
+
+---
+
 ## Priority 1 (P0) — Agent engine modernization  ⭐ take first
 
 **What it is.** Upstream moved the Claude/Codex/OpenCode agent harnesses off a homemade
