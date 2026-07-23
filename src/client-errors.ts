@@ -121,6 +121,11 @@ function isNoise(e: ClientError): boolean {
   if (m.includes("resizeobserver loop")) return true;
   if (m.includes("load failed") && !e.stack) return true;
   if (/networkerror|failed to fetch/.test(m) && !e.componentStack) return true;
+  // Globals injected by the visitor's OWN browser or extensions — never
+  // anything we ship (crypto-wallet `window.ethereum`, Firefox reader mode's
+  // `__firefox__`, the DarkReader extension). Matched narrowly on the injected
+  // identifier so a genuine app error can't be swept up by accident.
+  if (m.includes("window.ethereum") || m.includes("__firefox__") || m.includes("darkreader")) return true;
   return false;
 }
 
@@ -172,6 +177,19 @@ export async function reportClientError(
   };
 
   await persist(e);
+
+  // Known third-party / browser noise: the raw record above is still kept, but
+  // we neither surface it in the human findings feed nor dispatch a fix — it is
+  // not our bug and can't be fixed in our code. Nothing is truly hidden: every
+  // report remains in errors.jsonl for inspection.
+  if (isNoise(e)) {
+    return {
+      stored: true,
+      reported: false,
+      dispatched: false,
+      reason: "third-party/browser noise — recorded but not surfaced",
+    };
+  }
 
   // 1) Report it to the human via the findings feed (+ push). Dedup by title so
   //    a repeated error doesn't re-spam the feed.
