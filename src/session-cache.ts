@@ -1,0 +1,62 @@
+import { listSessions, type Session } from "./sessions.ts";
+
+// Must exceed both the status-broadcast cadence (~1s) and the warm-refresh
+// interval below so hot readers (live-ws status loop, monitor) hit a warm cache
+// instead of triggering a blocking full rebuild on the event loop.
+const LIST_SESSIONS_CACHE_TTL_MS = 3000;
+const ACTIVE_REFRESH_INTERVAL_MS = 2500;
+const ACTIVE_REFRESH_IDLE_MS = 30_000;
+
+let cached: { at: number; sessions: Session[] } | null = null;
+let inflight: Promise<Session[]> | null = null;
+let recentClientActivityAt = 0;
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+export function invalidateListSessionsCache(): void {
+  cached = null;
+}
+
+function setCachedFromInflight(promise: Promise<Session[]>): Promise<Session[]> {
+  inflight = promise
+    .then((sessions) => {
+      cached = { at: Date.now(), sessions };
+      return sessions;
+    })
+    .finally(() => {
+      inflight = null;
+    });
+  return inflight;
+}
+
+async function refreshListSessionsCache(): Promise<Session[]> {
+  if (inflight) return inflight;
+  return setCachedFromInflight(listSessions());
+}
+
+function stopWarmRefresh(): void {
+  if (!refreshTimer) return;
+  clearInterval(refreshTimer);
+  refreshTimer = null;
+}
+
+function warmRefreshTick(): void {
+  if (Date.now() - recentClientActivityAt > ACTIVE_REFRESH_IDLE_MS) {
+    stopWarmRefresh();
+    return;
+  }
+  void refreshListSessionsCache().catch(() => {});
+}
+
+export function noteListSessionsClientActivity(): void {
+  recentClientActivityAt = Date.now();
+  if (refreshTimer) return;
+  refreshTimer = setInterval(warmRefreshTick, ACTIVE_REFRESH_INTERVAL_MS);
+  (refreshTimer as { unref?: () => void }).unref?.();
+}
+
+export async function listSessionsCached(): Promise<Session[]> {
+  const now = Date.now();
+  if (cached && now - cached.at < LIST_SESSIONS_CACHE_TTL_MS) return cached.sessions;
+  if (inflight) return inflight;
+  return refreshListSessionsCache();
+}

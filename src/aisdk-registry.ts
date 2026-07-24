@@ -19,6 +19,20 @@ import { PATHS } from "./config.ts";
 
 const DIR = join(PATHS.data, "aisdk");
 
+// Shape-compatible with tmux.ts PanePrompt / web SessionPrompt so live-ws can
+// publish registry prompts on the same SSE `prompt` channel as pane selectors.
+export type AisdkPromptOption = {
+  index: number;
+  label: string;
+  selected: boolean;
+  description?: string;
+};
+export type AisdkPrompt = {
+  question: string;
+  options: AisdkPromptOption[];
+  header?: string;
+};
+
 export type AisdkEntry = {
   sessionId: string;
   harnessPid: number; // pid of the bun harness process (the tmux pane's child)
@@ -29,10 +43,15 @@ export type AisdkEntry = {
   draftText?: string | null; // transient streamed assistant text; never persisted to transcripts
   draftUpdatedAt?: number | null;
   title?: string | null; // first user prompt, for the card before a transcript exists
+  // Display-name override for this session, from a custom agent profile (see
+  // src/agent-profile.ts). When set, the UI shows this branded label instead of
+  // the raw agent kind. Absent/null on every session without a configured
+  // profile — treat a missing value as "use the agent kind".
+  agentLabel?: string | null;
   createdAt: number;
   // Which AI-SDK backend this entry drives. Absent on legacy Claude entries —
   // treat a missing value as "claude" so old entries keep working unchanged.
-  agent?: "claude" | "codex" | "opencode";
+  agent?: "claude" | "codex" | "opencode" | "pi";
   // Resume-handle slot, reused by the backends that can't pick their transcript
   // id up front:
   //   - codex: the app-server-assigned thread id, which is ALSO the rollout
@@ -43,16 +62,27 @@ export type AisdkEntry = {
   //     opencode writes no transcript we can read, so the opencode harness
   //     SELF-PERSISTS a Claude-shaped JSONL named by the control-plane key
   //     (== sessionId) and keeps threadId purely as the resume handle.
+  //   - pi: the RpcClient session's own sessionId (pi's session-file uuid).
+  //     Known almost immediately after the harness starts (before turn 1), but
+  //     still patched in asynchronously like the others rather than assumed.
   // The Claude harness leaves this undefined — the deterministic sessionId
   // already IS its transcript id.
   threadId?: string | null;
+  // Pending interactive question for headless harnesses (OpenCode `question`
+  // tool). Live-ws publishes this as a session `prompt` event; answer/dismiss
+  // route through the command file. Null/absent when no question is open.
+  prompt?: AisdkPrompt | null;
 };
 
 export type AisdkCommand =
   | { type: "send"; text: string }
   | { type: "set_model"; model: string }
   | { type: "interrupt" }
-  | { type: "close" };
+  | { type: "close" }
+  // OpenCode (and future headless) interactive questions — option index is the
+  // 0-based index into the registry prompt.options array.
+  | { type: "answer"; index: number }
+  | { type: "dismiss" };
 
 function entryPath(sessionId: string): string {
   return join(DIR, `${sessionId}.json`);

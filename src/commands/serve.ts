@@ -32,9 +32,6 @@ import {
 } from "../auto/store.ts";
 import { runAutoAgent } from "../auto/runner.ts";
 import { startAutoScheduler } from "../auto/scheduler.ts";
-import { runSessionBrain, runSessionBrainForSession } from "../session-brain/runner.ts";
-import { startSessionBrainScheduler } from "../session-brain/scheduler.ts";
-import { setBrainPromptSender } from "../session-brain/merge-guard.ts";
 import {
   computeSessionDiff,
   computeSessionDiffStat,
@@ -42,16 +39,28 @@ import {
   computeSessionFilePatch,
 } from "../session-diff.ts";
 import {
-  listPatternSuggestions,
-  listSessionBrainRuns,
-  listSessionNotes,
-  readSessionBrainConfig,
-  updatePatternSuggestionStatus,
-  updateSessionBrainConfig,
-  updateSessionNoteStatus,
-  type PatternSuggestionStatus,
-  type SessionNoteStatus,
-} from "../session-brain/store.ts";
+  createOriginDelivery,
+  listOriginDeliveries,
+  type OriginDeliveryMedia,
+} from "../origin-deliveries.ts";
+import {
+  createImageArtifact,
+  createVideoArtifact,
+  deleteArtifact,
+  getImageArtifact,
+  imageArtifactToMessage,
+  listAllArtifacts,
+  publishHtmlArtifact,
+  type ImageArtifact,
+} from "../artifacts.ts";
+import { deleteImagePreview, getOrCreateImagePreview } from "../artifact-previews.ts";
+import { addShipPost, listShipPosts } from "../shipped.ts";
+import {
+  artifactRefreshManager,
+  prepareArtifactRefreshConfig,
+  startArtifactRefreshScheduler,
+  type ArtifactRefreshChanges,
+} from "../artifact-refresh.ts";
 import { reportClientError, listClientErrors } from "../client-errors.ts";
 import { getAllUsage } from "../usage.ts";
 import {
@@ -73,11 +82,7 @@ import {
 import {
   listSessions,
   resolveTranscript,
-  recentMessages,
-  recentMessagesCached,
-  warmRecentMessages,
-  searchTranscript,
-  messagePage,
+  readTitleOverrides,
   normalizeLineMessages,
   setSessionTitle,
   sessionIdForPid,
@@ -90,10 +95,16 @@ import {
 } from "../sessions.ts";
 import {
   enqueueTranscriptIndex,
+  indexArtifactMessage,
+  indexedArtifactPlacement,
   indexedMessagePage,
+  indexedRecentMessages,
   indexTranscript,
+  removeIndexedArtifact,
   searchAllTranscriptIndexes,
   searchTranscriptIndex,
+  sessionIndexKey,
+  warmTranscriptIndexes,
 } from "../transcript-index.ts";
 import {
   capturePane,
@@ -116,7 +127,7 @@ import {
   panePidForSession,
   isBusy,
 } from "../tmux.ts";
-import { addManaged, patchManaged, removeManaged } from "../managed.ts";
+import { addManaged, listManaged, patchManaged, removeManaged } from "../managed.ts";
 import { PtyBridge, termSessionName } from "../pty.ts";
 import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
@@ -723,13 +734,42 @@ function liveSessionIds(sessions: Session[]): Set<string> {
 function warmRenderedBacklogs(sessions: Session[], limit = 40): void {
   for (const session of sessions.slice(0, MESSAGE_HTML_CACHE_MAX)) {
     const path = session.transcriptPath;
-    if (!path) continue;
-    void recentMessagesCached(path, limit)
+    const sessionId = session.sessionId;
+    if (!path || !sessionId) continue;
+    void indexedRecentMessages(path, sessionId, limit)
       .then((messages) => {
         for (const message of visibleTranscriptMessages(messages)) msgWithHtml(message);
       })
       .catch(() => {});
   }
+}
+
+function artifactDirExists(path: string | null | undefined): path is string {
+  if (!path) return false;
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// Where an artifact-owning session actually runs — refresh scripts are scoped
+// to this directory so a session can only execute code under its own cwd.
+async function artifactOwnerCwd(sessionId: string): Promise<string | null> {
+  const sessions = await listSessions().catch(() => []);
+  const session = sessions.find(
+    (row) => row.sessionId === sessionId || row.nativeSessionId === sessionId,
+  );
+  if (artifactDirExists(session?.cwd)) return session.cwd;
+  const managed = listManaged().find(
+    (row) => row.sessionId === sessionId || row.nativeSessionId === sessionId,
+  );
+  if (artifactDirExists(managed?.cwd)) return managed.cwd;
+  const transcript = await resolveTranscript(sessionId).catch(() => null);
+  if (!transcript) return null;
+  const cwd = await cwdForTranscript(transcript).catch(() => null) ??
+    await cwdForCodexTranscript(transcript).catch(() => null);
+  return artifactDirExists(cwd) ? cwd : null;
 }
 
 function compactForSpeech(text: string, max = 700): string {
@@ -805,7 +845,7 @@ async function sessionSummaryContext(sessionId: string, transcriptPath: string):
   fallback: string;
 }> {
   const [msgs, live] = await Promise.all([
-    recentMessages(transcriptPath, 64, { maxBytes: 192 * 1024 }),
+    indexedRecentMessages(transcriptPath, sessionId, 64),
     listSessions().catch(() => []),
   ]);
   const session = live.find((s) => s.sessionId === sessionId) ?? null;
@@ -1075,7 +1115,7 @@ async function waitForAdvisorAnswer(
     await new Promise((r) => setTimeout(r, 1200));
     const tp = await resolveTranscript(id);
     if (!tp) continue;
-    const answers = (await recentMessages(tp, 0, { maxBytes: null })).filter(
+    const answers = (await indexedRecentMessages(tp, id, 2_000)).filter(
       isAdvisorAnswer,
     );
     if (answers.length > baseline) {
@@ -1124,7 +1164,7 @@ async function voiceConsult(
   if (!id) throw new Error("advisor unexpectedly missing");
   const tp = await resolveTranscript(id);
   const baseline = tp
-    ? (await recentMessages(tp, 0, { maxBytes: null })).filter(isAdvisorAnswer)
+    ? (await indexedRecentMessages(tp, id, 2_000)).filter(isAdvisorAnswer)
         .length
     : 0;
   appendAisdkCmd(id, { type: "send", text: question });
@@ -2129,87 +2169,10 @@ export async function cmdServe() {
         return json({ findings: await listFindings(status) });
       }
 
-      if (path === "/api/session-brain/notes" && req.method === "GET") {
-        const status = url.searchParams.get("status") || undefined;
-        return json({ notes: await listSessionNotes(status) });
-      }
-      if (path === "/api/session-brain/config" && req.method === "GET") {
-        return json({ config: await readSessionBrainConfig() });
-      }
-      if (path === "/api/session-brain/config" && req.method === "POST") {
-        const b = (await req.json().catch(() => null)) as {
-          enabled?: boolean;
-          autoClose?: boolean;
-          intervalMin?: number;
-          minIdleMin?: number;
-          model?: string;
-        } | null;
-        if (!b || typeof b !== "object") return err(400, "config patch required");
-        const enabled = typeof b.enabled === "boolean" ? b.enabled : undefined;
-        const config = await updateSessionBrainConfig({
-          enabled,
-          // One visible switch controls the whole session-brain system. If a
-          // caller explicitly patches autoClose we still honor it for
-          // compatibility, otherwise enabling/disabling the brain carries the
-          // cleanup behavior with it.
-          autoClose: typeof b.autoClose === "boolean" ? b.autoClose : enabled,
-          intervalMin: typeof b.intervalMin === "number" ? b.intervalMin : undefined,
-          minIdleMin: typeof b.minIdleMin === "number" ? b.minIdleMin : undefined,
-          model: typeof b.model === "string" && b.model.trim() ? b.model.trim() : undefined,
-        });
-        return json({ config });
-      }
-      if (path === "/api/session-brain/suggestions" && req.method === "GET") {
-        const status = url.searchParams.get("status") || undefined;
-        return json({ suggestions: await listPatternSuggestions(status) });
-      }
-      if (path === "/api/session-brain/runs" && req.method === "GET") {
-        const limit = Number(url.searchParams.get("limit")) || 20;
-        return json({ runs: await listSessionBrainRuns(limit) });
-      }
-      if (path === "/api/session-brain/run" && req.method === "POST") {
-        const b = (await req.json().catch(() => null)) as {
-          autoClose?: boolean;
-          limit?: number;
-        } | null;
-        const run = await runSessionBrain(
-          { autoClose: b?.autoClose, limit: b?.limit },
-          (l) => console.log(l),
-        );
-        return json({ run });
-      }
-      {
-        const m = path.match(/^\/api\/session-brain\/notes\/([a-z0-9]+)\/status$/);
-        if (m && req.method === "POST") {
-          const b = (await req.json().catch(() => null)) as { status?: string } | null;
-          const status = b?.status;
-          if (
-            status !== "open" &&
-            status !== "snoozed" &&
-            status !== "done" &&
-            status !== "dismissed"
-          )
-            return err(400, "invalid note status");
-          const note = await updateSessionNoteStatus(m[1], status as SessionNoteStatus);
-          if (!note) return err(404, "note not found");
-          return json({ note });
-        }
-      }
-      {
-        const m = path.match(/^\/api\/session-brain\/suggestions\/([a-z0-9]+)\/status$/);
-        if (m && req.method === "POST") {
-          const b = (await req.json().catch(() => null)) as { status?: string } | null;
-          const status = b?.status;
-          if (status !== "open" && status !== "accepted" && status !== "dismissed")
-            return err(400, "invalid suggestion status");
-          const suggestion = await updatePatternSuggestionStatus(
-            m[1],
-            status as PatternSuggestionStatus,
-          );
-          if (!suggestion) return err(404, "suggestion not found");
-          return json({ suggestion });
-        }
-      }
+      // session-brain routes removed — upstream deleted the subsystem (we never
+      // modified it; adopted upstream's engine as of 8c86d77). The web app's
+      // Brain panel polls these with .catch(() => {}) so it degrades gracefully;
+      // remove that UI section in our shell as follow-up.
 
       // ── Client (frontend) error auto-report → auto-fix ────────────────────
       // The web app funnels uncaught errors here. Each report is stored, shown
@@ -2292,6 +2255,7 @@ export async function cmdServe() {
           agentId?: string | null;
           sessionId?: string | null;
           user?: string | null;
+          pushback?: boolean;
           wait?: boolean;
           timeoutMs?: number;
         } | null;
@@ -2302,12 +2266,14 @@ export async function cmdServe() {
           agentId: b.agentId,
           sessionId: b.sessionId,
           user: b.user,
+          pushback: b.pushback === true,
         });
         // Wake the user with a push (user-scoped). Voice talk-back happens when
         // they engage: open questions are surfaced in the voice snapshot below,
         // so the voice agent can read them out and answer on the user's behalf.
         void notifyAll({ user: q.user }).catch(() => {});
-        if (b.wait === false) return json({ id: q.id, status: q.status });
+        // Pushback asks never block — the answer arrives via session injection.
+        if (q.pushback || b.wait === false) return json({ id: q.id, status: q.status });
         // Cap the block so a stuck request can't pin a connection forever.
         const timeoutMs = Math.min(Math.max(b.timeoutMs ?? 180_000, 1_000), 600_000);
         const answered = await waitForAnswer(q.id, timeoutMs);
@@ -2342,7 +2308,36 @@ export async function cmdServe() {
           // next run to re-interpret it. Reuse the validated /send and /close
           // routes via a loopback call. On any failure we leave the question
           // "answered" so the supervisor's STEP 1 still backstops it.
-          if (q.sessionId) {
+          if (q.sessionId && q.pushback) {
+            // Fire-and-forget ask (MCP lfg_ask_user): the asking agent ended its
+            // turn and is NOT polling, so this injection is the only way the
+            // answer reaches it. Always deliver verbatim — no interpretation, a
+            // plain "no" is a real answer here. Steer mode wakes an idle session.
+            const clip = (t: string, n: number) => {
+              const c = t.replace(/\s+/g, " ").trim();
+              return c.length > n ? c.slice(0, n - 1).trimEnd() + "…" : c;
+            };
+            const text =
+              `[ask-user answer ${q.id}] The user answered the question you asked earlier.\n` +
+              `Question: ${clip(q.question, 300)}\n` +
+              `Answer: ${q.answer ?? ""}\n` +
+              `Act on this answer now; it is the user's decision.`;
+            try {
+              const r = await fetch(
+                `http://127.0.0.1:${PORT}/api/sessions/${q.sessionId}/send`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ text, mode: "steer" }),
+                },
+              );
+              if (r.ok) await markHandled(q.id);
+              // On failure the question stays "answered" and is visible in the
+              // ask feed; the supervisor backstop can still deliver it.
+            } catch {
+              // loopback failed — leave answered
+            }
+          } else if (q.sessionId) {
             const plan = plannedSessionAction(q.answer ?? "");
             try {
               if (plan.kind === "send") {
@@ -2827,12 +2822,7 @@ export async function cmdServe() {
 
       if (path === "/api/sessions") {
         const sessions = await listSessions();
-        warmRecentMessages(
-          sessions
-            .map((session) => session.transcriptPath)
-            .filter((path): path is string => !!path),
-          40,
-        );
+        warmTranscriptIndexes(sessions);
         warmRenderedBacklogs(sessions, 40);
         return json({ sessions });
       }
@@ -3489,15 +3479,10 @@ export async function cmdServe() {
             const rawBefore = url.searchParams.get("before");
             const before =
               rawBefore == null ? null : Math.max(0, parseInt(rawBefore, 10) || 0);
-            const page =
-              (await indexedMessagePage(tp, m[1], {
-                before,
-                limit: Number.isFinite(rawLimit) ? rawLimit : 220,
-              })) ??
-              (await messagePage(tp, {
-                before,
-                limit: Number.isFinite(rawLimit) ? rawLimit : 220,
-              }));
+            const page = await indexedMessagePage(tp, m[1], {
+              before,
+              limit: Number.isFinite(rawLimit) ? rawLimit : 220,
+            });
             return json({
               id: m[1],
               total: page.total,
@@ -3510,22 +3495,18 @@ export async function cmdServe() {
           const lim = full
             ? Math.max(0, Math.min(20000, Number.isFinite(rawLimit) ? rawLimit : 0))
             : Math.min(200, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 30));
+          const page = await indexedMessagePage(tp, m[1], {
+            limit: full && lim === 0 ? 20_000 : lim,
+          });
           if (!full) {
-            const page = await indexedMessagePage(tp, m[1], { limit: lim });
-            if (page) {
-              return json({
-                id: m[1],
-                messages: page.messages.map(msgWithHtml),
-              });
-            }
+            return json({
+              id: m[1],
+              messages: page.messages.map(msgWithHtml),
+            });
           }
           return json({
             id: m[1],
-            messages: visibleTranscriptMessages(
-              await (full ? recentMessages : recentMessagesCached)(tp, lim, {
-                maxBytes: full ? null : undefined,
-              }),
-            ).map(msgWithHtml),
+            messages: visibleTranscriptMessages(page.messages).map(msgWithHtml),
           });
         }
       }
@@ -3546,9 +3527,7 @@ export async function cmdServe() {
           } | null;
           const query = body?.query?.trim();
           if (!query) return err(400, "expected { query }");
-          const r = await searchTranscriptIndex(tp, m[1], query, { limit: body?.limit }).catch(() =>
-            searchTranscript(tp, query, { limit: body?.limit }),
-          );
+          const r = await searchTranscriptIndex(tp, m[1], query, { limit: body?.limit });
           return json({ id: m[1], query, ...r });
         }
       }
@@ -3722,6 +3701,503 @@ export async function cmdServe() {
         }
       }
 
+      // Move a session under a different parent (or detach it to a root). Used
+      // by the LFG MCP delegate tools to keep subagent lineage truthful.
+      if (path === "/api/sessions/reparent" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          sessionId?: string;
+          parentSessionId?: string | null;
+        } | null;
+        const childId = body?.sessionId?.trim();
+        if (!childId) return err(400, "sessionId required");
+        const sessions = await listSessions();
+        const matches = (s: (typeof sessions)[number], id: string) =>
+          s.sessionId === id || s.nativeSessionId === id;
+        const child = sessions.find((s) => matches(s, childId));
+        if (!child) return err(404, "session not found");
+        if (!child.managed || !child.tmuxName)
+          return err(400, "session is not lfg-managed; its parentage cannot be changed");
+
+        const newParentId = body?.parentSessionId?.trim() || null;
+        if (!newParentId) {
+          // Detach to a root: clear the parent fields.
+          patchManaged(child.tmuxName, {
+            parentSessionId: undefined,
+            parentNativeSessionId: undefined,
+            parentAgent: undefined,
+          });
+          return json({ ok: true, sessionId: childId, parentSessionId: null });
+        }
+
+        const parent = sessions.find((s) => matches(s, newParentId));
+        if (!parent) return err(404, "parent session not found");
+        if (matches(parent, childId)) return err(400, "cannot parent a session to itself");
+        // Cycle guard: walk up from the proposed parent; if we reach the child,
+        // the move would form a loop. Bounded by session count as a backstop
+        // against a pre-existing cycle in the data.
+        let cursor: (typeof sessions)[number] | undefined = parent;
+        for (let hops = 0; cursor && hops <= sessions.length; hops++) {
+          if (matches(cursor, childId)) return err(400, "reparent would create a cycle");
+          const up: string | null | undefined =
+            cursor.parentSessionId ?? cursor.parentNativeSessionId;
+          cursor = up ? sessions.find((s) => matches(s, up)) : undefined;
+        }
+
+        patchManaged(child.tmuxName, {
+          parentSessionId: parent.sessionId ?? undefined,
+          parentNativeSessionId: parent.nativeSessionId ?? undefined,
+          parentAgent: parent.agent ?? undefined,
+        });
+        return json({
+          ok: true,
+          sessionId: childId,
+          parentSessionId: parent.sessionId ?? parent.nativeSessionId ?? newParentId,
+        });
+      }
+
+      // Origin deliveries — an agent sends a result "back to where the job came
+      // from" (text + media). LFG stores only the payload; an external adapter
+      // (iMessage/Slack/voice bridge) polls the list and delivers it.
+      {
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/origin-deliveries$/);
+        if (m && req.method === "GET") {
+          const limit = Number(url.searchParams.get("limit") ?? 50);
+          return json({ deliveries: listOriginDeliveries(m[1], limit) });
+        }
+        if (m && req.method === "POST") {
+          if (req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "origin delivery requires the owning LFG session");
+          }
+          const body = (await req.json().catch(() => null)) as {
+            text?: string;
+            mediaPaths?: string[];
+            artifactIds?: string[];
+          } | null;
+          if (!body) return err(400, "request body required");
+          try {
+            const artifacts: ImageArtifact[] = [];
+            for (const id of (body.artifactIds ?? []).slice(0, 3)) {
+              const artifact = getImageArtifact(id);
+              if (!artifact || artifact.sessionId !== m[1]) {
+                throw new Error(`artifact ${id} does not belong to this session`);
+              }
+              if (artifact.media !== "video" && (artifact.media ?? "image") !== "image") {
+                throw new Error(`artifact ${id} is not image or video media`);
+              }
+              artifacts.push(artifact);
+            }
+            for (const mediaPath of (body.mediaPaths ?? []).slice(0, Math.max(0, 3 - artifacts.length))) {
+              const extension = extname(mediaPath).toLowerCase();
+              const artifact = [".mp4", ".m4v", ".webm", ".mov", ".ogv"].includes(extension)
+                ? createVideoArtifact({ sessionId: m[1], path: mediaPath })
+                : createImageArtifact({ sessionId: m[1], path: mediaPath });
+              artifacts.push(artifact);
+            }
+            const media: OriginDeliveryMedia[] = artifacts.map((artifact) => ({
+              path: `/api/artifacts/${artifact.id}`,
+              kind: artifact.media === "video" ? "video" : "image",
+              mimeType: artifact.mimeType,
+            }));
+            const delivery = createOriginDelivery({
+              sessionId: m[1],
+              text: body.text,
+              media,
+            });
+            return json({ ok: true, delivery });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not create origin delivery");
+          }
+        }
+      }
+
+      {
+        // Gallery: every artifact across sessions, newest first. Powers the
+        // Artifacts view so agent output is browsable in one place.
+        if (path === "/api/artifacts" && req.method === "GET") {
+          const limit = Math.min(Number(url.searchParams.get("limit")) || 120, 500);
+          const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
+          // Optional kind filter (image | video | html) applied before paging
+          // so offset/total always describe the filtered set.
+          const kindFilter = url.searchParams.get("kind");
+          const titles = await readTitleOverrides();
+          const managed = listManaged();
+          const all = listAllArtifacts().filter(
+            (artifact) => !kindFilter || (artifact.media ?? "image") === kindFilter,
+          );
+          // listAllArtifacts is oldest-first; page newest-first with an offset
+          // so the gallery can load incrementally instead of all up front.
+          const artifacts = all
+            .slice()
+            .reverse()
+            .slice(offset, offset + limit)
+            .map((artifact) => ({
+              id: artifact.id,
+              kind: artifact.media ?? "image",
+              url: `/api/artifacts/${encodeURIComponent(artifact.id)}`,
+              name: artifact.name,
+              title: artifact.title,
+              caption: artifact.caption,
+              sessionId: artifact.sessionId,
+              sessionTitle:
+                titles[artifact.sessionId] ??
+                managed.find(
+                  (m2) => m2.sessionId === artifact.sessionId || m2.nativeSessionId === artifact.sessionId,
+                )?.title,
+              ts: artifact.updatedAt ?? artifact.createdAt,
+              lastRefreshedAt: artifact.refresh?.lastSuccessAt,
+              refreshStatus: artifact.refresh?.status,
+              refreshEnabled: artifact.refresh?.enabled,
+              version: artifact.version,
+              size: artifact.size,
+              mimeType: artifact.mimeType,
+            }));
+          return json({ ok: true, artifacts, total: all.length });
+        }
+        const m = path.match(/^\/api\/artifacts\/([a-z0-9-]+)$/);
+        if (m && req.method === "GET") {
+          const artifact = getImageArtifact(m[1]);
+          if (!artifact) return err(404, "artifact not found");
+          const wantsPreview = url.searchParams.get("preview") === "1";
+          let filePath = artifact.filePath;
+          let contentType = artifact.mimeType;
+          if (wantsPreview && (artifact.media ?? "image") === "image") {
+            try {
+              filePath = await getOrCreateImagePreview(artifact);
+              contentType = "image/webp";
+            } catch (error) {
+              // A corrupt/unsupported input should not leave the transcript with
+              // a broken image. The immutable original remains a safe fallback.
+              console.warn("artifact preview generation failed", artifact.id, error);
+            }
+          }
+          const file = Bun.file(filePath);
+          if (!(await file.exists())) return err(404, "artifact file not found");
+          if (artifact.media === "html") {
+            // Updatable + rendered in a sandboxed iframe: never cache (the same
+            // URL serves newer versions), and lock the document down — inline
+            // script/style only, no network, no parent-frame access.
+            // A tiny reporter is injected so embeds can match content height
+            // (the sandboxed frame is cross-origin; postMessage is the only channel).
+            const reporter =
+              '<script>(function(){var last=0;var send=function(){var b=document.body;var h=Math.max(document.documentElement.scrollHeight,b?b.scrollHeight:0);if(Math.abs(h-last)>2){last=h;try{parent.postMessage({type:"lfg-artifact-height",height:h},"*")}catch(e){}}};addEventListener("load",send);setTimeout(send,60);setInterval(send,1000);try{new ResizeObserver(send).observe(document.documentElement)}catch(e){}})();</scr' + "ipt>";
+            let doc = await file.text();
+            doc = doc.includes("</body>")
+              ? doc.replace("</body>", reporter + "</body>")
+              : doc + reporter;
+            return new Response(doc, {
+              headers: {
+                "Content-Type": "text/html; charset=utf-8",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy":
+                  "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'self'",
+              },
+            });
+          }
+          const baseHeaders: Record<string, string> = {
+            "Content-Type": contentType,
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+            // Video seeking (and Safari playback) needs byte-range support.
+            "Accept-Ranges": "bytes",
+          };
+          // Honor a single-range request so the <video> element can seek without
+          // re-downloading the whole file. Bun.file().slice() streams the slice.
+          const range = req.headers.get("range");
+          const rangeMatch = range?.match(/^bytes=(\d*)-(\d*)$/);
+          if (rangeMatch) {
+            const total = file.size;
+            const startRaw = rangeMatch[1];
+            const endRaw = rangeMatch[2];
+            let start = startRaw ? Number(startRaw) : 0;
+            let end = endRaw ? Number(endRaw) : total - 1;
+            if (!startRaw && endRaw) {
+              // Suffix range: bytes=-N → the final N bytes.
+              start = Math.max(0, total - Number(endRaw));
+              end = total - 1;
+            }
+            if (
+              Number.isFinite(start) &&
+              Number.isFinite(end) &&
+              start <= end &&
+              start < total
+            ) {
+              end = Math.min(end, total - 1);
+              return new Response(file.slice(start, end + 1), {
+                status: 206,
+                headers: {
+                  ...baseHeaders,
+                  "Content-Range": `bytes ${start}-${end}/${total}`,
+                  "Content-Length": String(end - start + 1),
+                },
+              });
+            }
+            return new Response("range not satisfiable", {
+              status: 416,
+              headers: { ...baseHeaders, "Content-Range": `bytes */${total}` },
+            });
+          }
+          return new Response(file, { headers: baseHeaders });
+        }
+      }
+
+      {
+        // Destructive artifact changes are owner-scoped just like refresh
+        // configuration. Removing an HTML artifact cancels any active script
+        // before its stable id and file disappear.
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/([a-z0-9-]+)$/);
+        if (m && req.method === "DELETE") {
+          if (req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "artifact deletion requires the owning LFG session");
+          }
+          const artifact = getImageArtifact(m[2]);
+          if (!artifact) return err(404, "artifact not found");
+          if (artifact.sessionId !== m[1]) return err(403, "artifact belongs to a different session");
+          try {
+            const placementPath = indexedArtifactPlacement(artifact.id);
+            if (artifact.media === "html") artifactRefreshManager.cancel(artifact.id);
+            // Remove the visible placement first. If file/catalog deletion
+            // fails, restore exactly that placement before returning failure.
+            removeIndexedArtifact(artifact.id);
+            let deleted;
+            try {
+              deleted = deleteArtifact({ id: artifact.id, sessionId: m[1] });
+            } catch (deleteError) {
+              if (placementPath) indexArtifactMessage(placementPath, m[1], artifact);
+              throw deleteError;
+            }
+            await deleteImagePreview(deleted.id);
+            return json({ ok: true, artifact: deleted });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not delete artifact");
+          }
+        }
+      }
+
+      {
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/images$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            path?: string;
+            caption?: string;
+            alt?: string;
+          } | null;
+          if (!body?.path?.trim()) return err(400, "path required");
+          try {
+            const transcriptPath = await resolveTranscript(m[1]);
+            const indexPath = transcriptPath ?? sessionIndexKey(m[1]);
+            const artifact = createImageArtifact({
+              sessionId: m[1],
+              path: body.path,
+              caption: body.caption,
+              alt: body.alt,
+            });
+            // One ordered append + joined artifacts row — same source the
+            // transcript page reads via JOIN. Never acknowledge a display until
+            // metadata + placement commit atomically in SQLite.
+            indexArtifactMessage(indexPath, m[1], artifact);
+            return json({ ok: true, artifact, message: imageArtifactToMessage(artifact), indexed: true });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not create image artifact");
+          }
+        }
+      }
+
+      {
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/videos$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            path?: string;
+            caption?: string;
+            alt?: string;
+          } | null;
+          if (!body?.path?.trim()) return err(400, "path required");
+          try {
+            const transcriptPath = await resolveTranscript(m[1]);
+            const indexPath = transcriptPath ?? sessionIndexKey(m[1]);
+            const artifact = createVideoArtifact({
+              sessionId: m[1],
+              path: body.path,
+              caption: body.caption,
+              alt: body.alt,
+            });
+            indexArtifactMessage(indexPath, m[1], artifact);
+            return json({ ok: true, artifact, message: imageArtifactToMessage(artifact), indexed: true });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not create video artifact");
+          }
+        }
+      }
+
+      {
+        // Publish/re-publish HTML and optionally attach a server-side refresh
+        // script. The script path is scoped to the owning session cwd; the
+        // sandboxed iframe has no route to invoke it (no forms, network, or
+        // same-origin capability under the artifact CSP).
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/html$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            html?: string;
+            id?: string;
+            title?: string;
+            caption?: string;
+            refreshScriptPath?: string | null;
+            refreshArgv?: string[];
+            refreshIntervalSeconds?: number;
+            refreshTimeoutSeconds?: number;
+            refreshEnabled?: boolean;
+          } | null;
+          if (!body) return err(400, "request body required");
+          const hasRefreshChanges = [
+            "refreshScriptPath",
+            "refreshArgv",
+            "refreshIntervalSeconds",
+            "refreshTimeoutSeconds",
+            "refreshEnabled",
+          ].some((key) => Object.prototype.hasOwnProperty.call(body, key));
+          if (hasRefreshChanges && req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "refresh configuration requires the owning LFG session");
+          }
+          if (!body.html?.trim() && (!body.id || !hasRefreshChanges)) {
+            return err(400, "html required unless updating an existing refresh configuration");
+          }
+          try {
+            const changes: ArtifactRefreshChanges = {
+              scriptPath: body.refreshScriptPath,
+              argv: body.refreshArgv,
+              intervalMs: body.refreshIntervalSeconds === undefined
+                ? undefined
+                : body.refreshIntervalSeconds * 1_000,
+              timeoutMs: body.refreshTimeoutSeconds === undefined
+                ? undefined
+                : body.refreshTimeoutSeconds * 1_000,
+              enabled: body.refreshEnabled,
+            };
+            let artifact;
+            if (body.html?.trim()) {
+              const existing = body.id ? getImageArtifact(body.id) : null;
+              let refresh = undefined;
+              if (hasRefreshChanges) {
+                const scopeRoot = typeof body.refreshScriptPath === "string"
+                  ? await artifactOwnerCwd(m[1]) ?? undefined
+                  : undefined;
+                refresh = prepareArtifactRefreshConfig({
+                  changes,
+                  existing: existing?.refresh,
+                  scopeRoot,
+                });
+                if (!refresh || !refresh.enabled) artifactRefreshManager.cancel(body.id ?? "");
+              }
+              const transcriptPath = await resolveTranscript(m[1]);
+              artifact = publishHtmlArtifact({
+                sessionId: m[1],
+                html: body.html,
+                id: body.id,
+                title: body.title,
+                caption: body.caption,
+                refresh: hasRefreshChanges ? refresh : undefined,
+              });
+              indexArtifactMessage(transcriptPath ?? sessionIndexKey(m[1]), m[1], artifact);
+            } else {
+              const scopeRoot = typeof body.refreshScriptPath === "string"
+                ? await artifactOwnerCwd(m[1]) ?? undefined
+                : undefined;
+              artifact = artifactRefreshManager.configure({
+                id: body.id!,
+                sessionId: m[1],
+                scopeRoot,
+                changes,
+              });
+            }
+            return json({ ok: true, artifact, message: imageArtifactToMessage(artifact) });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not publish html artifact");
+          }
+        }
+      }
+
+      {
+        // Status + manual refresh. Ownership is enforced by both the route
+        // session and the durable artifact owner before host execution begins.
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/html\/([a-z0-9-]+)\/refresh$/);
+        if (m && (req.method === "GET" || req.method === "POST")) {
+          if (req.headers.get("x-lfg-session-id") !== m[1]) {
+            return err(403, "artifact refresh requires the owning LFG session");
+          }
+          const artifact = getImageArtifact(m[2]);
+          if (!artifact || artifact.media !== "html") return err(404, "html artifact not found");
+          if (artifact.sessionId !== m[1]) return err(403, "artifact belongs to a different session");
+          if (req.method === "GET") {
+            return json({ ok: true, artifact, refresh: artifact.refresh ?? null });
+          }
+          try {
+            const result = await artifactRefreshManager.refreshNow(m[2], m[1]);
+            return json({ ...result, refresh: result.artifact.refresh ?? null });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not refresh html artifact");
+          }
+        }
+      }
+
+      {
+        // The Shipped channel: agents post finished work here (title, summary,
+        // media). Media are ordinary artifacts, so images/videos/live html
+        // dashboards all embed the same way.
+        if (path === "/api/shipped" && req.method === "GET") {
+          const limit = Math.min(Number(url.searchParams.get("limit")) || 50, 200);
+          const offset = Math.max(Number(url.searchParams.get("offset")) || 0, 0);
+          const titles = await readTitleOverrides();
+          const managed = listManaged();
+          const page = listShipPosts(limit, offset);
+          const posts = page.posts.map((post) => {
+            const source = post.sessionId
+              ? managed.find(
+                  (s) => s.sessionId === post.sessionId || s.nativeSessionId === post.sessionId,
+                )
+              : undefined;
+            return {
+              ...post,
+              sessionTitle: post.sessionId
+                ? (titles[post.sessionId] ?? source?.title)
+                : undefined,
+              // The feed's avatar/byline reflect the session that actually did
+              // the work — the registry is authoritative over whatever the post
+              // was stored with (lfg_ship never sends an agent kind).
+              agent: source?.agent ?? post.agent,
+            };
+          });
+          return json({ ok: true, posts, total: page.total });
+        }
+        if (path === "/api/shipped" && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            title?: string;
+            summary?: string;
+            id?: string;
+            sessionId?: string;
+            agent?: string;
+            project?: string;
+            mediaPaths?: Array<{ path: string; caption?: string }>;
+            artifactIds?: string[];
+          } | null;
+          const shipTitle = body?.title?.trim();
+          if (!body || !shipTitle) return err(400, "title required");
+          try {
+            // Stamp the posting session's agent kind at write time so the feed
+            // byline survives registry pruning; the GET hydration still prefers
+            // the live registry when the session is known.
+            const sourceAgent = body.sessionId
+              ? listManaged().find(
+                  (s) => s.sessionId === body.sessionId || s.nativeSessionId === body.sessionId,
+                )?.agent
+              : undefined;
+            const post = await addShipPost({ ...body, agent: body.agent ?? sourceAgent, title: shipTitle });
+            return json({ ok: true, post });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not add shipped post");
+          }
+        }
+      }
+
       {
         const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/diff-stat$/);
         if (m && req.method === "GET") {
@@ -3753,15 +4229,6 @@ export async function cmdServe() {
           const file = computeSessionFilePatch(sess.cwd, p);
           if (!file) return err(404, "no diff for path");
           return json({ file });
-        }
-      }
-
-      {
-        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/brain$/);
-        if (m && req.method === "POST") {
-          const run = await runSessionBrainForSession(m[1], (l) => console.log(l));
-          if (run.errors.length && !run.decisions.length) return err(404, run.errors[0] || "session not found");
-          return json({ run, decision: run.decisions[0] ?? null });
         }
       }
 
@@ -3825,7 +4292,7 @@ export async function cmdServe() {
           if (!tp) return err(404, "session transcript not found");
           enqueueTranscriptIndex(tp, m[1]);
           const page = await indexedMessagePage(tp, m[1], { limit: 60 });
-          const msgs = (page?.messages ?? visibleTranscriptMessages(await recentMessagesCached(tp, 60))).map(msgWithHtml);
+          const msgs = page.messages.map(msgWithHtml);
           return json({ id: m[1], messages: msgs });
         }
       }
@@ -4084,9 +4551,7 @@ export async function cmdServe() {
                     return;
                   }
                   const backlogT0 = performance.now();
-                  const page =
-                    (await indexedMessagePage(p.tp, p.sid, { limit: 40 })) ??
-                    (await messagePage(p.tp, { limit: 40 }));
+                  const page = await indexedMessagePage(p.tp, p.sid, { limit: 40 });
                   const readMs = performance.now() - backlogT0;
                   const renderT0 = performance.now();
                   const msgs = visibleTranscriptMessages(page.messages).map(msgWithHtml);
@@ -4210,7 +4675,7 @@ export async function cmdServe() {
               // backlog, then tail
               (async () => {
                 const page = await indexedMessagePage(tp, sid, { limit: 40 });
-                const msgs = (page?.messages ?? visibleTranscriptMessages(await recentMessagesCached(tp, 40))).map(msgWithHtml);
+                const msgs = page.messages.map(msgWithHtml);
                 for (const msg of msgs)
                   send(`event: msg\ndata: ${JSON.stringify(msg)}\n\n`);
                 offset = Bun.file(tp).size;
@@ -4320,11 +4785,9 @@ export async function cmdServe() {
   });
 
   startAutoScheduler((l) => console.log(l));
-  // Let the session-brain merge-guard nudge a live session's agent (queue mode)
-  // when it detects unmerged worktree work before archiving.
-  setBrainPromptSender((session, text, opts) => sendPromptToLiveSession(session, text, opts));
-  startSessionBrainScheduler((l) => console.log(l));
   startWorktreeSweep((l) => console.log(l));
+  // Re-arm server-side refresh scripts for live HTML artifacts.
+  startArtifactRefreshScheduler((l) => console.log(l));
   // Watch the fleet for busy -> idle transitions and fan "completed" events out
   // to voice subscribers (/api/voice/events). Idempotent + best-effort.
   startFleetWatcher();

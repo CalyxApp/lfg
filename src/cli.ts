@@ -6,6 +6,7 @@ Usage:
   lfg agents [list|run|show]       Run / inspect insight agents (see 'agents help')
   lfg subagent [create|models]      Spawn a managed worker session on any harness
   lfg whatsapp [run|sessions]      Run the optional WhatsApp control sidecar
+  lfg mcp                          Run the LFG MCP stdio server
   lfg setup                        Provision this box (Bun, tmux, Tailscale, service)
 
 Env (read from process env / .env, see .env.example):
@@ -31,6 +32,10 @@ async function main() {
     case "whatsapp": {
       const { cmdWhatsapp } = await import("./commands/whatsapp.ts");
       return await cmdWhatsapp(rest);
+    }
+    case "mcp": {
+      const { cmdMcp } = await import("./commands/mcp.ts");
+      return await cmdMcp();
     }
     case "setup": {
       const { cmdSetup } = await import("./commands/setup.ts");

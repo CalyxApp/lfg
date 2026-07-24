@@ -21,6 +21,7 @@ import {
 import { Streamdown } from "streamdown";
 import { getJson, postJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
 import { EmptyState } from "./ui/empty-state";
 import { Input } from "./ui/input";
 import { Textarea } from "./ui/textarea";
@@ -89,6 +90,9 @@ export function FilesView({
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Full-screen HTML reader — separate from `file` so closing drops you back
+  // exactly where you were in the tree.
+  const [htmlView, setHtmlView] = useState<string | null>(null);
 
   const loadTree = useCallback(
     async (path: string) => {
@@ -127,6 +131,11 @@ export function FilesView({
       setError(null);
       if (IMG_RE.test(path)) {
         setFile({ path, size: 0, raw: "image" });
+        return;
+      }
+      if (/\.html?$/i.test(path)) {
+        // HTML docs open as a full-screen reader, not an inline pane.
+        setHtmlView(path);
         return;
       }
       if (FRAME_RE.test(path)) {
@@ -425,6 +434,13 @@ export function FilesView({
           ))}
         </div>
       )}
+      {htmlView ? (
+        <HtmlViewerOverlay
+          title={htmlView.split("/").pop()?.replace(/\.html?$/i, "") || htmlView}
+          src={`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(htmlView)}`}
+          onClose={() => setHtmlView(null)}
+        />
+      ) : null}
     </div>
   );
 }
