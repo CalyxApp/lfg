@@ -1,7 +1,10 @@
 # Upstream Adoption Plan — pulling BennyKok/lfg features into CalyxApp/lfg
 
-> **Priority: HIGH.** Status: **spikes 1+2 complete — P0 execution in progress** (branch
-> `upstream/p0-engine-lift`).
+> **Status: ✅ COMPLETE — adopted, merged to `main`, running in production** (2026-07-24).
+> P0 (engine) + P1 (LFG-aware agents) + P2 (artifacts/Shipped, backend + UI in our shell)
+> all live on the single production instance (`lfg-fork.service`, :8767, phone URL :8444/:8445).
+> The `lfg-next` test instance (:8446) has been retired. Remaining work: see
+> **Follow-ups** below. History of how we got here is preserved in the sections that follow.
 > Author: exploration pass, 2026-07-23. Owner: Sam.
 >
 > This plan is based on a deep read of the upstream code at tag `8c86d77`. Re-verify
@@ -283,23 +286,43 @@ a dedicated cleanup pass.
 - Seeded: one live HTML artifact ("Adoption build status") + one Shipped post, so the new
   views render real content on first open.
 
-## Follow-ups (post-adoption)
+## Follow-ups (the pickup point — everything else in this doc is done)
 
-- **Test further: tap-to-open artifact cards in chat** (Sam, 2026-07-24) — verified in the
-  Files reader on-device; the in-chat card flow verified headlessly but Sam couldn't locate
-  this session's card on-device during the test window. Re-test on-device on a fresh session.
-- **`window.calyx` bridge shim for repo HTML** — Sam's PlatosRaveCave dashboards check
-  `window.calyx` (the Calyx vault bridge) and fall back to a "open inside Calyx" banner.
-  lfg already exposes the vault via `/api/vault/*`; inject a shim into `/api/repos/raw`-served
-  HTML so dashboards go fully live in lfg. Reverse the expected call surface from the
-  dashboards' source first.
-- **Brain UI deep plumbing** — dead-but-inert swipe-to-brain gesture, `SessionBrainView`,
-  handlers, and the `.catch(() => {})` polls still fire 404s; excise in a dedicated pass.
-- **Managed resume (disconnect flavor)** — `/api/sessions/resume` path still unexercised.
-- **`vps-vitals` demo artifact** — its refresh script lives in a throwaway session worktree
-  (`/tmp/lfg-wt/lfg-5e2e03/vps-vitals.sh`); move somewhere durable or let it lapse.
-- **lfg-next instance** — retire (disable service + tailscale 8446 mapping) once production
-  has been stable on the adopted build for a while.
+**Deployment state (2026-07-24):** one instance. `main` = production =
+`lfg-fork.service` at `/home/openclaw/lfg-fork` (:8767 local; phone URLs
+https://chiron-server.tail5226b1.ts.net:8444 and :8445 via tailscale serve).
+`lfg-next` (:8446) retired: service + tailscale mapping removed, checkout deleted.
+Rollback point if the adopted build misbehaves: `git reset --hard fb23a28` in
+lfg-fork + `bun install` + web rebuild + restart (pre-adoption prod commit).
+
+**Next up (in rough priority order):**
+
+1. **`window.calyx` bridge shim for repo HTML** — highest value. Sam's PlatosRaveCave
+   dashboards (771 .html files, used like markdown docs) check `window.calyx` and fall
+   back to an "open inside Calyx" banner. lfg already exposes `/api/vault/*`; inject a
+   shim into `/api/repos/raw`-served HTML so his dashboards go fully live on the phone.
+   Reverse the expected call surface from the dashboards' source first.
+2. **Brain UI deep plumbing** — dead-but-inert swipe-to-brain gesture, unreachable
+   `SessionBrainView`, handlers, and `refreshBrain` polls that 404 (caught, but noisy).
+   Excise in a dedicated pass.
+3. **Managed resume (disconnect flavor)** — `/api/sessions/resume` still unexercised.
+4. **Legacy-session imports** — sessions spawned pre-adoption resolve via the
+   legacy-transcript fallback (`9a2b301`) and import on first read (one-time delay on
+   big transcripts). Self-resolving as old sessions retire; nothing to do unless a
+   pre-adoption transcript surfaces empty — if so, check `data/logs/trace-*.jsonl`
+   for `transcript_page` events with `path: "lfg://session/…"`.
+5. **Housekeeping, whenever:** `lfg-fork/data/backup-transcript-index/` (the pre-adoption
+   sqlite kept from the index rebuild — delete after a quiet week); the `vps-vitals` demo
+   artifact's refresh is disabled (its script lived in a throwaway session worktree —
+   content stays visible, just static; delete the artifact whenever).
+
+**Adoption-boundary lessons (for the next big lift):**
+- Inherited `data/` state bites twice: the old build's `transcript-index.sqlite` made the
+  new importer silently no-op (fix: rebuild the index DB — safe, transcripts re-import,
+  artifacts resync from their catalog), and registry entries for old-engine sessions
+  pointed the new direct-index read path at empty synthetic keys (fix: `9a2b301`).
+- Verify with the *production data dir*, not just a fresh checkout — a parallel test
+  instance with clean state can't catch either failure mode.
 
 ## Sequencing & risks
 
