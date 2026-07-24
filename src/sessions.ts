@@ -2373,10 +2373,32 @@ export async function resolveTranscript(sessionId: string): Promise<string | nul
     return await findManagedCodexTranscript(managed);
   }
   if (managed?.agent && DIRECT_INDEX_MANAGED_AGENTS.has(managed.agent)) {
-    return sessionIndexKey(managed.sessionId ?? sessionId);
+    const key = managed.sessionId ?? sessionId;
+    // Adoption boundary: sessions spawned by the PRE-adoption engine are
+    // registered as direct-index agents but their history lives in a transcript
+    // file the old runtime wrote — the new runtime's direct rows don't exist.
+    // If the index has nothing for this session, prefer a legacy on-disk
+    // transcript so the importer can pick it up; brand-new direct sessions
+    // (no file, rows appear with the first turn) still get the index key.
+    if (!sessionHasIndexedMessages(key)) {
+      const legacy =
+        (await findTranscriptById(managed.nativeSessionId ?? key)) ??
+        (managed.nativeSessionId && managed.nativeSessionId !== key
+          ? await findTranscriptById(key)
+          : null);
+      if (legacy) return legacy;
+    }
+    return sessionIndexKey(key);
   }
   const entry = findAisdkEntryByAnyId(sessionId);
-  if (entry) return sessionIndexKey(entry.sessionId);
+  if (entry) {
+    // Same adoption-boundary fallback for registry-only (unmanaged) sessions.
+    if (!sessionHasIndexedMessages(entry.sessionId)) {
+      const legacy = await findTranscriptById(entry.sessionId);
+      if (legacy) return legacy;
+    }
+    return sessionIndexKey(entry.sessionId);
+  }
   if (sessionHasIndexedMessages(sessionId)) return sessionIndexKey(sessionId);
   if (managed?.nativeSessionId && managed.nativeSessionId !== sessionId) {
     const native =
