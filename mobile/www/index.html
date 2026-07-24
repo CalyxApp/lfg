@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
+  <title>lfg</title>
+  <style>
+    :root {
+      --bg: #f2f2f7; --card: #ffffff; --text: #1c1c1e; --muted: #8e8e93;
+      --accent: #007aff; --border: rgba(0,0,0,0.08); --danger: #ff3b30;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #000000; --card: #1c1c1e; --text: #f2f2f7; --muted: #98989e;
+        --accent: #0a84ff; --border: rgba(255,255,255,0.10); --danger: #ff453a;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg); color: var(--text);
+      font: -apple-system-body, -apple-system, "SF Pro Text", system-ui, sans-serif;
+      display: flex; align-items: center; justify-content: center;
+      padding: max(24px, env(safe-area-inset-top)) 24px max(24px, env(safe-area-inset-bottom));
+      -webkit-text-size-adjust: 100%;
+    }
+    .card { width: 100%; max-width: 420px; }
+    h1 { font-size: 34px; font-weight: 700; margin: 0 0 4px; letter-spacing: -0.5px; }
+    .sub { color: var(--muted); font-size: 15px; margin: 0 0 28px; line-height: 1.4; }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 0 0 6px 4px; text-transform: uppercase; letter-spacing: 0.4px; }
+    input[type="url"] {
+      width: 100%; padding: 14px 16px; font-size: 16px; border-radius: 12px;
+      border: 1px solid var(--border); background: var(--card); color: var(--text);
+      outline: none; -webkit-appearance: none;
+    }
+    input[type="url"]:focus { border-color: var(--accent); }
+    button {
+      width: 100%; margin-top: 16px; padding: 15px; font-size: 17px; font-weight: 600;
+      border: none; border-radius: 12px; background: var(--accent); color: #fff;
+      -webkit-appearance: none; cursor: pointer;
+    }
+    button:disabled { opacity: 0.55; }
+    button.ghost { background: transparent; color: var(--accent); font-weight: 500; margin-top: 8px; }
+    .hint { color: var(--muted); font-size: 13px; line-height: 1.5; margin-top: 20px; }
+    .err { color: var(--danger); font-size: 14px; margin-top: 14px; min-height: 18px; }
+    /* connecting interstitial */
+    #connecting { text-align: center; }
+    #connecting .host { color: var(--muted); font-size: 15px; word-break: break-all; margin-top: 6px; }
+    .spinner {
+      width: 28px; height: 28px; margin: 0 auto 18px; border-radius: 50%;
+      border: 3px solid var(--border); border-top-color: var(--accent);
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <!-- Pairing form -->
+    <div id="pair">
+      <h1>lfg</h1>
+      <p class="sub">Connect to your server to get started.</p>
+      <label for="url">Server address</label>
+      <input id="url" type="url" inputmode="url" autocapitalize="off" autocorrect="off"
+             spellcheck="false" placeholder="https://your-server.ts.net:8444" />
+      <button id="connect">Connect</button>
+      <div id="error" class="err"></div>
+      <p class="hint">
+        Your server is only reachable over your private network — make sure the
+        Tailscale app is installed and switched on before connecting.
+      </p>
+    </div>
+
+    <!-- Auto-connect interstitial (shown when a server is already saved) -->
+    <div id="connecting" class="hidden">
+      <div class="spinner"></div>
+      <div>Connecting…</div>
+      <div class="host" id="connecting-host"></div>
+      <button id="change" class="ghost">Change server</button>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      var KEY = 'lfg.serverUrl';
+      // Prefill for the first device this ships on; harmless elsewhere.
+      var DEFAULT_URL = 'https://chiron-server.tail5226b1.ts.net:8444';
+      var AUTO_CONNECT_DELAY_MS = 1200; // window to tap "Change server"
+
+      var $ = function (id) { return document.getElementById(id); };
+      var pairEl = $('pair'), connEl = $('connecting');
+      var urlEl = $('url'), errEl = $('error');
+      var autoTimer = null;
+
+      function normalize(raw) {
+        var s = (raw || '').trim();
+        if (!s) return null;
+        if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+        try {
+          var u = new URL(s);
+          if (u.protocol !== 'https:' && u.hostname !== 'localhost') return null;
+          return u.origin;
+        } catch (e) { return null; }
+      }
+
+      // Reachability probe. no-cors: an opaque response still means "something
+      // answered TLS + HTTP there", which is all we need before handing over.
+      function probe(origin) {
+        return new Promise(function (resolve, reject) {
+          var t = setTimeout(function () { reject(new Error('timeout')); }, 6000);
+          fetch(origin + '/', { mode: 'no-cors', cache: 'no-store' })
+            .then(function () { clearTimeout(t); resolve(); })
+            .catch(function (e) { clearTimeout(t); reject(e); });
+        });
+      }
+
+      function go(origin) { window.location.replace(origin + '/'); }
+
+      function showPair(prefill) {
+        connEl.classList.add('hidden');
+        pairEl.classList.remove('hidden');
+        if (prefill) urlEl.value = prefill;
+      }
+
+      function connect(origin, fromForm) {
+        errEl.textContent = '';
+        var btn = $('connect');
+        if (fromForm) { btn.disabled = true; btn.textContent = 'Connecting…'; }
+        probe(origin).then(function () {
+          localStorage.setItem(KEY, origin);
+          go(origin);
+        }).catch(function () {
+          if (fromForm) { btn.disabled = false; btn.textContent = 'Connect'; }
+          showPair(origin);
+          errEl.textContent = 'Couldn’t reach the server. Is Tailscale switched on?';
+        });
+      }
+
+      $('connect').addEventListener('click', function () {
+        var origin = normalize(urlEl.value);
+        if (!origin) { errEl.textContent = 'That doesn’t look like a valid https address.'; return; }
+        connect(origin, true);
+      });
+      urlEl.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') $('connect').click();
+      });
+      $('change').addEventListener('click', function () {
+        if (autoTimer) clearTimeout(autoTimer);
+        localStorage.removeItem(KEY);
+        showPair(localStorage.getItem(KEY) || urlEl.value || DEFAULT_URL);
+      });
+
+      var saved = localStorage.getItem(KEY);
+      if (saved) {
+        pairEl.classList.add('hidden');
+        connEl.classList.remove('hidden');
+        $('connecting-host').textContent = saved.replace(/^https:\/\//, '');
+        autoTimer = setTimeout(function () { connect(saved, false); }, AUTO_CONNECT_DELAY_MS);
+      } else {
+        urlEl.value = DEFAULT_URL;
+      }
+    })();
+  </script>
+</body>
+</html>
