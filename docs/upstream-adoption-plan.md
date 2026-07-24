@@ -283,6 +283,24 @@ a dedicated cleanup pass.
 - Seeded: one live HTML artifact ("Adoption build status") + one Shipped post, so the new
   views render real content on first open.
 
+## Follow-ups (post-adoption)
+
+- **Test further: tap-to-open artifact cards in chat** (Sam, 2026-07-24) — verified in the
+  Files reader on-device; the in-chat card flow verified headlessly but Sam couldn't locate
+  this session's card on-device during the test window. Re-test on-device on a fresh session.
+- **`window.calyx` bridge shim for repo HTML** — Sam's PlatosRaveCave dashboards check
+  `window.calyx` (the Calyx vault bridge) and fall back to a "open inside Calyx" banner.
+  lfg already exposes the vault via `/api/vault/*`; inject a shim into `/api/repos/raw`-served
+  HTML so dashboards go fully live in lfg. Reverse the expected call surface from the
+  dashboards' source first.
+- **Brain UI deep plumbing** — dead-but-inert swipe-to-brain gesture, `SessionBrainView`,
+  handlers, and the `.catch(() => {})` polls still fire 404s; excise in a dedicated pass.
+- **Managed resume (disconnect flavor)** — `/api/sessions/resume` path still unexercised.
+- **`vps-vitals` demo artifact** — its refresh script lives in a throwaway session worktree
+  (`/tmp/lfg-wt/lfg-5e2e03/vps-vitals.sh`); move somewhere durable or let it lapse.
+- **lfg-next instance** — retire (disable service + tailscale 8446 mapping) once production
+  has been stable on the adopted build for a while.
+
 ## Sequencing & risks
 
 1. **P0 first.** Subsystem lift per the canonical recipe below (NOT cherry-picks — see Spike 1),
