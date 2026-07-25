@@ -13,7 +13,7 @@ export type SkillCatalogItem = {
   path: string;
 };
 
-export const CLAUDE_MODELS: string[] = ["fable", "opus", "sonnet", "haiku"];
+export const CLAUDE_MODELS: string[] = ["fable", "opus", "claude-opus-5", "sonnet", "haiku"];
 export const CODEX_MODELS: string[] = [
   "gpt-5.6-sol",
   "gpt-5.6-terra",
@@ -23,7 +23,7 @@ export const CODEX_MODELS: string[] = [
   "gpt-5.4-mini",
   "gpt-5.3-codex-spark",
 ];
-export const AISDK_MODELS: string[] = ["fable", "opus", "sonnet", "haiku"];
+export const AISDK_MODELS: string[] = ["fable", "opus", "claude-opus-5", "sonnet", "haiku"];
 export const CODEX_AISDK_MODELS: string[] = [
   "gpt-5.6-sol",
   "gpt-5.6-terra",
