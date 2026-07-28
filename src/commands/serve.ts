@@ -207,7 +207,7 @@ import {
 import { testProfile } from "../browser/tool.ts";
 import { listCustomRepos, addCustomRepo, removeCustomRepo } from "../repos-store.ts";
 import { projectName, reposRoot } from "../projects.ts";
-import { listReports, getReportHtml } from "../reports.ts";
+import { listReports, getReportHtml, renderReportHtml as renderCalyxReportHtml } from "../reports.ts";
 import { resolveSessionCwd, startWorktreeSweep } from "../worktree.ts";
 import {
   synthesizeTts,
@@ -2746,8 +2746,10 @@ export async function cmdServe() {
       }
       const reportMatch = path.match(/^\/api\/calyx-reports\/(.+)$/);
       if (reportMatch && req.method === "GET") {
-        const html = getReportHtml(decodeURIComponent(reportMatch[1]));
-        if (html == null) return err(404, "report not found");
+        const raw = getReportHtml(decodeURIComponent(reportMatch[1]));
+        if (raw == null) return err(404, "report not found");
+        // Vault paths -> desktop-style chips + click-forwarder (Phase 1).
+        const html = renderCalyxReportHtml(raw);
         // Self-contained doc; rendered in a sandboxed iframe (sandbox=allow-scripts,
         // no same-origin) client-side, same as HTML artifacts. Never cache — the
         // nightly generator overwrites the day's file in place.

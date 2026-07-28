@@ -127,3 +127,99 @@ export function getReportHtml(id: string): string | null {
     return null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Vault-path chips (ported verbatim from the Calyx desktop app so the mobile
+// reports show the SAME "mention pills" as the VS Code fork's ReportViewer —
+// webview-ui/src/components/reports/ReportViewer.tsx: linkifyVaultPaths /
+// prettifyName / CHIP_STYLES / CHIP_ICON). The desktop post-processes the DOM
+// in React (its iframe is sandbox=allow-same-origin); our report iframe is
+// sandbox=allow-scripts (cross-origin), so we can't touch its DOM from the
+// parent — instead we apply the same transform to the HTML at serve time and
+// inject a small click-forwarder that postMessages the tapped path up to the
+// app. "Implementation differs, the recognition/affordance logic is reused."
+// ---------------------------------------------------------------------------
+
+// A relative vault path: path-like chars, at least one segment, optional
+// trailing slash. Excludes absolute paths, URLs (":"), and commands (spaces).
+const RELATIVE_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\/?$/;
+
+const CHIP_STYLE_MARKER = "data-chiron-chips";
+
+const CHIP_STYLES = `<style ${CHIP_STYLE_MARKER}>
+  .chiron-path-chip {
+    display: inline-flex; align-items: center; gap: 0.3em;
+    padding: 0.08em 0.55em 0.08em 0.45em; border-radius: 999px;
+    background: rgba(201,122,58,0.10); color: #b06a30;
+    border: 1px solid rgba(201,122,58,0.18); font-family: inherit;
+    font-size: 0.86em; font-weight: 500; line-height: 1.4; white-space: nowrap;
+    vertical-align: baseline; cursor: pointer; text-decoration: none;
+  }
+  .chiron-path-chip:hover { background: rgba(201,122,58,0.18); }
+  .chiron-path-chip:active { transform: scale(0.97); }
+  .chiron-path-chip svg { width: 0.85em; height: 0.85em; opacity: 0.7; flex-shrink: 0; }
+  @media (prefers-color-scheme: dark) {
+    .chiron-path-chip { background: rgba(224,160,106,0.12); color: #e0a06a; border-color: rgba(224,160,106,0.22); }
+    .chiron-path-chip:hover { background: rgba(224,160,106,0.2); }
+  }
+</style>`;
+
+const CHIP_ICON =
+  '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" ' +
+  'stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 4.5a1 1 0 0 1 1-1h3.2l1.3 1.5h6a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1z"/></svg>';
+
+// "calyx-chrome-extension" -> "Calyx Chrome Extension"
+function prettifyName(leaf: string): string {
+  return leaf
+    .replace(/\.[A-Za-z0-9]+$/, "")
+    .replace(/[-_]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
+// Replace <code> spans holding a relative vault path with a chip. Unlike the
+// desktop original we also stash the (normalized) path in data-vault-path so a
+// tap can be resolved to a file — the desktop drops it, keeping only the name.
+function linkifyVaultPaths(html: string): string {
+  return html.replace(/<code>([^<]*?)<\/code>/gi, (match, raw) => {
+    const path = String(raw).trim();
+    if (!path.includes("/") || !RELATIVE_PATH.test(path)) return match;
+    const segments = path.split("/").filter(Boolean);
+    const leaf = segments[segments.length - 1];
+    const name = leaf && prettifyName(leaf);
+    if (!name) return match;
+    const clean = path.replace(/\/+$/, ""); // chars are already [A-Za-z0-9._-/]-safe
+    return `<span class="chiron-path-chip" data-vault-path="${clean}" role="link" tabindex="0">${CHIP_ICON}${name}</span>`;
+  });
+}
+
+function injectChipStyles(html: string): string {
+  if (html.includes(CHIP_STYLE_MARKER)) return html;
+  if (/<head[^>]*>/i.test(html)) return html.replace(/<head([^>]*)>/i, `<head$1>\n${CHIP_STYLES}`);
+  return `${CHIP_STYLES}\n${html}`;
+}
+
+// Tap a chip (or any relative-path anchor) -> tell the app to open that vault
+// file. Runs inside the sandboxed iframe (allow-scripts); postMessage is the
+// only channel to the parent. The app listens for "calyx-open-vault" (Phase 2).
+const FORWARDER =
+  "<script>(function(){function p(el){var c=el.closest?el.closest('[data-vault-path]'):null;" +
+  "if(c)return c.getAttribute('data-vault-path');var a=el.closest?el.closest('a[href]'):null;" +
+  "if(a){var h=a.getAttribute('href')||'';if(/^[a-z]+:/i.test(h)||h.charAt(0)==='#'||h.charAt(0)==='/')return null;" +
+  "return h.replace(/^([.][.]?\\/)+/,'').replace(/[?#].*$/,'')||null;}return null;}" +
+  "document.addEventListener('click',function(e){var t=e.target;if(!t)return;var el=t.nodeType===1?t:t.parentElement;" +
+  "if(!el)return;var path=p(el);if(!path)return;e.preventDefault();" +
+  "try{parent.postMessage({type:'calyx-open-vault',path:path},'*');}catch(_){}" +
+  "},true);})();</scr" + "ipt>";
+
+function injectForwarder(html: string): string {
+  return html.includes("</body>") ? html.replace("</body>", FORWARDER + "</body>") : html + FORWARDER;
+}
+
+// Full report HTML as served to the app: vault paths -> chips, chip styles +
+// click-forwarder injected. Pure string transform over the on-disk report.
+export function renderReportHtml(html: string): string {
+  return injectForwarder(injectChipStyles(linkifyVaultPaths(html)));
+}
