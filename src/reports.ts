@@ -1,15 +1,20 @@
-// Reports store — read-only view over the Calyx vault's `reports/` folder.
+// Reports store — read-only view over the PRIMARY repo's `reports/` folder.
 //
-// The Calyx VS Code extension writes each generated report as a SELF-CONTAINED
-// `.html` file (inline styles, light/dark aware) with its metadata carried in
-// `<meta name="chiron:*">` tags in the head. We don't duplicate or re-store any
-// of that — this module just scans the folder, parses those meta tags into a
-// small ReportItem, and serves the raw HTML so the PWA can render it in the same
-// sandboxed iframe used for HTML artifacts. New nightly reports appear for free.
+// The Calyx apps write each generated report as a SELF-CONTAINED `.html` file
+// (inline styles, light/dark aware) with its metadata carried in meta tags in
+// the head — `<meta name="calyx:*">` (product name) or the older `<meta
+// name="chiron:*">` codename. We don't duplicate or re-store any of that — this
+// module scans the folder, parses those meta tags into a small ReportItem, and
+// serves the raw HTML so the PWA can render it in the same sandboxed iframe used
+// for HTML artifacts. New reports appear for free.
+//
+// Source = the primary/main repo (the vault the app writes to), NOT the legacy
+// ~/.openclaw/workspace. Default primary is PlatosRaveCave (matches the app's
+// CONVERSE_WORKSPACE default); overridable via env.
 
 import { closeSync, openSync, readFileSync, readSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { reposRoot } from "./projects.ts";
 
 export type ReportItem = {
   id: string; // filename without `.html`
@@ -22,16 +27,18 @@ export type ReportItem = {
   url: string; // /api/reports/:id — raw HTML
 };
 
-// Default to the Calyx vault the extension writes to (see the global env
-// orientation: "User vault | ~/.openclaw/workspace/"). Overridable so the
-// folder can be relocated without a code change.
+// The primary repo's `reports/` folder. Resolves to
+// <reposRoot>/<primary>/reports, where primary defaults to PlatosRaveCave.
+// LFG_REPORTS_DIR overrides the whole path if ever needed.
 function reportsDir(): string {
-  return process.env.LFG_REPORTS_DIR || join(homedir(), ".openclaw", "workspace", "reports");
+  if (process.env.LFG_REPORTS_DIR) return process.env.LFG_REPORTS_DIR;
+  const primary = process.env.CALYX_PRIMARY_REPO || process.env.CONVERSE_WORKSPACE || "PlatosRaveCave";
+  return join(reposRoot(), primary, "reports");
 }
 
-// Matches ReportService.parseMetaTags in the extension: <meta name="chiron:KEY"
-// content="VALUE">, self-closing or not, single line.
-const META_RE = /<meta\s+name="chiron:([^"]+)"\s+content="([^"]*)"\s*\/?>/gi;
+// <meta name="calyx:KEY" content="VALUE"> (product) or the older chiron: codename,
+// self-closing or not, single line.
+const META_RE = /<meta\s+name="(?:calyx|chiron):([^"]+)"\s+content="([^"]*)"\s*\/?>/gi;
 
 function decodeEntities(s: string): string {
   return s

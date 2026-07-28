@@ -17,27 +17,36 @@ differ per platform — that's expected.
 
 ## Current state
 
-Reports are already live in the mobile app (Home "Today's reports" section +
-Reports screen via the "Also under Agents" hub, `/api/calyx-reports`). Reports are
-self-contained HTML in `~/.openclaw/workspace/reports/*.html` with `chiron:*`
-meta tags; they render in the shared full-screen `HtmlViewerOverlay`
+Reports are live in the mobile app (Home "Today's reports" section + Reports
+screen via the "Also under Agents" hub, `/api/calyx-reports`). Reports are
+self-contained HTML with meta tags — `calyx:*` (product) or the older `chiron:*`
+codename, both parsed — rendered in the shared full-screen `HtmlViewerOverlay`
 (sandboxed iframe, `allow-scripts`).
+
+**Source = the primary repo.** `reports.ts` resolves `<reposRoot>/<primary>/reports`
+where `primary` defaults to **PlatosRaveCave** (env: `CALYX_PRIMARY_REPO`, else
+`CONVERSE_WORKSPACE`, else `PlatosRaveCave`; `LFG_REPORTS_DIR` overrides the path).
+
+> History: this initially (wrongly) read `~/.openclaw/workspace/reports` — a
+> *separate, older* vault (using `chiron:`) that isn't registered in the app and
+> that the user doesn't browse. Corrected to PlatosRaveCave, the canonical vault.
 
 ---
 
-## The decisive constraint
+## The primary-repo model (Sam)
 
-The files reports link to (`tasks/…`, `projects/…`) live in the reports **vault**
-`~/.openclaw/workspace`. The app's file endpoints (`/api/repos/file`,
-`/api/repos/raw`) are **repo-scoped** to `LFG_REPOS_ROOT=~/repos`. The vault is a
-git repo but sits **outside** that root and is **not registered**, so those
-endpoints 404 on vault paths. (`PlatosRaveCave` is a *different* dir under
-`~/repos`, not the vault.)
+LFG can operate across many repos (agents do dev work in various folders), but
+there is one **primary/main repo** — **PlatosRaveCave**:
+- **Writes default here** (new file / new task).
+- **Reports live here.**
+- Other registered repos stay **accessible** for agent work (reads/edits), just
+  not the default write target.
 
-**Decision (Sam):** users expect to browse their **whole workspace**. So in
-Phase 2 we **register `~/.openclaw/workspace` as a repo** — the report link then
-opens through the *same* `/api/repos/file` + `FilesView` pipeline as everything
-else (max reuse, identical behavior), and the vault becomes browsable in Files.
+**Consequence for vault links:** PlatosRaveCave is **already a registered repo**
+(`~/repos/PlatosRaveCave`, listed in `/api/repos`, selectable in the app). So a
+tapped link resolves through the **existing** `/api/repos/file` (md) + `/api/repos/raw`
+(html) endpoints with `repo=PlatosRaveCave` — **no new repo registration needed**
+(an earlier draft of this doc wrongly called for that, based on the wrong vault).
 
 ---
 
@@ -67,9 +76,10 @@ click-forwarder that `postMessage`s the tapped path to the app.
 - No frontend / navigation changes; nothing listens for the message yet.
 
 ### Phase 2 — open the file
-- Register the workspace vault as a repo (custom-repo store or `LFG_REPOS_ROOT`
-  handling) so `/api/repos/file` (md → JSON, rendered by `MarkdownDoc`/`streamdown`)
-  and `/api/repos/raw` (html → `HtmlViewerOverlay`) resolve `tasks/…`,`projects/…`.
+- Resolve paths against the primary repo (`repo=PlatosRaveCave`, already
+  registered) via the existing `/api/repos/file` (md → JSON, rendered by
+  `MarkdownDoc`/`streamdown`) and `/api/repos/raw` (html → `HtmlViewerOverlay`).
+  No new repo registration.
 - App-level `message` listener (verify `event.source === iframe.contentWindow`,
   the pattern `ArtifactsView` uses) receives `calyx-open-vault` → opens the file
   using the **existing** viewer components (reuse, so it matches the Files tab).
