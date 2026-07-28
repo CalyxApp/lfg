@@ -11,12 +11,32 @@ import {
   Circle,
   CircleCheck,
   CircleDot,
+  FileText,
   Folder,
+  Newspaper,
   PenLine,
   Search,
+  Sparkles,
 } from "lucide-react";
 import { getJson, postJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
+
+type Report = {
+  id: string;
+  title: string;
+  source: string;
+  status: string;
+  created: string;
+  reportType?: string;
+  url: string;
+};
+
+function ReportIcon({ source, className }: { source: string; className?: string }) {
+  const Icon =
+    source === "briefing" ? Sparkles : source === "agent" ? Bot : source === "scheduled" ? Newspaper : FileText;
+  return <Icon className={className} />;
+}
 
 type Repo = { name: string; project?: string; custom?: boolean };
 type HomeSession = {
@@ -67,6 +87,8 @@ export function HomeView({
 }) {
   const [vaultRepo, setVaultRepo] = useState<string | null>(null);
   const [tasks, setTasks] = useState<VaultTask[] | null>(null);
+  const [reports, setReports] = useState<Report[] | null>(null);
+  const [openReport, setOpenReport] = useState<Report | null>(null);
   const today = localToday();
 
   // Detect (once) which repo carries Calyx tasks; remember the answer.
@@ -141,6 +163,30 @@ export function HomeView({
       setTasks((ts) => ts?.map((x) => (x.path === t.path ? { ...x, status: prev } : x)) ?? null);
     }
   }
+
+  // Calyx reports (nightly briefings, etc.) — vault-generated HTML docs.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await getJson<{ items: Report[] }>("/api/calyx-reports");
+        if (!cancelled) setReports(res.items);
+      } catch {
+        if (!cancelled) setReports([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Prefer reports created today; if none yet, fall back to the latest one so
+  // the section is always populated when any reports exist.
+  const homeReports = useMemo(() => {
+    const all = reports ?? [];
+    const todays = all.filter((r) => (r.created || "").slice(0, 10) === today);
+    return todays.length ? todays.slice(0, 3) : all.slice(0, 1);
+  }, [reports, today]);
 
   const active = useMemo(
     () =>
@@ -252,6 +298,47 @@ export function HomeView({
         </section>
       ) : null}
 
+      {/* Reports — today's, else the latest */}
+      {homeReports.length ? (
+        <section className="space-y-2">
+          <div className="flex items-center justify-between px-1">
+            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              {homeReports[0]?.created?.slice(0, 10) === today ? "Today's reports" : "Latest report"}
+            </h2>
+            <button
+              type="button"
+              onClick={() => onOpen("reports")}
+              className="text-xs font-medium text-muted-foreground hover:text-foreground"
+            >
+              All reports
+            </button>
+          </div>
+          <div className="overflow-hidden rounded-2xl border border-border bg-card/40 divide-y divide-border">
+            {homeReports.map((r) => (
+              <button
+                key={r.id}
+                type="button"
+                onClick={() => setOpenReport(r)}
+                className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors duration-150 ease-ios hover:bg-foreground/[0.03] active:bg-foreground/[0.06]"
+              >
+                <span className="flex size-7 shrink-0 items-center justify-center rounded-[7px] bg-primary/10 text-primary">
+                  <ReportIcon source={r.source} className="size-4" />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium">{r.title}</span>
+                  {r.reportType ? (
+                    <span className="block truncate text-xs text-muted-foreground">
+                      {r.reportType.replace(/[-_]/g, " ")}
+                    </span>
+                  ) : null}
+                </span>
+                <ChevronRight className="size-4 shrink-0 text-muted-foreground/60" />
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
       {/* Live sessions */}
       <section className="space-y-2">
         <div className="flex items-center justify-between px-1">
@@ -303,6 +390,14 @@ export function HomeView({
           </button>
         )}
       </section>
+
+      {openReport ? (
+        <HtmlViewerOverlay
+          title={openReport.title}
+          src={openReport.url}
+          onClose={() => setOpenReport(null)}
+        />
+      ) : null}
     </div>
   );
 }
