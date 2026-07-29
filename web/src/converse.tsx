@@ -22,6 +22,7 @@ import { ArrowUp, AudioLines, Mic, MicOff, Square, Volume2, VolumeX, X } from "l
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
 import { VoiceMeter } from "./components/voice-meter";
+import { ToolCard, type ToolDetail } from "./components/tool-card";
 import {
   primeAudio,
   playReady,
@@ -44,7 +45,13 @@ type Phase = "live" | "review";
 // `id` keys realtime-voice turns so their text can be upserted in place as
 // transcript deltas stream in (see handleEvent) — that's what keeps the thread
 // in sync with the audio you actually hear. `ok` marks a tool chip's outcome.
-type LogEntry = { role: "you" | "assistant" | "tool" | "system"; text: string; id?: string; ok?: boolean };
+type LogEntry = {
+  role: "you" | "assistant" | "tool" | "system";
+  text: string;
+  id?: string;
+  ok?: boolean;
+  tool?: ToolDetail; // set on tool rows → expandable input/result preview
+};
 
 // Friendly one-line label for a tool call — "Created project “X”", not raw
 // JSON args (Sam, 2026-07-22: tool calls looked like "a whole bunch of random
@@ -135,6 +142,18 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const append = (role: LogEntry["role"], text: string, ok?: boolean) =>
     setLog((l) => {
       const next = [...l.slice(-60), { role, text, ok }];
+      logRef.current = next;
+      return next;
+    });
+
+  // Tool row carrying the full call detail (name/args/result) so the chip can
+  // expand to a preview. `label` stays the friendly one-liner from toolLabel().
+  const appendTool = (name: string, args: Record<string, unknown>, ok: boolean | undefined, result?: string) =>
+    setLog((l) => {
+      const next = [
+        ...l.slice(-60),
+        { role: "tool" as const, text: toolLabel(name, args, ok), ok, tool: { name, args, result, ok } },
+      ];
       logRef.current = next;
       return next;
     });
@@ -312,9 +331,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
       if (!res.ok) throw new Error(`chat ${res.status}: ${(await res.text()).slice(0, 300)}`);
       const data = (await res.json()) as {
         text: string;
-        toolCalls?: { name: string; args: Record<string, unknown>; ok?: boolean }[];
+        toolCalls?: { name: string; args: Record<string, unknown>; ok?: boolean; result?: string }[];
       };
-      for (const tc of data.toolCalls ?? []) append("tool", toolLabel(tc.name, tc.args, tc.ok), tc.ok);
+      for (const tc of data.toolCalls ?? []) appendTool(tc.name, tc.args, tc.ok, tc.result);
       if (data.text) append("assistant", data.text);
       logEvent("chat_assistant", { text: data.text, toolCalls: data.toolCalls ?? [] });
     } catch (e) {
@@ -421,7 +440,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
       /* unknown outcome */
     }
     logEvent("tool", { name, args, ok, output: output.slice(0, 2000) });
-    append("tool", toolLabel(name, args, ok), ok);
+    appendTool(name, args, ok, output);
     const dc = dcRef.current;
     if (!dc || dc.readyState !== "open") return;
     dc.send(
@@ -843,15 +862,19 @@ export function Converse({ onClose }: { onClose: () => void }) {
                 />
               ) : e.role === "tool" ? (
                 <div key={i} className="flex">
-                  <span
-                    className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
-                      e.ok === false
-                        ? "border-destructive/40 bg-destructive/10 text-destructive"
-                        : "border-border bg-muted/40 text-muted-foreground"
-                    }`}
-                  >
-                    {e.ok === false ? "✗" : "✓"} {e.text}
-                  </span>
+                  {e.tool ? (
+                    <ToolCard label={e.text} detail={e.tool} />
+                  ) : (
+                    <span
+                      className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
+                        e.ok === false
+                          ? "border-destructive/40 bg-destructive/10 text-destructive"
+                          : "border-border bg-muted/40 text-muted-foreground"
+                      }`}
+                    >
+                      {e.ok === false ? "✗" : "✓"} {e.text}
+                    </span>
+                  )}
                 </div>
               ) : (
                 <div key={i} className="text-center text-xs text-muted-foreground">

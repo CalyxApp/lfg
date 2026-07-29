@@ -91,7 +91,13 @@ const openai: ChatProvider = {
     ];
     // Surfaced to the UI as friendly chips — includes the outcome (ok + a
     // path/id detail when the tool returned one), not just the invocation.
-    const toolCalls: { name: string; args: Record<string, unknown>; ok?: boolean; detail?: string }[] = [];
+    const toolCalls: {
+      name: string;
+      args: Record<string, unknown>;
+      ok?: boolean;
+      detail?: string;
+      result?: string;
+    }[] = [];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       let res: Response;
@@ -160,7 +166,7 @@ const openai: ChatProvider = {
         } catch {
           /* non-JSON output — leave outcome unknown */
         }
-        toolCalls.push({ name: call.function.name, args, ok, detail });
+        toolCalls.push({ name: call.function.name, args, ok, detail, result: output.slice(0, 4000) });
         convo.push({ role: "tool", tool_call_id: call.id, content: output });
       }
     }
