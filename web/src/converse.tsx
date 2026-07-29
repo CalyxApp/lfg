@@ -18,12 +18,24 @@
 
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
-import { ArrowUp, AudioLines, Mic, X } from "lucide-react";
+import { ArrowUp, AudioLines, Mic, Volume2, VolumeX, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
+import {
+  primeAudio,
+  playReady,
+  playError,
+  startWorking,
+  stopWorking,
+  areSoundsMuted,
+  setSoundsMuted,
+} from "./lib/earcons";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
-const MODEL = "gpt-realtime-2.1-mini";
+const MODEL = "gpt-realtime-2";
+// Unresolved "…" speech placeholders are cleared after this long if no transcript
+// ever arrives (noise-triggered VAD, empty transcription) so they don't stick.
+const PLACEHOLDER_TTL_MS = 9000;
 
 type Mode = "chat" | "voice";
 type VoiceStatus = "connecting" | "live" | "error";
@@ -81,6 +93,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("connecting");
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<LogEntry[]>([]);
+  const [soundsMuted, setMuted] = useState(areSoundsMuted());
+  // Bumped to force a voice reconnect after a dropped WebRTC connection.
+  const [connNonce, setConnNonce] = useState(0);
 
   // chat-mode state
   const [input, setInput] = useState("");
@@ -130,12 +145,101 @@ export function Converse({ onClose }: { onClose: () => void }) {
     });
   // running transcript per realtime item while its deltas stream in
   const rtTextRef = useRef<Record<string, string>>({});
+  // timers that clear an unresolved "…" user placeholder (see handleEvent)
+  const placeholderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const retryRef = useRef(0); // reconnect attempts for the current voice session
+
+  // ---- per-session debug log (Sam wants every realtime call recorded) ----
+  // The browser holds WebRTC directly to OpenAI, so the server can't see the
+  // transcript/turn events. We batch them here and POST to /api/voice/rt/log,
+  // which appends JSONL to data/converse-logs/ (git-ignored, local). Buffered +
+  // flushed on a timer / at teardown so a crash mid-call still leaves a trail.
+  const sessionIdRef = useRef<string | null>(null);
+  const logBufRef = useRef<Record<string, unknown>[]>([]);
+  const logTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // One debug-log id per Converse surface — spans text turns, the voice call, and
+  // any reconnects, so a single conversation is one file.
+  function ensureSessionId() {
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+    }
+  }
+
+  function flushLog() {
+    const sid = sessionIdRef.current;
+    if (logTimerRef.current) {
+      clearTimeout(logTimerRef.current);
+      logTimerRef.current = null;
+    }
+    if (!sid || logBufRef.current.length === 0) return;
+    const events = logBufRef.current;
+    logBufRef.current = [];
+    // fire-and-forget; keepalive lets it survive the surface closing
+    void fetch("/api/voice/rt/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: sid, events }),
+      keepalive: true,
+    }).catch(() => {
+      /* best-effort debug log */
+    });
+  }
+
+  function logEvent(kind: string, data: Record<string, unknown>) {
+    if (!sessionIdRef.current) return;
+    logBufRef.current.push({ t: new Date().toISOString(), kind, ...data });
+    if (logBufRef.current.length >= 20) flushLog();
+    else if (!logTimerRef.current) logTimerRef.current = setTimeout(flushLog, 2500);
+  }
+
+  function toggleSounds() {
+    const next = !soundsMuted;
+    setSoundsMuted(next);
+    setMuted(next);
+  }
+
+  // Resolve a user-speech transcript onto its placeholder. Prefer the matching
+  // item id; fall back to the most recent unresolved "…" placeholder when ids
+  // don't line up (or none was given) so the text can't land after the reply.
+  function resolveUserTranscript(itemId: string | undefined, text: string) {
+    if (itemId && placeholderTimers.current[itemId]) {
+      clearTimeout(placeholderTimers.current[itemId]);
+      delete placeholderTimers.current[itemId];
+    }
+    setLog((l) => {
+      let idx = itemId ? l.findIndex((e) => e.id === itemId) : -1;
+      if (idx < 0) {
+        for (let i = l.length - 1; i >= 0; i--) {
+          if (l[i].role === "you" && l[i].text === "…") {
+            idx = i;
+            break;
+          }
+        }
+      }
+      let next: LogEntry[];
+      if (idx >= 0) {
+        next = [...l];
+        next[idx] = { ...next[idx], role: "you", text };
+      } else {
+        next = [...l.slice(-60), { id: itemId, role: "you", text }];
+      }
+      logRef.current = next;
+      return next;
+    });
+  }
 
   // keep the thread pinned to the latest turn
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [log, sending, mode]);
+
+  // Flush any buffered debug events when the whole surface unmounts (covers a
+  // text-only conversation that never mounted the voice effect).
+  useEffect(() => () => flushLog(), []);
 
   // which chat model powers typed turns (selection persists server-side)
   useEffect(() => {
@@ -181,6 +285,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
       { role: "user", content: text },
     ];
     append("you", text);
+    ensureSessionId();
+    logEvent("chat_user", { text });
     setInput("");
     setSending(true);
     setError(null);
@@ -197,8 +303,11 @@ export function Converse({ onClose }: { onClose: () => void }) {
       };
       for (const tc of data.toolCalls ?? []) append("tool", toolLabel(tc.name, tc.args, tc.ok), tc.ok);
       if (data.text) append("assistant", data.text);
+      logEvent("chat_assistant", { text: data.text, toolCalls: data.toolCalls ?? [] });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      logEvent("chat_error", { message: msg });
     } finally {
       setSending(false);
     }
@@ -246,6 +355,25 @@ export function Converse({ onClose }: { onClose: () => void }) {
     } catch {
       /* leave empty */
     }
+
+    // wait_for_user: the model chose to stay silent on ambient noise/silence.
+    // Acknowledge the call but DON'T trigger a response (no forced reply) and
+    // don't clutter the thread with a chip.
+    if (name === "wait_for_user") {
+      logEvent("tool", { name, args, waiting: true });
+      const dc = dcRef.current;
+      if (dc && dc.readyState === "open") {
+        dc.send(
+          JSON.stringify({
+            type: "conversation.item.create",
+            item: { type: "function_call_output", call_id: callId, output: JSON.stringify({ ok: true, waiting: true }) },
+          }),
+        );
+      }
+      return;
+    }
+
+    startWorking(); // subtle "something's happening" heartbeat while the tool runs
     let output: string;
     try {
       const res = await fetch(`/api/voice/rt/tools/${name}`, {
@@ -256,6 +384,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
       output = await res.text();
     } catch (e) {
       output = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      stopWorking();
     }
     // Friendly outcome chip (not raw args): parse the tool result for ok/error.
     let ok: boolean | undefined;
@@ -265,6 +395,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
     } catch {
       /* unknown outcome */
     }
+    logEvent("tool", { name, args, ok, output: output.slice(0, 2000) });
     append("tool", toolLabel(name, args, ok), ok);
     const dc = dcRef.current;
     if (!dc || dc.readyState !== "open") return;
@@ -278,6 +409,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
   }
 
   function handleEvent(ev: any) {
+    // Debug log: every realtime event, verbatim, to this session's JSONL.
+    logEvent("rt", { event: ev });
     switch (ev?.type) {
       case "response.done":
         for (const item of ev.response?.output ?? []) {
@@ -288,8 +421,23 @@ export function Converse({ onClose }: { onClose: () => void }) {
       // the transcription itself arrives seconds later (often AFTER the
       // assistant has begun replying), which is what made the transcript feel
       // out of sync with the audio. The placeholder pins the correct position.
+      // A TTL clears it if the transcription never arrives (noise-triggered VAD).
       case "input_audio_buffer.speech_started":
-        if (ev.item_id) upsert(ev.item_id, "you", "…");
+        if (ev.item_id) {
+          const id = ev.item_id as string;
+          upsert(id, "you", "…");
+          if (placeholderTimers.current[id]) clearTimeout(placeholderTimers.current[id]);
+          placeholderTimers.current[id] = setTimeout(() => {
+            delete placeholderTimers.current[id];
+            setLog((l) => {
+              const idx = l.findIndex((e) => e.id === id);
+              if (idx < 0 || l[idx].text !== "…") return l; // resolved meanwhile
+              const next = l.filter((_, i) => i !== idx);
+              logRef.current = next;
+              return next;
+            });
+          }, PLACEHOLDER_TTL_MS);
+        }
         break;
       // Stream the assistant's transcript word-by-word as it speaks (instead of
       // one paragraph popping in when the whole utterance is done).
@@ -308,13 +456,12 @@ export function Converse({ onClose }: { onClose: () => void }) {
         }
         break;
       case "conversation.item.input_audio_transcription.completed":
-        if (ev.transcript) {
-          if (ev.item_id) upsert(ev.item_id, "you", ev.transcript);
-          else append("you", ev.transcript);
-        }
+        // Resolve onto the pinned placeholder (id match, else newest unresolved).
+        if (ev.transcript) resolveUserTranscript(ev.item_id, ev.transcript);
         break;
       case "error":
         setError(ev.error?.message ?? "realtime error");
+        playError();
         break;
       default:
         break;
@@ -330,6 +477,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
     async function connect() {
       try {
         const user = localStorage.getItem("lfg_user") || "anon";
+        ensureSessionId();
+        primeAudio(); // unlock WebAudio on this user-gesture-initiated connect
+        logEvent("session_start", { user, model: MODEL, attempt: retryRef.current });
         const tokenRes = await fetch(`/api/voice/rt/token?user=${encodeURIComponent(user)}`, { method: "POST" });
         if (!tokenRes.ok) throw new Error(`token ${tokenRes.status}: ${await tokenRes.text()}`);
         const { value: ephemeralKey } = (await tokenRes.json()) as { value: string };
@@ -340,6 +490,21 @@ export function Converse({ onClose }: { onClose: () => void }) {
         pcRef.current = pc;
         pc.ontrack = (e) => {
           if (audioRef.current) audioRef.current.srcObject = e.streams[0];
+        };
+        // Auto-reconnect once or twice on a dropped connection before giving up.
+        pc.onconnectionstatechange = () => {
+          const st = pc.connectionState;
+          logEvent("conn", { state: st });
+          if (st === "failed" && !cancelled) {
+            if (retryRef.current < 2) {
+              retryRef.current++;
+              setConnNonce((n) => n + 1); // effect cleanup tears down, then reconnects
+            } else {
+              setError("voice connection lost — tap End and start again");
+              setVoiceStatus("error");
+              playError();
+            }
+          }
         };
 
         // Explicit echo cancellation / noise suppression: the phone speaker's
@@ -377,7 +542,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
           }
           if (!startedAtRef.current) startedAtRef.current = Date.now();
           usedVoiceRef.current = true;
+          retryRef.current = 0; // a clean open clears the reconnect budget
           setVoiceStatus("live");
+          playReady(); // soft chime: the session is listening — start talking
         };
         dc.onmessage = (e) => {
           try {
@@ -400,18 +567,23 @@ export function Converse({ onClose }: { onClose: () => void }) {
         if (!cancelled) append("system", "Voice connected — start talking.");
       } catch (e) {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(msg);
         setVoiceStatus("error");
+        playError();
+        logEvent("error", { message: msg });
       }
     }
 
     void connect();
     return () => {
       cancelled = true;
+      stopWorking();
       teardownVoice();
+      flushLog(); // persist whatever's buffered before we drop the session
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [mode, connNonce]);
 
   // ---------------- close / save ----------------
   function buildTranscript(): string {
@@ -605,12 +777,24 @@ export function Converse({ onClose }: { onClose: () => void }) {
           <div className="flex flex-col gap-3">
             {log.map((e, i) =>
               e.role === "you" ? (
-                <div
-                  key={i}
-                  className="msg-text markdown user-bubble ml-auto w-fit max-w-[85%] whitespace-pre-wrap text-base"
-                >
-                  {e.text}
-                </div>
+                e.text === "…" ? (
+                  // Distinct "we're hearing you" state (not a real turn yet) vs a
+                  // finished user bubble — the transcript lands a beat later.
+                  <div
+                    key={i}
+                    className="ml-auto w-fit max-w-[85%] text-sm italic text-muted-foreground"
+                    aria-live="polite"
+                  >
+                    🎤 transcribing…
+                  </div>
+                ) : (
+                  <div
+                    key={i}
+                    className="msg-text markdown user-bubble ml-auto w-fit max-w-[85%] whitespace-pre-wrap text-base"
+                  >
+                    {e.text}
+                  </div>
+                )
               ) : e.role === "assistant" ? (
                 // Rendered markdown (same .msg-text.markdown styles as the
                 // agent chat) — assistant replies use headings/lists/bold.
@@ -651,6 +835,15 @@ export function Converse({ onClose }: { onClose: () => void }) {
                 ? "connecting…"
                 : "voice error"}
           </span>
+          <button
+            type="button"
+            className="flex size-9 items-center justify-center rounded-full border border-border text-muted-foreground hover:text-foreground"
+            onClick={toggleSounds}
+            title={soundsMuted ? "Cue sounds off" : "Cue sounds on"}
+            aria-label={soundsMuted ? "Turn cue sounds on" : "Turn cue sounds off"}
+          >
+            {soundsMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+          </button>
           <button
             className="rounded-full bg-destructive px-5 py-2 text-sm font-medium text-destructive-foreground"
             onClick={() => setMode("chat")}
@@ -704,7 +897,10 @@ export function Converse({ onClose }: { onClose: () => void }) {
             <button
               type="button"
               className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
-              onClick={() => setMode("voice")}
+              onClick={() => {
+                retryRef.current = 0;
+                setMode("voice");
+              }}
               disabled={sending}
               title="Start realtime voice conversation"
               aria-label="Start voice mode"
