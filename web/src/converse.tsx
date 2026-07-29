@@ -32,7 +32,7 @@ import {
 } from "./lib/earcons";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
-const MODEL = "gpt-realtime-2";
+const MODEL = "gpt-realtime-2.1";
 // Unresolved "…" speech placeholders are cleared after this long if no transcript
 // ever arrives (noise-triggered VAD, empty transcription) so they don't stick.
 const PLACEHOLDER_TTL_MS = 9000;

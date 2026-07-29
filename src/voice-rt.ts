@@ -26,10 +26,13 @@ import {
 } from "./vault-tools.ts";
 import { buildVoiceInstructions } from "./converse-persona.ts";
 
-// Full gpt-realtime-2 (Sam, 2026-07-29): stronger tool selection + exact-entity
-// handling than the -mini for the vault/project/email work. Env-overridable so the
-// exact model id can be corrected without a code change if OpenAI's string differs.
-const MODEL = process.env.CONVERSE_RT_MODEL || "gpt-realtime-2";
+// Full gpt-realtime-2.1 (Sam, 2026-07-29): the full-size sibling of the
+// gpt-realtime-2.1-mini we were running — same current generation (released
+// 2026-07-06), stronger tool selection + exact-entity handling for the vault/
+// project work. Confirmed the current-gen id via OpenAI's changelog; the
+// client_secrets mint validates the *config* schema (verified) but not the model
+// string, so this stays env-overridable via CONVERSE_RT_MODEL just in case.
+const MODEL = process.env.CONVERSE_RT_MODEL || "gpt-realtime-2.1";
 const CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets";
 
 // Per-session debug logs (Sam wants to track every realtime call for himself).

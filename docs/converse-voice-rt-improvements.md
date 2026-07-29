@@ -21,7 +21,9 @@ bigger design (see §Deferred).
 - `src/commands/serve.ts` — routes.
 
 ## Decisions locked with Sam (2026-07-29)
-- **Model:** full `gpt-realtime-2` (was `-mini`). Env-overridable via `CONVERSE_RT_MODEL`.
+- **Model:** full `gpt-realtime-2.1` (was `gpt-realtime-2.1-mini`) — the full-size
+  sibling in the same current generation (released 2026-07-06). Env-overridable via
+  `CONVERSE_RT_MODEL`.
 - **Mic profile:** `near_field` noise reduction (earbuds + phone; never laptop).
 - **Injected tasks:** overdue within the **past 7 days** + due in the **next 7 days**,
   **no cap**. Projects: **all active**, by name (+ status if not plain "active").
@@ -103,15 +105,22 @@ bigger design (see §Deferred).
 - Read a debug log: `data/converse-logs/*.jsonl` (JSON per line).
 
 ## Verification
-- `web` and server both pass `tsc --noEmit` (0 errors) as of Rev 1.
-- Not yet exercised against a live OpenAI key on-device — see risks.
+- `web` and server both pass `tsc --noEmit` (0 errors).
+- **Session config validated against the live key** (2026-07-29): the full new config
+  (`model: gpt-realtime-2.1`, `noise_reduction: near_field`, `transcription.language:
+  "en"`, `semantic_vad`/`eagerness: low`, `max_output_tokens`, `voice: marin`) minted a
+  client secret with **HTTP 200**. The mint endpoint DOES schema-validate the session —
+  bogus values 400 with the supported list (e.g. noise_reduction supports exactly
+  `near_field`/`far_field`; turn_detection `server_vad`/`semantic_vad`) — so a 200
+  confirms every field/value name is accepted.
+- Still to do: a real WebRTC round-trip on-device (mint validates config but not the
+  model string; the model is only exercised when the call connects).
 
-## Risks / to confirm on-device
-- **Exact realtime model id.** `gpt-realtime-2` is our best read of the production
-  name; if OpenAI's string differs, set `CONVERSE_RT_MODEL` (no redeploy of code).
-- **Session-config field names.** `audio.input.noise_reduction` and
-  `transcription.language` follow the GA nested `audio` schema this code already uses;
-  worth a smoke test that the client-secret mint returns 200 with them present.
+## Risks / notes
+- **Model id.** `gpt-realtime-2.1` confirmed as the current-generation full model from
+  OpenAI's changelog (released alongside the `-mini` we already ran). The mint endpoint
+  does not validate the model string, so if a call ever fails on the model, set
+  `CONVERSE_RT_MODEL` — no code change.
 
 ## Deferred (NOT in this branch)
 - Cross-device **universal chat / transcript store** spanning mobile + desktop. The
