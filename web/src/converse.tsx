@@ -18,7 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
-import { ArrowUp, AudioLines, Mic, Volume2, VolumeX, X } from "lucide-react";
+import { ArrowUp, AudioLines, Mic, MicOff, Square, Volume2, VolumeX, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
 import {
@@ -91,14 +91,26 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const [mode, setMode] = useState<Mode>("chat");
   const [phase, setPhase] = useState<Phase>("live");
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("connecting");
+  const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<LogEntry[]>([]);
-  const [soundsMuted, setMuted] = useState(areSoundsMuted());
+  // cue-sound mute (earcons) — distinct from `muted` above, which mutes the mic
+  const [soundsMuted, setSoundsMutedState] = useState(areSoundsMuted());
   // Bumped to force a voice reconnect after a dropped WebRTC connection.
   const [connNonce, setConnNonce] = useState(0);
 
   // chat-mode state
   const [input, setInput] = useState("");
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Auto-grow the chat box with its content (iOS Safari lacks CSS field-sizing),
+  // capped at ~40vh then it scrolls. Runs on every value change so it also
+  // shrinks back to one line after the box is cleared on send.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight * 0.4))}px`;
+  }, [input]);
   const [sending, setSending] = useState(false);
   const [cfg, setCfg] = useState<ChatConfig | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -197,8 +209,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
   function toggleSounds() {
     const next = !soundsMuted;
-    setSoundsMuted(next);
-    setMuted(next);
+    setSoundsMuted(next); // earcons module (persists + stops any working loop)
+    setSoundsMutedState(next); // local UI state for the toggle icon
   }
 
   // Resolve a user-speech transcript onto its placeholder. Prefer the matching
@@ -345,6 +357,18 @@ export function Converse({ onClose }: { onClose: () => void }) {
     dcRef.current = null;
     pcRef.current = null;
     micRef.current = null;
+    setMuted(false);
+  }
+
+  // Mute/unmute the outgoing mic without tearing down the session. Disabling the
+  // track stops audio reaching the model (so it won't hear you or ambient noise)
+  // while the connection stays live.
+  function toggleMute() {
+    const stream = micRef.current;
+    if (!stream) return;
+    const next = !muted;
+    for (const t of stream.getAudioTracks()) t.enabled = !next;
+    setMuted(next);
   }
 
   // run a tool call the model relays over the data channel
@@ -830,7 +854,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
         <div className="flex items-center justify-center gap-3 border-t border-border px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           <span className="text-sm text-muted-foreground">
             {voiceStatus === "live"
-              ? "voice is live — just talk"
+              ? muted
+                ? "muted — tap the mic to talk"
+                : "voice is live — just talk"
               : voiceStatus === "connecting"
                 ? "connecting…"
                 : "voice error"}
@@ -845,10 +871,27 @@ export function Converse({ onClose }: { onClose: () => void }) {
             {soundsMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
           </button>
           <button
-            className="rounded-full bg-destructive px-5 py-2 text-sm font-medium text-destructive-foreground"
-            onClick={() => setMode("chat")}
+            type="button"
+            onClick={toggleMute}
+            disabled={voiceStatus !== "live"}
+            className={
+              muted
+                ? "flex size-11 items-center justify-center rounded-full bg-destructive text-destructive-foreground disabled:opacity-50 md:size-9"
+                : "flex size-11 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+            }
+            title={muted ? "Unmute microphone" : "Mute microphone"}
+            aria-label={muted ? "Unmute microphone" : "Mute microphone"}
           >
-            End voice
+            {muted ? <MicOff className="size-5 md:size-4" /> : <Mic className="size-5 md:size-4" />}
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("chat")}
+            className="flex items-center gap-1.5 rounded-full border border-border px-4 py-2 text-sm font-medium text-foreground"
+            title="Stop voice — back to the keyboard, keeps the conversation"
+            aria-label="Stop voice"
+          >
+            <Square className="size-4" /> Stop
           </button>
         </div>
       ) : dict.active ? (
@@ -864,10 +907,19 @@ export function Converse({ onClose }: { onClose: () => void }) {
             void sendChatText(input);
           }}
         >
-          <input
-            className="lfg-gfield h-11 min-h-11 min-w-0 flex-1 rounded-2xl border-transparent px-4 text-base shadow-sm placeholder:text-muted-foreground"
+          <textarea
+            ref={inputRef}
+            rows={1}
+            className="lfg-gfield max-h-[40vh] min-h-11 min-w-0 flex-1 resize-none overflow-y-auto rounded-2xl border-transparent px-4 py-2.5 text-base leading-6 shadow-sm placeholder:text-muted-foreground"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter sends; Shift+Enter (or ⌘/Ctrl+Enter) inserts a newline.
+              if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+                e.preventDefault();
+                void sendChatText(input);
+              }
+            }}
             placeholder="Ask…"
             disabled={sending}
           />

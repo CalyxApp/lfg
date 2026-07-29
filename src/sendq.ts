@@ -23,7 +23,10 @@ import {
   feedbackPromptOpen,
   tmuxDismissFeedback,
 } from "./tmux.ts";
-import { listSessions, resolveTranscript, recentMessages } from "./sessions.ts";
+import { resolveTranscript } from "./sessions.ts";
+import { listSessionsCached } from "./session-cache.ts";
+import { enqueueTranscriptIndex, indexedRecentMessages } from "./transcript-index.ts";
+import { traceLog } from "./trace-log.ts";
 
 export type QueuedMsg = {
   id: string;
@@ -76,6 +79,7 @@ export function enqueueMessage(sessionId: string, text: string): QueuedMsg {
     updatedAt: now,
   };
   s.msgs.push(msg);
+  traceLog("sendq_enqueue", { sessionId, messageId: msg.id, chars: text.length });
   pruneTerminal(s);
   kick(sessionId);
   return msg;
@@ -152,19 +156,49 @@ const norm = (s: string) => s.replace(/\s+/g, " ").trim();
 // would never match.
 const NEEDLE_LEN = 48;
 
-function boxHasNeedle(target: string, needle: string): boolean | null {
+// Does the composer currently show our message? Two probes, in order:
+//
+// 1. Needle: our normalized prefix is visible in the box. Definitive for short
+//    drafts and unscrolled viewports.
+// 2. Inverted (the codex long-draft case): the codex composer viewport scrolls
+//    for long drafts, so NEITHER the head nor the tail of the draft is
+//    guaranteed on screen — the needle probe false-negatives, and the queue
+//    would clear + retype a message that was sitting there fine, then fail.
+//    What IS guaranteed is that every visible composer line is a contiguous
+//    slice of our draft, so check that direction: a non-empty box matches when
+//    every visible line is a substring of the normalized message. A foreign
+//    draft or placeholder ("Add a follow-up") fails this; a scrolled viewport
+//    of ours passes. Checked per-line rather than joined, because a mid-word
+//    wrap has no space at the seam — joining visible lines with a space would
+//    fabricate one and break the substring match.
+//
+// Exported for tests: pure logic over a captured box string.
+export function boxTextMatches(box: string, fullNorm: string, needle: string): boolean {
+  const normBox = norm(box);
+  if (!normBox) return false;
+  if (normBox.includes(needle)) return true;
+  const lines = box
+    .split("\n")
+    .map(norm)
+    .filter(Boolean);
+  return lines.length > 0 && lines.every((l) => fullNorm.includes(l));
+}
+
+function boxShowsMessage(target: string, fullNorm: string, needle: string): boolean | null {
   const box = inputBoxText(target);
   if (box == null) return null; // composer not visible (modal up, or unknown)
-  return norm(box).includes(needle);
+  return boxTextMatches(box, fullNorm, needle);
 }
 
 async function transcriptUserMatchCount(
+  sessionId: string,
   transcriptPath: string | null,
   needle: string,
 ): Promise<number> {
   if (!transcriptPath) return 0;
   try {
-    const msgs = await recentMessages(transcriptPath, 120);
+    enqueueTranscriptIndex(transcriptPath, sessionId);
+    const msgs = await indexedRecentMessages(transcriptPath, sessionId, 120);
     return msgs.filter(
       (m) => m.role === "user" && m.kind === "text" && norm(m.text).includes(needle),
     ).length;
@@ -188,7 +222,8 @@ export async function reconcileQueued(sessionId: string): Promise<boolean> {
   if (!transcriptPath) return false;
   let recent;
   try {
-    recent = await recentMessages(transcriptPath, 40);
+    enqueueTranscriptIndex(transcriptPath, sessionId);
+    recent = await indexedRecentMessages(transcriptPath, sessionId, 40);
   } catch {
     return false;
   }
@@ -201,6 +236,7 @@ export async function reconcileQueued(sessionId: string): Promise<boolean> {
     if (found) {
       m.status = "delivered";
       m.updatedAt = Date.now();
+      traceLog("sendq_reconciled", { sessionId, messageId: m.id });
       changed = true;
     }
   }
@@ -220,16 +256,28 @@ function clearFeedbackPrompt(target: string): boolean {
 }
 
 async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
-  const sess = (await listSessions()).find((s) => s.sessionId === sessionId);
+  const started = performance.now();
+  const sess = (await listSessionsCached()).find(
+    (s) => s.sessionId === sessionId || s.nativeSessionId === sessionId,
+  );
   const target = sess?.tmuxTarget ?? null;
   if (!target) {
     msg.status = "failed";
     msg.error = "session is not in a tmux pane";
+    traceLog("sendq_failed", { sessionId, messageId: msg.id, error: msg.error });
     return;
   }
   const transcriptPath = await resolveTranscript(sessionId);
-  const needle = norm(msg.text).slice(0, NEEDLE_LEN);
-  const transcriptMatchesBefore = await transcriptUserMatchCount(transcriptPath, needle);
+  const fullNorm = norm(msg.text);
+  const needle = fullNorm.slice(0, NEEDLE_LEN);
+  const transcriptMatchesBefore = await transcriptUserMatchCount(sessionId, transcriptPath, needle);
+  traceLog("sendq_deliver_start", {
+    sessionId,
+    messageId: msg.id,
+    transcriptPath,
+    target,
+    chars: msg.text.length,
+  });
 
   // Clear any session-rating overlay first — it swallows Enter and would
   // otherwise strand every send with "never left the input box".
@@ -270,6 +318,7 @@ async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
     if (attempt === 1) {
       msg.status = "failed";
       msg.error = "a prompt/selector wouldn't dismiss — answer it first";
+      traceLog("sendq_failed", { sessionId, messageId: msg.id, error: msg.error });
       return;
     }
   }
@@ -278,10 +327,11 @@ async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
   while (msg.attempts < MAX_ATTEMPTS) {
     msg.attempts++;
     msg.updatedAt = Date.now();
+    traceLog("sendq_attempt", { sessionId, messageId: msg.id, attempt: msg.attempts });
 
     // Only type when our text isn't already sitting in the box (a previous
     // attempt may have typed it but failed to submit — retyping would double it).
-    if (boxHasNeedle(target, needle) !== true) {
+    if (boxShowsMessage(target, fullNorm, needle) !== true) {
       // Wipe any foreign draft first. The composer may already hold text the
       // user (or a stranded earlier send) left there; tmuxType appends, so
       // without this our message fuses onto it and the merged line submits as
@@ -292,7 +342,7 @@ async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
       let settled = false;
       for (let i = 0; i < 20; i++) {
         await sleep(150);
-        if (boxHasNeedle(target, needle) === true) {
+        if (boxShowsMessage(target, fullNorm, needle) === true) {
           settled = true;
           break;
         }
@@ -302,6 +352,7 @@ async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
         // loop to retry from scratch.
         tmuxClearInput(target);
         await sleep(200);
+        traceLog("sendq_type_retry", { sessionId, messageId: msg.id, attempt: msg.attempts });
         continue;
       }
     }
@@ -316,11 +367,18 @@ async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
     tmuxEnter(target);
     for (let i = 0; i < 24; i++) {
       await sleep(150);
-      const inBox = boxHasNeedle(target, needle);
-      const transcriptMatchesNow = await transcriptUserMatchCount(transcriptPath, needle);
+      const inBox = boxShowsMessage(target, fullNorm, needle);
+      const transcriptMatchesNow = await transcriptUserMatchCount(sessionId, transcriptPath, needle);
       if (transcriptMatchesNow > transcriptMatchesBefore) {
         msg.status = "delivered";
         msg.error = undefined;
+        traceLog("sendq_delivered", {
+          sessionId,
+          messageId: msg.id,
+          via: "transcript_index",
+          attempts: msg.attempts,
+          durationMs: Math.round((performance.now() - started) * 1000) / 1000,
+        });
         return;
       }
       // inBox === false: the composer is visible and our text is gone.
@@ -341,6 +399,13 @@ async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
           ? "delivered"
           : "queued";
         msg.error = undefined;
+        traceLog("sendq_accepted", {
+          sessionId,
+          messageId: msg.id,
+          status: msg.status,
+          attempts: msg.attempts,
+          durationMs: Math.round((performance.now() - started) * 1000) / 1000,
+        });
         return;
       }
     }
@@ -350,4 +415,11 @@ async function deliver(sessionId: string, msg: QueuedMsg): Promise<void> {
 
   msg.status = "failed";
   msg.error = "message never left the input box after retries";
+  traceLog("sendq_failed", {
+    sessionId,
+    messageId: msg.id,
+    error: msg.error,
+    attempts: msg.attempts,
+    durationMs: Math.round((performance.now() - started) * 1000) / 1000,
+  });
 }

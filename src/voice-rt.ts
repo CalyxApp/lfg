@@ -82,7 +82,8 @@ async function buildSessionConfig(repoCwd?: string) {
         turn_detection: {
           type: "semantic_vad",
           // `low` waits longer before deciding the user is done / is interrupting —
-          // fewer accidental mid-reply cut-offs in a noisy room.
+          // fewer accidental mid-reply cut-offs in a noisy room. If noise still
+          // barges in, switch to server_vad with an explicit numeric `threshold`.
           eagerness: "low",
           create_response: true,
           interrupt_response: true,

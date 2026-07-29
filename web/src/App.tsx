@@ -41,6 +41,8 @@ import {
   Boxes,
   Braces,
   CalendarClock,
+  Images,
+  Package,
   Flag,
   AlertTriangle,
   Check,
@@ -110,6 +112,8 @@ import { MicButton, recordingButtonStyle, useDictation, useWaveformDictation, Wa
 import { CaptureView } from "@/components/CaptureView";
 import { HomeView } from "@/components/HomeView";
 import { SearchView } from "@/components/SearchView";
+import { ArtifactInlineCard, ArtifactsView } from "@/components/ArtifactsView";
+import { ShippedView } from "@/components/ShippedView";
 
 // Injected by Vite `define` at build time (see vite.config.ts).
 declare const __BUILD_STAMP__: string;
@@ -333,6 +337,14 @@ type Message = {
   ts?: number;
   pending?: boolean;
   seed?: boolean;
+  // Artifact placement messages (kind image/video/html) — appended into the
+  // transcript when an agent publishes; hydrated by the artifacts JOIN.
+  artifactId?: string;
+  url?: string;
+  title?: string;
+  caption?: string;
+  version?: number;
+  mimeType?: string;
   // A draft assistant turn we joined mid-stream: its text was already fully
   // accumulated when we connected, so it renders settled instead of replaying
   // the word-by-word streaming reveal. See DRAFT_CATCHUP_MIN_CHARS.
@@ -3238,8 +3250,21 @@ export function App() {
                   label="Search"
                 />
                 <IconTab
+                  active={tab === "artifacts"}
+                  onClick={() => setTab("artifacts")}
+                  icon={<Images className="size-[18px]" />}
+                  label="Artifacts"
+                />
+                <IconTab
+                  active={tab === "shipped"}
+                  onClick={() => setTab("shipped")}
+                  icon={<Package className="size-[18px]" />}
+                  label="Shipped"
+                />
+                <IconTab
                   active={
-                    tab !== "live" && tab !== "files" && tab !== "capture" && tab !== "search"
+                    tab !== "live" && tab !== "files" && tab !== "capture" && tab !== "search" &&
+                    tab !== "artifacts" && tab !== "shipped"
                   }
                   onClick={() => setTab("settings")}
                   icon={<Settings className="size-[18px]" />}
@@ -3314,6 +3339,10 @@ export function App() {
             onEdit={setEditingAgent}
             onRunNow={runAutoNow}
           />
+        ) : tab === "artifacts" ? (
+          <ArtifactsView />
+        ) : tab === "shipped" ? (
+          <ShippedView />
         ) : tab === "brain" ? (
           <SessionBrainView
             config={brainConfig}
@@ -3865,7 +3894,8 @@ const ROUTABLE_TABS = new Set([
   "home",
   "live",
   "auto",
-  "brain",
+  "artifacts",
+  "shipped",
   "ask",
   "usage",
   "coding-agents",
@@ -3883,7 +3913,8 @@ const ROUTABLE_TABS = new Set([
 const AGENT_FAMILY_TABS = new Set([
   "live",
   "auto",
-  "brain",
+  "artifacts",
+  "shipped",
   "ask",
   "usage",
   "coding-agents",
@@ -3898,7 +3929,8 @@ const AGENT_FAMILY_TABS = new Set([
 // keeps pointing there.
 const AGENT_TOOL_TABS = new Set([
   "auto",
-  "brain",
+  "artifacts",
+  "shipped",
   "usage",
   "coding-agents",
   "agent-browser",
@@ -3912,11 +3944,12 @@ const AGENT_TOOL_TABS = new Set([
 function AgentToolChips({ onOpen }: { onOpen: (tab: string) => void }) {
   const tools = [
     { id: "auto", label: "Auto agents", icon: CalendarClock },
+    { id: "artifacts", label: "Artifacts", icon: Images },
+    { id: "shipped", label: "Shipped", icon: Package },
     { id: "agent-browser", label: "Agent browser", icon: GitFork },
     { id: "coding-agents", label: "Coding agents", icon: Bot },
     { id: "term", label: "Terminal", icon: TerminalSquare },
     { id: "usage", label: "Usage", icon: Activity },
-    { id: "brain", label: "Session brain", icon: Brain },
     { id: "browser", label: "Browser profiles", icon: Globe },
   ];
   return (
@@ -8362,6 +8395,19 @@ function MessageBubble({
     );
   }
 
+  // Artifact placements render as inline media cards at the point in the
+  // conversation where the agent published them (images, videos, live HTML).
+  if (
+    (message.kind === "image" || message.kind === "video" || message.kind === "html") &&
+    message.url
+  ) {
+    return (
+      <AiMessage className={cn("msg", entering && "lfg-msg-in")} from="assistant">
+        <ArtifactInlineCard artifact={message} />
+      </AiMessage>
+    );
+  }
+
   const isUser = message.role === "user";
   return (
     <AiMessage
@@ -8912,6 +8958,16 @@ function NewSessionDialog({
   const [usage, setUsage] = useState<ProviderUsage | null>(null);
   const [pendingCreates, setPendingCreates] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // Kickoff dictation: same waveform voice-to-text used in the running-session
+  // composer (tap mic → recorder row with ✕/✓/↑), replacing the old red
+  // active-mic MicButton so starting a session matches ongoing chats.
+  const rec = useWaveformDictation({
+    baseText: prompt,
+    onText: setPrompt,
+    onInterim: setPrompt,
+    onSend: (t) => void submit(undefined, t),
+    onCancel: (b) => setPrompt(b),
+  });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const previewUrls = useRef<string[]>([]);
   // Resumable (closed / rebooted-away) sessions. Fetched lazily when the user
@@ -9566,6 +9622,10 @@ function NewSessionDialog({
         )}
         ref={fieldRef}
       >
+        {rec.active ? (
+          <WaveformRecorderRow rec={rec} />
+        ) : (
+          <>
         {variant === "inline" ? agentPopover : null}
         <SkillTextarea
           value={prompt}
@@ -9591,27 +9651,19 @@ function NewSessionDialog({
               : "min-h-40 max-h-[42dvh] px-1 py-1 pr-10",
           )}
         />
-        <MicButton
-          minimal
+        <Button
+          size="icon"
+          type="button"
+          variant="tint"
           className={cn("size-9 shrink-0", variant !== "inline" && "absolute bottom-1 right-1")}
-          silenceMs={2500}
-          // Phase 1 of unified-chat-and-voice: tap-dictation is review-before-
-          // send — the transcript lands here as editable text and the user sends
-          // it; press-and-hold release-to-send remains the hands-free path.
-          reviewOnStop
-          baseText={prompt}
-          onText={(text, base) =>
-            setPrompt(base.trim() ? `${base.trimEnd()} ${text}` : text)
-          }
-          onInterim={(text, base) =>
-            setPrompt(base.trim() ? `${base.trimEnd()} ${text}` : text)
-          }
-          onAutoSubmit={(text, base) => {
-            const combined = base.trim() ? `${base.trimEnd()} ${text}` : text;
-            void submit(undefined, combined);
-          }}
-          onCancel={(base) => setPrompt(base)}
-        />
+          onClick={() => void rec.start()}
+          aria-label="Dictate"
+          title="Dictate — you review before sending"
+        >
+          <Mic className="size-4" />
+        </Button>
+          </>
+        )}
       </div>
 
       {attachments.length ? (
@@ -11764,38 +11816,8 @@ function SettingsView({
             </div>
             <ChevronRight className="size-4 text-muted-foreground/60" />
           </button>
-          <div className="flex items-center justify-between gap-4 px-4 py-2.5">
-            <button
-              type="button"
-              onClick={onOpenBrain}
-              className="flex min-w-0 flex-1 items-center gap-3 text-left"
-            >
-              <span className="flex size-7 shrink-0 items-center justify-center rounded-[7px] bg-foreground text-background">
-                <Brain className="size-4" />
-              </span>
-              <span className="min-w-0">
-                <span className="block text-sm font-medium">Session brain</span>
-                <span className="block truncate text-xs text-muted-foreground">
-                  {brainConfig?.enabled ? "Automatic cleanup enabled" : "Automatic cleanup paused"}
-                </span>
-              </span>
-            </button>
-            <div className="flex shrink-0 items-center gap-2">
-              <button
-                type="button"
-                onClick={onOpenBrain}
-                aria-label="Open session brain settings"
-                className="flex size-7 items-center justify-center rounded-lg text-muted-foreground/60 hover:bg-muted hover:text-foreground"
-              >
-                <ChevronRight className="size-4" />
-              </button>
-              <Switch
-                checked={brainConfig?.enabled ?? false}
-                onCheckedChange={(enabled) => onBrainConfigChange({ enabled })}
-                aria-label="Enable session brain"
-              />
-            </div>
-          </div>
+          {/* Session brain removed — the backend subsystem was deleted when we
+              adopted the upstream engine (see docs/upstream-adoption-plan.md). */}
         </div>
       </section>
 

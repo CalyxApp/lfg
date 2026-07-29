@@ -1,61 +1,67 @@
 // Headless interactive session harness for the "opencode" agent kind.
 //
-// This is the long-lived process behind an "opencode (ai sdk)" session. Like its
+// This is the long-lived process behind a managed opencode session. Like its
 // Claude/codex siblings (./aisdk-session.ts, ./codex-aisdk-session.ts) it runs
 // inside a tmux pane used purely as a process supervisor + lifecycle handle (we
-// never drive I/O through the pane), and drives a multi-turn conversation through
-// the Vercel AI SDK — here via the ai-sdk-provider-opencode-sdk provider, which
-// talks to a local `opencode serve` HTTP server (auto-started). Auth is
+// never drive I/O through the pane), and drives a multi-turn conversation
+// through the OFFICIAL @opencode-ai/sdk: `createOpencodeServer()` boots a local
+// `opencode serve`, and the generated client drives it over HTTP. Auth is
 // opencode's own config (~/.config/opencode auth); there is NO API key.
 //
-// Control plane is identical to the other AI-SDK harnesses:
+// History: this harness previously went through the Vercel AI SDK
+// (ai-sdk-provider-opencode-sdk). The official SDK removes the adapter's worst
+// contortions: the session id is known at session.create() BEFORE turn 1 (the
+// provider only revealed it in post-turn providerMetadata), interrupt is a real
+// session.abort() call, and the reply arrives as structured parts instead of
+// text deltas interleaved with "unmapped event" error parts.
+//
+// Control plane is identical to the other harnesses:
 //   - control IN: we tail a command file (data/aisdk/<key>.cmd) for
-//     send / interrupt / close, written by the serve endpoints.
+//     send / set_model / interrupt / close / answer / dismiss.
 //   - busy + discovery: a registry entry (data/aisdk/<key>.json) we keep
 //     updated; serve reads it for the live-view busy dot and session list.
+//   - interactive questions: OpenCode's `question` tool has no TUI here, so we
+//     surface pending questions on the registry `prompt` field, drop busy while
+//     waiting, and reply/reject via OpenCode's HTTP question API when the user
+//     answers from the web UI (or auto-reject after a timeout).
 //
-// THE KEY DIFFERENCE from both siblings is the transcript. Claude lets the SDK
-// write the standard JSONL for us; codex persists a rollout we can discover.
-// opencode does NEITHER — it keeps conversation state server-side and writes no
-// transcript file our discovery can read. So this harness SELF-PERSISTS a
-// transcript in the EXACT Claude-projects JSONL shape, at the exact path
-// findTranscriptById() resolves, so lfg's existing Claude discovery + SSE live
-// stream read it unchanged with zero opencode-specific code on the read side.
+// THE KEY DIFFERENCE from both siblings is the transcript. opencode keeps
+// conversation state server-side, so this harness builds Claude-shaped message
+// envelopes and indexes their normalized rows directly into SQLite.
 //
-// Id model: we mint a deterministic transcript UUID up front and use it as BOTH
-// the control-plane KEY (registry/command file names) AND the transcript file
-// name — we own the file, so they can be the same id (unlike codex, where the
-// transcript id is assigned by the app-server after turn 1). opencode's own
-// resume sessionId is learned after turn 1 and stored in the registry's threadId
-// slot, used to resume the conversation on later turns. It is NOT surfaced as the
-// live-view id (that stays the transcript uuid we wrote).
-//
-// Interrupt is an AbortController on the current turn — staying purely on the AI
-// SDK surface (the provider aborts the in-flight request for us).
+// Id model: we mint a deterministic transcript/index UUID up front and use it as
+// the control-plane KEY (registry/command file names) and SQLite path key.
+// opencode's own session id (its resume handle) is created up front too and
+// stored in the registry's threadId slot.
 import {
   type AisdkCommand,
+  type AisdkPrompt,
   cmdPath,
   patchEntry,
-  readEntry,
   removeEntry,
   writeEntry,
 } from "../../aisdk-registry.ts";
+import { normalizeLineMessages } from "../../sessions.ts";
+import { indexSessionMessagesDirect } from "../../transcript-index.ts";
 import { makeDraftPublisher } from "./draft.ts";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+// Headless OpenCode can't show its TUI question picker. If the user never
+// answers via LFG, reject after this so the turn can't hang forever.
+const QUESTION_TIMEOUT_MS = 5 * 60 * 1000;
 
 function arg(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
 }
 
-// The provider's HTTP server is started by @opencode-ai/sdk via a bare
-// `opencode serve` (cross-spawn, inheriting PATH) — there is no option in the
-// installed types to pass a binary path. So we resolve the opencode binary
-// ourselves and prepend its directory to PATH before the provider spawns it.
-// Resolution order: LFG_OPENCODE_PATH override, then a PATH lookup, then this
-// repo's node_modules/.bin/opencode (the `opencode-ai` dep installs it there).
+// The SDK's server bootstrap spawns a bare `opencode` (inheriting PATH), with
+// no binary-path option — so resolve the binary ourselves and prepend its
+// directory to PATH first. Resolution order: LFG_OPENCODE_PATH override, then a
+// PATH lookup, then this repo's node_modules/.bin/opencode (the `opencode-ai`
+// dep installs it there).
 function resolveOpencodePath(): string | undefined {
   try {
     if (process.env.LFG_OPENCODE_PATH) return process.env.LFG_OPENCODE_PATH;
@@ -69,86 +75,127 @@ function resolveOpencodePath(): string | undefined {
   }
 }
 
-// Make a resolved opencode binary discoverable to the SDK's bare `opencode`
-// spawn by prepending its directory to PATH. No-op if we couldn't resolve one
-// (then we rely on whatever PATH the harness inherited).
 function ensureOpencodeOnPath(): void {
   const bin = resolveOpencodePath();
   if (!bin) return;
   const dir = bin.slice(0, Math.max(bin.lastIndexOf("/"), 0)) || ".";
-  const sep = ":";
   const cur = process.env.PATH ?? "";
-  if (!cur.split(sep).includes(dir)) process.env.PATH = dir + sep + cur;
+  if (!cur.split(":").includes(dir)) process.env.PATH = dir + ":" + cur;
 }
 
-export async function pipeToOpencodeAiSdk(
-  prompt: string,
-  log: (s: string) => void,
-  opts: { model?: string; cwd?: string } = {},
-): Promise<string> {
-  const model = opts.model ?? "opencode/big-pickle";
-  const cwd = opts.cwd ?? process.cwd();
-  ensureOpencodeOnPath();
-  const { streamText } = await import("ai");
-  const { createOpencode } = await import("ai-sdk-provider-opencode-sdk");
+// "anthropic/claude-sonnet-4-6" → { providerID, modelID }. No slash → let the
+// server pick its configured default model.
+function modelRef(model: string): { providerID: string; modelID: string } | undefined {
+  const i = model.indexOf("/");
+  if (i <= 0) return undefined;
+  return { providerID: model.slice(0, i), modelID: model.slice(i + 1) };
+}
 
-  log(`[runner] piping ${prompt.length} chars to opencode via ai-sdk (${model})`);
-  const provider = createOpencode({
-    autoStartServer: true,
-    defaultSettings: { directory: cwd },
-  });
+type OcPart = {
+  id?: string;
+  type?: string;
+  text?: string;
+  tool?: string;
+  state?: { input?: unknown; status?: string; output?: unknown; error?: string };
+  sessionID?: string;
+  messageID?: string;
+};
 
-  try {
-    const result = streamText({ model: provider(model), prompt });
-    let textBuf = "";
-    let lastEmit = 0;
-    const flush = (force = false) => {
-      const now = Date.now();
-      if (force || now - lastEmit > 800) {
-        lastEmit = now;
-        const k = textBuf.length >= 1000 ? `${(textBuf.length / 1000).toFixed(1)}k` : String(textBuf.length);
-        log(`[runner] opencode generating… ${k} chars`);
-      }
-    };
-    for await (const part of result.fullStream as any) {
-      if (part?.type === "text-delta") {
-        textBuf += String(part.text ?? part.textDelta ?? part.delta ?? "");
-        flush();
-      } else if (part?.type === "tool-call") {
-        log(`[runner] opencode running tool: ${part.toolName ?? "?"}`);
-      } else if (part?.type === "error") {
-        throw new Error(String((part as any).error).slice(0, 800));
-      }
+type OcQuestionOption = { label?: string; description?: string };
+type OcQuestionInfo = {
+  question?: string;
+  header?: string;
+  options?: OcQuestionOption[];
+};
+type OcPendingQuestion = {
+  id: string;
+  sessionID?: string;
+  questions: OcQuestionInfo[];
+};
+
+function partsToBlocks(parts: OcPart[]): { text: string; blocks: unknown[] } {
+  let text = "";
+  const blocks: unknown[] = [];
+  for (const p of parts) {
+    if (p?.type === "text" && typeof p.text === "string") {
+      text += (text ? "\n\n" : "") + p.text;
+    } else if (p?.type === "tool") {
+      blocks.push({ type: "tool_use", name: p.tool ?? "tool", input: p.state?.input ?? {} });
     }
-    const text = await result.text;
-    flush(true);
-    const out = (text || textBuf).trim();
-    if (!out) throw new Error("opencode ai-sdk backend produced empty result");
-    log(`[runner] opencode ai-sdk done (${out.length} chars)`);
-    return out;
-  } finally {
-    await provider.dispose?.().catch(() => {});
+  }
+  return { text, blocks };
+}
+
+async function ocFetchJson<T>(baseUrl: string, path: string, init?: RequestInit): Promise<T | null> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, init);
+    if (!res.ok) return null;
+    if (res.status === 204) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
   }
 }
 
-// ---- Self-persisted Claude-shaped transcript ----------------------------------
-// We replicate exactly what lfg's Claude discovery reads:
-//   path: ~/.claude/projects/<enc-cwd>/<uuid>.jsonl, enc-cwd = cwd with every
-//         "/" replaced by "-" (the same encoding candidateDirs() expects; and
-//         findTranscriptById scans every dir anyway, so the file is found).
-//   line envelope (copied from a real file under ~/.claude/projects/*/*.jsonl):
-//     user:      { parentUuid, type:"user", message:{ role:"user",
-//                  content:[{type:"text",text}] }, uuid, timestamp, cwd,
-//                  sessionId }
-//     assistant: { parentUuid, type:"assistant", message:{ role:"assistant",
-//                  model, content:[{type:"text",text}|{type:"tool_use",name,
-//                  input}] }, uuid, timestamp, cwd, sessionId }
-// These are exactly the fields normalizeLineMessages / lastUserText /
-// firstPromptTitle / lastAssistantModel parse — everything else Claude writes is
-// ignored by the reader, so we keep our envelope minimal but faithful.
-function transcriptPathFor(cwd: string, uuid: string): string {
-  const enc = cwd.replace(/\//g, "-");
-  return join(homedir(), ".claude", "projects", enc, `${uuid}.jsonl`);
+async function listPendingQuestions(baseUrl: string): Promise<OcPendingQuestion[]> {
+  const data = await ocFetchJson<OcPendingQuestion[]>(baseUrl, "/question");
+  return Array.isArray(data) ? data : [];
+}
+
+async function replyQuestion(
+  baseUrl: string,
+  requestId: string,
+  answers: string[][],
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/question/${encodeURIComponent(requestId)}/reply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function rejectQuestion(baseUrl: string, requestId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `${baseUrl.replace(/\/$/, "")}/question/${encodeURIComponent(requestId)}/reject`,
+      { method: "POST" },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** @internal exported for unit tests */
+export function pendingToPrompt(pending: OcPendingQuestion): AisdkPrompt | null {
+  const q = pending.questions?.[0];
+  const options = Array.isArray(q?.options) ? q.options : [];
+  if (!q || !options.length) return null;
+  return {
+    question: typeof q.question === "string" ? q.question : "OpenCode needs a choice",
+    header: typeof q.header === "string" ? q.header : undefined,
+    options: options.map((o, i) => ({
+      index: i,
+      label: typeof o?.label === "string" ? o.label : String(o ?? `Option ${i + 1}`),
+      selected: i === 0,
+      description: typeof o?.description === "string" ? o.description : undefined,
+    })),
+  };
+}
+
+/** @internal exported for unit tests */
+export function answersForIndex(pending: OcPendingQuestion, index: number): string[][] {
+  return (pending.questions ?? []).map((q, qi) => {
+    const opts = Array.isArray(q?.options) ? q.options : [];
+    const pick = opts[qi === 0 ? index : 0] ?? opts[0];
+    const label = typeof pick?.label === "string" ? pick.label : "";
+    return label ? [label] : [];
+  });
 }
 
 function latestOpencodeError(opencodeSessionId: string): string | null {
@@ -172,14 +219,97 @@ function latestOpencodeError(opencodeSessionId: string): string | null {
   return null;
 }
 
+function toolPartMessage(part: OcPart, fallbackId: string): ReturnType<typeof normalizeLineMessages>[number] {
+  const status = part.state?.status ? ` [${part.state.status}]` : "";
+  const input = part.state?.input == null
+    ? ""
+    : (() => {
+        try {
+          return JSON.stringify(part.state.input, null, 2);
+        } catch {
+          return String(part.state.input);
+        }
+      })();
+  const name = part.tool ?? "tool";
+  return {
+    id: part.id || fallbackId,
+    role: "assistant",
+    kind: "tool_use",
+    text: input ? `${name}${status}: ${input}` : `${name}${status}`,
+    ts: Date.now(),
+  };
+}
+
+// Auto runner has no human — reject any OpenCode question so the turn can't hang.
+async function autoRejectPendingQuestions(baseUrl: string, sessionId: string): Promise<void> {
+  const pending = (await listPendingQuestions(baseUrl)).filter(
+    (q) => !q.sessionID || q.sessionID === sessionId,
+  );
+  for (const q of pending) {
+    await rejectQuestion(baseUrl, q.id);
+  }
+}
+
+// One-shot headless run for the auto/report runner: own server, one session,
+// one blocking prompt.
+export async function pipeToOpencodeAiSdk(
+  prompt: string,
+  log: (s: string) => void,
+  opts: { model?: string; cwd?: string } = {},
+): Promise<string> {
+  const model = opts.model ?? "opencode/big-pickle";
+  const cwd = opts.cwd ?? process.cwd();
+  ensureOpencodeOnPath();
+  const { createOpencodeServer, createOpencodeClient } = await import("@opencode-ai/sdk");
+
+  log(`[runner] piping ${prompt.length} chars to opencode via opencode-sdk (${model})`);
+  const server = await createOpencodeServer({});
+  try {
+    const client = createOpencodeClient({ baseUrl: server.url });
+    const created = await client.session.create({ body: {}, query: { directory: cwd } });
+    if (created.error || !created.data?.id)
+      throw new Error(`opencode session.create failed: ${JSON.stringify(created.error).slice(0, 300)}`);
+    const ocId = created.data.id;
+    // Headless auto runs can't answer OpenCode questions — poll + reject while
+    // the blocking prompt is in flight so the turn can't hang forever.
+    const rejectTimer = setInterval(() => {
+      void autoRejectPendingQuestions(server.url, ocId);
+    }, 1000);
+    let res: { error?: unknown; data?: { parts?: OcPart[] } };
+    try {
+      res = (await client.session.prompt({
+        path: { id: ocId },
+        query: { directory: cwd },
+        body: {
+          ...(modelRef(model) ? { model: modelRef(model) } : {}),
+          parts: [{ type: "text", text: prompt }],
+        },
+      })) as { error?: unknown; data?: { parts?: OcPart[] } };
+    } finally {
+      clearInterval(rejectTimer);
+      await autoRejectPendingQuestions(server.url, ocId);
+    }
+    if (res.error)
+      throw new Error(`opencode prompt failed: ${JSON.stringify(res.error).slice(0, 500)}`);
+    const { text } = partsToBlocks((res.data?.parts ?? []) as OcPart[]);
+    if (!text.trim()) throw new Error("opencode sdk backend produced empty result");
+    log(`[runner] opencode sdk done (${text.length} chars)`);
+    return text.trim();
+  } finally {
+    server.close();
+  }
+}
+
 export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
-  // The control-plane key (a uuid) — names the registry/command files AND the
-  // transcript file (we own it, so they're one id).
+  // The control-plane key (a uuid) — names the registry/command files and the
+  // synthetic direct-index path.
   const keyArg = arg(argv, "--key");
   let model = arg(argv, "--model") ?? "anthropic/claude-sonnet-4-6";
   const cwd = arg(argv, "--cwd") ?? process.cwd();
   const tmuxName = arg(argv, "--tmux") ?? "";
-  // Everything after `--` is the initial prompt (mirrors the other harnesses).
+  // Resuming: opencode session ids persist server-side, so a relaunched harness
+  // can be handed one (registry threadId) and continue the conversation.
+  const resumeOcId = arg(argv, "--resume");
   const dashI = argv.indexOf("--");
   const initialPrompt = dashI >= 0 ? argv.slice(dashI + 1).join(" ").trim() : "";
 
@@ -194,38 +324,31 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
   } catch {}
 
   ensureOpencodeOnPath();
+  const { createOpencodeServer, createOpencodeClient } = await import("@opencode-ai/sdk");
 
-  const { streamText } = await import("ai");
-  // Lazy-import the provider so the rest of the CLI never hard-depends on it.
-  const { createOpencode } = await import("ai-sdk-provider-opencode-sdk");
+  // One server + client per harness, reused across every turn.
+  const server = await createOpencodeServer({});
+  const serverUrl = server.url;
+  const client = createOpencodeClient({ baseUrl: serverUrl });
 
-  // One provider per harness; it owns the auto-started `opencode serve` child,
-  // reused across every turn (and resume). directory scopes opencode's file
-  // operations to this session's cwd. (The settings expose `cwd` too but it's
-  // deprecated in favor of `directory`.)
-  const provider = createOpencode({
-    autoStartServer: true,
-    defaultSettings: { directory: cwd },
-  });
+  let parentUuid: string | null = null;
 
-  // The transcript we OWN — minted up front so the file path is known before the
-  // first turn and the live view can deep-link to it immediately.
-  const transcriptPath = transcriptPathFor(cwd, key);
-  try {
-    mkdirSync(join(transcriptPath, ".."), { recursive: true });
-  } catch {}
-  let parentUuid: string | null = null; // chain lines like Claude does
-
-  // Append one transcript line, tolerating any malformed input (a single bad
-  // turn must never crash the harness or corrupt the file).
-  function appendLine(obj: Record<string, unknown>): void {
+  function indexEnvelope(obj: Record<string, unknown>): void {
     try {
-      appendFileSync(transcriptPath, JSON.stringify(obj) + "\n");
+      const line = JSON.stringify(obj);
+      const now = Date.now();
+      const fallbackId = String(obj.uuid ?? crypto.randomUUID());
+      const messages = normalizeLineMessages(line).map((message, index) => ({
+        ...message,
+        id: message.id ?? (index === 0 ? fallbackId : `${fallbackId}#${index}`),
+        ts: message.ts ?? now,
+      }));
+      indexSessionMessagesDirect(key, messages);
     } catch {}
   }
   function writeUser(text: string): void {
     const uuid = crypto.randomUUID();
-    appendLine({
+    indexEnvelope({
       parentUuid,
       type: "user",
       message: { role: "user", content: [{ type: "text", text }] },
@@ -236,15 +359,13 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
     });
     parentUuid = uuid;
   }
-  // content is the assembled block list (text + any tool_use blocks).
   function writeAssistant(content: unknown[], apiError = false): void {
-    if (!content.length) return; // nothing to record (e.g. an empty/aborted turn)
+    if (!content.length) return;
     const uuid = crypto.randomUUID();
-    appendLine({
+    indexEnvelope({
       parentUuid,
       type: "assistant",
       ...(apiError ? { isApiErrorMessage: true } : {}),
-      // model lets lastAssistantModel() show the live model on the card.
       message: { role: "assistant", model, content },
       uuid,
       timestamp: new Date().toISOString(),
@@ -254,157 +375,299 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
     parentUuid = uuid;
   }
 
-  // Control-plane registry entry — the moment this exists (and our pid is alive),
-  // serve surfaces the session in the live view. threadId (opencode's resume id)
-  // starts null and is patched in after turn 1.
+  // opencode session — created UP FRONT (the old provider only revealed the id
+  // after turn 1), or adopted from --resume for a relaunched harness.
+  let ocSessionId: string | null = resumeOcId ?? null;
+  if (!ocSessionId) {
+    const created = await client.session.create({
+      body: { ...(initialPrompt ? { title: initialPrompt.slice(0, 72) } : {}) },
+      query: { directory: cwd },
+    });
+    if (created.error || !created.data?.id) {
+      console.error(
+        `opencode-aisdk-session: session.create failed: ${JSON.stringify(created.error).slice(0, 400)}`,
+      );
+      server.close();
+      process.exit(1);
+    }
+    ocSessionId = created.data.id;
+  }
+
+  // Control-plane registry entry — threadId (opencode's resume id) is known
+  // immediately now, so the live view never has to fall back.
   writeEntry({
     sessionId: key,
     agent: "opencode",
-    threadId: null,
+    threadId: ocSessionId,
     harnessPid: process.pid,
     tmuxName,
     cwd,
     model,
     busy: false,
+    prompt: null,
     title: initialPrompt ? initialPrompt.slice(0, 72) : null,
     createdAt: Date.now(),
   });
 
   const queue: string[] = [];
-  let sessionId: string | null = null; // opencode resume id, learned after turn 1
-  let currentAc: AbortController | null = null;
   let draining = false;
   let closing = false;
-  // Publish in-flight assistant text to the registry entry (keyed by the
-  // control-plane uuid) so the web live view animates the reply as it streams
-  // without persisting partial snapshots into the transcript.
+  let turnActive = false;
+  // True while OpenCode's `question` tool is waiting for a human answer.
+  // busy is cleared for this window so the UI shows "needs answer" instead of
+  // a permanent Working spinner; the underlying session.prompt() stays open.
+  let waitingOnQuestion = false;
+  // Ref object (not a bare let): TypeScript 7 narrows outer `let` bindings to
+  // `never` inside `for await` loops when they are only mutated from nested
+  // helpers, which broke openQuestionRef.current?.id. A mutable box keeps the type.
+  const openQuestionRef: { current: OcPendingQuestion | null } = { current: null };
+  let questionTimer: ReturnType<typeof setTimeout> | null = null;
   const publishDraft = makeDraftPublisher(key);
 
-  async function runTurn(prompt: string, signal: AbortSignal): Promise<void> {
-    // Record the user turn immediately so it surfaces in the live view even
-    // before the assistant replies.
-    writeUser(prompt);
-
-    // If we don't have an opencode resume id in memory yet (e.g. previous turn
-    // ended on a question before we captured metadata), try to hydrate from the
-    // on-disk registry entry (which may have been patched manually or by serve).
-    if (!sessionId) {
-      try {
-        const onDisk = readEntry(key);
-        if (onDisk?.threadId && typeof onDisk.threadId === "string") {
-          sessionId = onDisk.threadId;
-        }
-      } catch {}
+  function clearQuestionTimer(): void {
+    if (questionTimer) {
+      clearTimeout(questionTimer);
+      questionTimer = null;
     }
+  }
 
-    // First turn: no sessionId → the provider creates a fresh opencode session.
-    // Later turns: pass the captured sessionId to resume the same conversation.
-    // (sessionId lives in the MODEL settings, the 2nd arg — NOT providerOptions,
-    // which is where the codex provider wanted its threadId.)
-    const llm = sessionId ? provider(model, { sessionId }) : provider(model);
-
-    const result = streamText({
-      model: llm,
-      prompt,
-      abortSignal: signal,
+  function setWorkingBusy(): void {
+    if (closing) return;
+    waitingOnQuestion = false;
+    patchEntry(key, {
+      busy: true,
+      prompt: null,
     });
+  }
 
-    // Accumulate assistant output into Claude-shaped content blocks. Text is the
-    // priority; tool calls are recorded best-effort as tool_use blocks. Never
-    // throw out of the part loop on a malformed/unknown part.
-    let textBuf = "";
-    const toolBlocks: unknown[] = [];
+  function surfaceQuestion(pending: OcPendingQuestion): void {
+    if (closing || !turnActive) return;
+    if (pending.sessionID && pending.sessionID !== ocSessionId) return;
+    const prompt = pendingToPrompt(pending);
+    if (!prompt) return;
+    openQuestionRef.current = pending;
+    waitingOnQuestion = true;
+    clearQuestionTimer();
+    // Drop busy so the live view stops showing "Working"; publish the prompt
+    // so the session card can render option buttons.
+    patchEntry(key, {
+      busy: false,
+      prompt,
+      draftText: null,
+      draftUpdatedAt: null,
+    });
+    publishDraft("", true);
+    indexSessionMessagesDirect(key, [
+      {
+        id: pending.id,
+        role: "assistant",
+        kind: "tool_use",
+        text: `question: ${JSON.stringify({ questions: pending.questions }, null, 2)}`,
+        ts: Date.now(),
+      },
+    ]);
+    questionTimer = setTimeout(() => {
+      if (openQuestionRef.current?.id === pending.id) {
+        void handleDismissQuestion("timed out waiting for an answer");
+      }
+    }, QUESTION_TIMEOUT_MS);
+  }
 
+  function clearQuestionState(resumeBusy: boolean): void {
+    clearQuestionTimer();
+    openQuestionRef.current = null;
+    waitingOnQuestion = false;
+    if (closing) return;
+    patchEntry(key, {
+      prompt: null,
+      ...(resumeBusy && turnActive ? { busy: true } : {}),
+    });
+  }
+
+  async function handleAnswerQuestion(index: number): Promise<void> {
+    const pending = openQuestionRef.current;
+    if (!pending) return;
+    const answers = answersForIndex(pending, index);
+    const ok = await replyQuestion(serverUrl, pending.id, answers);
+    if (!ok) {
+      console.error(`opencode-aisdk-session: failed to reply to question ${pending.id}`);
+      return;
+    }
+    const label = answers[0]?.[0] ?? `option ${index}`;
+    indexSessionMessagesDirect(key, [
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        kind: "text",
+        text: `[answered OpenCode question] ${label}`,
+        ts: Date.now(),
+      },
+    ]);
+    clearQuestionState(true);
+  }
+
+  async function handleDismissQuestion(reason = "dismissed"): Promise<void> {
+    const pending = openQuestionRef.current;
+    if (!pending) return;
+    const ok = await rejectQuestion(serverUrl, pending.id);
+    if (!ok) {
+      console.error(`opencode-aisdk-session: failed to reject question ${pending.id}`);
+      // Still clear local state so the UI unsticks even if OpenCode already
+      // dropped the request (e.g. after interrupt).
+    }
+    indexSessionMessagesDirect(key, [
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        kind: "text",
+        text: `[skipped OpenCode question] ${reason}`,
+        ts: Date.now(),
+      },
+    ]);
+    clearQuestionState(true);
+  }
+
+  async function syncPendingQuestions(): Promise<void> {
+    if (!ocSessionId || closing) return;
+    const all = await listPendingQuestions(serverUrl);
+    const mine = all.filter((q) => !q.sessionID || q.sessionID === ocSessionId);
+    if (!mine.length) {
+      if (waitingOnQuestion) clearQuestionState(turnActive);
+      return;
+    }
+    // Prefer the newest request for this session.
+    const next = mine[mine.length - 1]!;
+    if (openQuestionRef.current?.id === next.id) return;
+    surfaceQuestion(next);
+  }
+
+  // Live draft + tool stream + question events. Cosmetically drives the live
+  // view; the turn result still comes from session.prompt() below.
+  void (async () => {
     try {
-      publishDraft("", true); // reset the animated draft at turn start
-      for await (const part of result.fullStream as any) {
-        try {
-          const t = part?.type;
-          if (t === "error") {
-            const errText = String((part as any).error);
-            // The opencode provider emits an "error" stream part for events it
-            // hasn't mapped yet — notably `question.asked` (the interactive
-            // question event, which this headless harness can't answer anyway).
-            if (/question\.asked|not yet mapped|question asked|asking/i.test(errText)) {
-              console.error(
-                `opencode-aisdk-session: ignoring unmapped stream event — ${errText.slice(0, 200)}`,
-              );
-              // Do not continue awaiting; finish the turn so we don't hang with busy=true.
-              // Any preceding text/tool output will be flushed below.
-              throw new Error("OPENCODE_QUESTION_ASKED");
-            } else {
-              throw new Error(errText.slice(0, 800));
-            }
-          } else if (t === "text-delta") {
-            // AI SDK streams text as `text-delta` parts; tolerate both current
-            // and older provider field names.
-            textBuf +=
-              (part as any).text ?? (part as any).textDelta ?? (part as any).delta ?? "";
-            publishDraft(textBuf);
-          } else if (t === "tool-call") {
-            // Flush whatever text preceded this tool so the live view shows the
-            // progress instead of jumping straight to the next phase.
-            publishDraft(textBuf, true);
-            const toolName = (part as any).toolName ?? (part as any).tool ?? "tool";
-            const input = (part as any).input ?? (part as any).args ?? {};
-            if (/^question$/i.test(String(toolName)) || (input && (input.questions || input.question))) {
-              toolBlocks.push({ type: "tool_use", name: "question", input });
-              // This is an interactive prompt from opencode (multiple choice etc).
-              // The stream will not advance until answered. Finish the turn now
-              // so the harness does not hang with busy=true forever.
-              throw new Error("OPENCODE_QUESTION_ASKED");
-            }
-            toolBlocks.push({ type: "tool_use", name: toolName, input });
+      const sub = await client.event.subscribe();
+      const stream = (sub as { stream?: AsyncIterable<unknown>; data?: AsyncIterable<unknown> }).stream ??
+        (sub as { data?: AsyncIterable<unknown> }).data;
+      if (!stream) return;
+      let draft = "";
+      // Track last published snapshot per tool part so status transitions
+      // (running → completed) re-index without spamming identical rows.
+      const toolPartSnapshots = new Map<string, string>();
+      for await (const raw of stream) {
+        if (closing) break;
+        const ev = raw as {
+          type?: string;
+          properties?: Record<string, unknown>;
+        };
+        const props = (ev?.properties ?? {}) as {
+          part?: OcPart & { sessionID?: string };
+          sessionID?: string;
+          id?: string;
+          questions?: OcQuestionInfo[];
+        };
+        const evSession = props.sessionID ?? props.part?.sessionID ?? null;
+
+        // OpenCode question events (v1 + v2 names).
+        if (
+          (ev?.type === "question.asked" || ev?.type === "question.v2.asked") &&
+          (!evSession || evSession === ocSessionId)
+        ) {
+          const id = props.id;
+          const questions = props.questions;
+          if (typeof id === "string" && Array.isArray(questions) && questions.length) {
+            surfaceQuestion({ id, sessionID: ocSessionId ?? undefined, questions });
+          } else {
+            void syncPendingQuestions();
           }
-        } catch (inner) {
-          // A single bad part shouldn't abort the whole turn — but a thrown
-          // `error` part is a real failure, so rethrow it to the outer catch.
-          if (inner instanceof Error && inner.message) throw inner;
+          continue;
+        }
+        if (
+          (ev?.type === "question.replied" ||
+            ev?.type === "question.rejected" ||
+            ev?.type === "question.v2.replied" ||
+            ev?.type === "question.v2.rejected") &&
+          (!evSession || evSession === ocSessionId)
+        ) {
+          const repliedId = typeof props.id === "string" ? props.id : null;
+          const openId = openQuestionRef.current?.id ?? null;
+          if (openId && (!repliedId || repliedId === openId)) {
+            clearQuestionState(turnActive);
+          }
+          continue;
+        }
+
+        if (!turnActive) continue;
+        const part = props.part;
+        if (ev?.type === "message.part.updated" && part?.sessionID === ocSessionId) {
+          if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
+            // Prefer the latest assistant text blob for the draft; reasoning
+            // only fills in when we don't have text yet.
+            if (part.type === "text") {
+              draft = part.text;
+              publishDraft(draft);
+            } else if (!draft && part.text) {
+              publishDraft(part.text);
+            }
+          } else if (part.type === "tool") {
+            const fallbackId = `${ocSessionId}:tool:${part.id ?? part.tool ?? "tool"}`;
+            const id = part.id || fallbackId;
+            const snap = `${part.tool ?? "tool"}|${part.state?.status ?? ""}|${JSON.stringify(part.state?.input ?? {})}`;
+            if (toolPartSnapshots.get(id) !== snap) {
+              toolPartSnapshots.set(id, snap);
+              indexSessionMessagesDirect(key, [toolPartMessage(part, fallbackId)]);
+            }
+            // If a question tool starts, reconcile from /question (events can
+            // lag behind the tool part).
+            if (part.tool === "question" && part.state?.status === "running") {
+              void syncPendingQuestions();
+            }
+          }
+        }
+        if (ev?.type === "session.idle" && (evSession == null || evSession === ocSessionId)) {
+          draft = "";
         }
       }
+    } catch {
+      // Event stream is best-effort; drafts just won't animate if it drops.
+    }
+  })();
 
-      // Opportunistic detection: opencode "asking" (with options) sometimes ends the
-      // stream without yielding an explicit "tool-call" for question or a matching
-      // error part (especially after tool uses in build mode). If the log shows a
-      // recent ask, treat it like the other cases so we don't hang.
-      try {
-        const logPath = join(homedir(), ".local", "share", "opencode", "log", "opencode.log");
-        const log = readFileSync(logPath, "utf8");
-        const recent = log.split("\n").slice(-50).join("\n");
-        if (/message=asking|questions=\d+/i.test(recent)) {
-          throw new Error("OPENCODE_QUESTION_ASKED");
-        }
-      } catch (e) {
-        if ((e as any)?.message === "OPENCODE_QUESTION_ASKED") throw e;
+  // Backup poll: catch questions if the SSE event was missed (common after
+  // reconnect / mid-turn subscribe). Cheap while a turn is active.
+  const questionPoll = setInterval(() => {
+    if (closing || !turnActive) return;
+    void syncPendingQuestions();
+  }, 1500);
+
+  async function runTurn(prompt: string): Promise<void> {
+    writeUser(prompt);
+    turnActive = true;
+    waitingOnQuestion = false;
+    openQuestionRef.current = null;
+    publishDraft("", true);
+    try {
+      const res = await client.session.prompt({
+        path: { id: ocSessionId! },
+        query: { directory: cwd },
+        body: {
+          ...(modelRef(model) ? { model: modelRef(model) } : {}),
+          parts: [{ type: "text", text: prompt }],
+        },
+      });
+      if (res.error) {
+        const msg = JSON.stringify(res.error).slice(0, 500);
+        console.error(`opencode-aisdk-session turn failed: ${msg}`);
+        writeAssistant([{ type: "text", text: `OpenCode turn failed for ${model}: ${msg}` }], true);
+        return;
       }
-
-      publishDraft(textBuf, true);
-      await result.text; // surfaces a failed generation
-
-      // Capture opencode's resume sessionId from the resolved metadata and pin
-      // it for resume on later turns. It is NOT a transcript id (we own the
-      // transcript), so it only ever feeds provider(model, { sessionId }).
-      let turnOpencodeSessionId: string | null = null;
-      try {
-        const meta = (await result.providerMetadata) as any;
-        const id = meta?.opencode?.sessionId;
-        if (typeof id === "string" && id) {
-          turnOpencodeSessionId = id;
-          if (!sessionId) {
-            sessionId = id;
-            patchEntry(key, { threadId: sessionId });
-          }
-        }
-      } catch {}
-
-      if (!textBuf.trim() && !toolBlocks.length) {
-        let logged: string | null = null;
-        if (turnOpencodeSessionId) {
-          for (let i = 0; i < 5 && !logged; i++) {
-            if (i) await new Promise((res) => setTimeout(res, 100));
-            logged = latestOpencodeError(turnOpencodeSessionId);
-          }
-        }
+      const { text, blocks } = partsToBlocks((res.data?.parts ?? []) as OcPart[]);
+      // Tools are already streamed into the index as they run — only commit the
+      // final assistant text here to avoid duplicate tool_use rows.
+      const content: unknown[] = [];
+      if (text.trim()) content.push({ type: "text", text });
+      else if (blocks.length) content.push(...blocks);
+      if (!content.length) {
+        const logged = latestOpencodeError(ocSessionId!);
         writeAssistant(
           [
             {
@@ -418,63 +681,20 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
         );
         return;
       }
+      writeAssistant(content);
     } catch (e) {
-      if (signal.aborted) {
-        // Interrupted on purpose — still persist whatever streamed so far.
-        // Best-effort: capture opencode sessionId for resume if available.
-        try {
-          const meta = (await result?.providerMetadata) as any;
-          const id = meta?.opencode?.sessionId;
-          if (typeof id === "string" && id && !sessionId) {
-            sessionId = id;
-            patchEntry(key, { threadId: sessionId });
-          }
-        } catch {}
-        flushAssistant(textBuf, toolBlocks);
-        return;
+      // session.abort() surfaces here as a failed/aborted request — if we're
+      // mid-interrupt that's expected; otherwise record the failure.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!closing) {
+        console.error(`opencode-aisdk-session turn failed: ${msg}`);
+        writeAssistant([{ type: "text", text: `OpenCode turn failed for ${model}: ${msg}` }], true);
       }
-      const message = e instanceof Error ? e.message : String(e);
-      if (message === "OPENCODE_QUESTION_ASKED") {
-        // opencode injected an interactive question tool (e.g. "how should I proceed?").
-        // Headless harness cannot answer; record what we have + a clear note and end turn.
-        // Capture sessionId if present so follow-ups can resume the same opencode thread.
-        try {
-          const meta = (await result?.providerMetadata) as any;
-          const id = meta?.opencode?.sessionId;
-          if (typeof id === "string" && id && !sessionId) {
-            sessionId = id;
-            patchEntry(key, { threadId: sessionId });
-          }
-        } catch {}
-        flushAssistant(textBuf, toolBlocks);
-        writeAssistant(
-          [
-            {
-              type: "text",
-              text: "OpenCode asked an interactive question during this turn (see transcript or opencode logs for the options). This headless session cannot answer; reply with your choice or restart the session to continue.",
-            },
-          ],
-          true,
-        );
-        return;
-      }
-      console.error(`opencode-aisdk-session turn failed: ${message}`);
-      flushAssistant(textBuf, toolBlocks);
-      writeAssistant(
-        [{ type: "text", text: `OpenCode turn failed for ${model}: ${message}` }],
-        true,
-      );
-      return;
+    } finally {
+      turnActive = false;
+      clearQuestionState(false);
+      publishDraft("", true);
     }
-    flushAssistant(textBuf, toolBlocks);
-  }
-
-  // Write the assistant turn: a text block (if any) followed by tool_use blocks.
-  function flushAssistant(text: string, toolBlocks: unknown[]): void {
-    const content: unknown[] = [];
-    if (text.trim()) content.push({ type: "text", text });
-    for (const b of toolBlocks) content.push(b);
-    writeAssistant(content);
   }
 
   async function drain(): Promise<void> {
@@ -483,13 +703,16 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
     try {
       while (queue.length && !closing) {
         const prompt = queue.shift()!;
-        currentAc = new AbortController();
-        patchEntry(key, { busy: true, draftText: null, draftUpdatedAt: null });
+        setWorkingBusy();
         try {
-          await runTurn(prompt, currentAc.signal);
+          await runTurn(prompt);
         } finally {
-          currentAc = null;
-          patchEntry(key, { busy: false, draftText: null, draftUpdatedAt: null });
+          patchEntry(key, {
+            busy: false,
+            draftText: null,
+            draftUpdatedAt: null,
+            prompt: null,
+          });
         }
       }
     } finally {
@@ -497,18 +720,29 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
     }
   }
 
+  function interrupt(): void {
+    if (!ocSessionId) return;
+    // Reject any open question first so abort doesn't leave a zombie /question
+    // entry (seen after the kimi-k3 hang).
+    if (openQuestionRef.current) {
+      void rejectQuestion(serverUrl, openQuestionRef.current.id);
+      clearQuestionState(false);
+    }
+    if (!turnActive) return;
+    void client.session
+      .abort({ path: { id: ocSessionId }, query: { directory: cwd } })
+      .catch(() => {});
+  }
+
   function shutdown(): void {
     closing = true;
-    currentAc?.abort();
+    clearInterval(questionPoll);
+    interrupt();
     removeEntry(key);
-    // Dispose the provider so the auto-started `opencode serve` child doesn't
-    // linger. (The installed types expose `dispose()`, not `close()`.)
-    void Promise.resolve()
-      .then(() => provider.dispose?.())
-      .catch(() => {})
-      // Give the registry write + provider dispose a tick, then exit so the
-      // tmux pane closes.
-      .finally(() => setTimeout(() => process.exit(0), 50));
+    try {
+      server.close();
+    } catch {}
+    setTimeout(() => process.exit(0), 50);
   }
 
   function dispatch(cmd: AisdkCommand): void {
@@ -523,8 +757,12 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
         model = next;
         patchEntry(key, { model });
       }
+    } else if (cmd.type === "answer") {
+      void handleAnswerQuestion(cmd.index);
+    } else if (cmd.type === "dismiss") {
+      void handleDismissQuestion("dismissed");
     } else if (cmd.type === "interrupt") {
-      currentAc?.abort();
+      interrupt();
     } else if (cmd.type === "close") {
       shutdown();
     }
@@ -534,6 +772,10 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
   // harnesses (simple + reliable across filesystems; 250ms is interactive).
   const cmdFile = cmdPath(key);
   let cmdOffset = 0;
+  // Start tailing from the CURRENT end of the command file. Commands before
+  // this process started belong to a previous harness incarnation — replaying
+  // them on restart would re-send every historical message as a new turn.
+  try { cmdOffset = statSync(cmdFile).size; } catch {}
   const poll = setInterval(() => {
     let raw = "";
     try {
@@ -566,7 +808,9 @@ export async function cmdOpencodeAisdkSession(argv: string[]): Promise<void> {
     const exitWatch = setInterval(() => {
       if (closing) {
         clearInterval(poll);
+        clearInterval(questionPoll);
         clearInterval(exitWatch);
+        clearQuestionTimer();
         resolve();
       }
     }, 100);

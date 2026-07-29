@@ -17,9 +17,47 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { useCallback, useRef, useState } from "react";
-import { Conversation } from "@elevenlabs/client";
+import { Conversation, VoiceConversation } from "@elevenlabs/client";
 
 export type ElevenStatus = "idle" | "connecting" | "connected" | "error";
+
+// ── Defensive shim for an @elevenlabs/client bug ─────────────────────────────
+// The SDK's BaseConversation.handleErrorEvent() blindly reads
+// `event.error_event.error_type` (and .message/.code/.details off the same
+// object). When the ElevenLabs server sends an `error`-type frame without an
+// `error_event` payload (seen in the wild on certain WebRTC session failures),
+// that read throws "undefined is not an object (evaluating
+// 'e.error_event.error_type')" *inside* the SDK's async onMessage handler —
+// which surfaces as an uncaught unhandledrejection that crashes the live view.
+//
+// The handler is inherited from BaseConversation, shared by both the voice and
+// text conversation classes, so we patch it once on the shared prototype:
+// normalise the frame so `error_event` is always an object before the SDK
+// touches it. Missing fields then read as `undefined` and the error is reported
+// through the normal onError path (as "Server error: Unknown error") instead of
+// throwing. Idempotent + guarded so a hot-reload can't double-wrap it.
+{
+  const baseProto = Object.getPrototypeOf(VoiceConversation.prototype) as {
+    handleErrorEvent?: (event: unknown) => void;
+    __lfgErrorEventGuard?: boolean;
+  } | null;
+  if (
+    baseProto &&
+    typeof baseProto.handleErrorEvent === "function" &&
+    !baseProto.__lfgErrorEventGuard
+  ) {
+    const original = baseProto.handleErrorEvent;
+    baseProto.handleErrorEvent = function (event: unknown) {
+      const e = (event ?? {}) as { error_event?: unknown };
+      const safe =
+        e.error_event && typeof e.error_event === "object"
+          ? e
+          : { ...e, error_event: {} };
+      return original.call(this, safe);
+    };
+    baseProto.__lfgErrorEventGuard = true;
+  }
+}
 
 export type ElevenHandle = Awaited<ReturnType<typeof Conversation.startSession>>;
 
