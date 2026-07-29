@@ -18,7 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
-import { ArrowUp, AudioLines, Mic, MicOff, Square, Volume2, VolumeX, X } from "lucide-react";
+import { ArrowUp, AudioLines, Mic, MicOff, Paperclip, Square, Volume2, VolumeX, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
 import { VoiceMeter } from "./components/voice-meter";
@@ -51,7 +51,13 @@ type LogEntry = {
   id?: string;
   ok?: boolean;
   tool?: ToolDetail; // set on tool rows → expandable input/result preview
+  images?: string[]; // data: URLs shown as thumbnails on a "you" turn
 };
+
+// An image the user has attached to the composer (inline data: URL — hosted
+// models take images as base64 parts, so no upload round-trip needed).
+type Attachment = { id: string; name: string; dataUrl: string };
+const MAX_ATTACHMENTS = 6;
 
 // Friendly one-line label for a tool call — "Created project “X”", not raw
 // JSON args (Sam, 2026-07-22: tool calls looked like "a whole bunch of random
@@ -122,6 +128,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const [sending, setSending] = useState(false);
   const [cfg, setCfg] = useState<ChatConfig | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // review-step state
   const [title, setTitle] = useState("");
@@ -142,6 +151,15 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const append = (role: LogEntry["role"], text: string, ok?: boolean) =>
     setLog((l) => {
       const next = [...l.slice(-60), { role, text, ok }];
+      logRef.current = next;
+      return next;
+    });
+
+  const appendUser = (text: string, images?: string[]) =>
+    setLog((l) => {
+      const entry: LogEntry = { role: "you", text };
+      if (images && images.length) entry.images = images;
+      const next = [...l.slice(-60), entry];
       logRef.current = next;
       return next;
     });
@@ -175,6 +193,33 @@ export function Converse({ onClose }: { onClose: () => void }) {
       logRef.current = next;
       return next;
     });
+  // ---- image attachments (typed chat) ----
+  function readAsDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result));
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+  }
+  async function addFiles(files: FileList | File[] | null) {
+    if (!files) return;
+    const imgs = Array.from(files).filter((f) => f.type.startsWith("image/"));
+    if (!imgs.length) return;
+    const room = MAX_ATTACHMENTS - attachments.length;
+    const picked = imgs.slice(0, Math.max(0, room));
+    const next: Attachment[] = [];
+    for (const f of picked) {
+      try {
+        next.push({ id: `${f.name}-${f.size}-${next.length}`, name: f.name, dataUrl: await readAsDataUrl(f) });
+      } catch {
+        /* skip unreadable file */
+      }
+    }
+    if (next.length) setAttachments((a) => [...a, ...next].slice(0, MAX_ATTACHMENTS));
+  }
+  const removeAttachment = (id: string) => setAttachments((a) => a.filter((x) => x.id !== id));
+
   // running transcript per realtime item while its deltas stream in
   const rtTextRef = useRef<Record<string, string>>({});
   // timers that clear an unresolved "…" user placeholder (see handleEvent)
@@ -310,15 +355,26 @@ export function Converse({ onClose }: { onClose: () => void }) {
   // dictation stop-&-send path can use it.
   async function sendChatText(raw: string) {
     const text = raw.trim();
-    if (!text || sending) return;
+    const atts = attachments;
+    if ((!text && atts.length === 0) || sending) return;
     if (!startedAtRef.current) startedAtRef.current = Date.now();
+    // Outgoing content: a plain string when there are no images, else a text +
+    // image_url parts array the hosted model reads directly (base64 data URLs).
+    const userContent =
+      atts.length > 0
+        ? [
+            ...(text ? [{ type: "text" as const, text }] : []),
+            ...atts.map((a) => ({ type: "image_url" as const, image_url: { url: a.dataUrl } })),
+          ]
+        : text;
     const messages = [
       ...threadTurns().map((e) => ({ role: e.role === "you" ? "user" : "assistant", content: e.text })),
-      { role: "user", content: text },
+      { role: "user", content: userContent },
     ];
-    append("you", text);
+    appendUser(text, atts.map((a) => a.dataUrl));
+    setAttachments([]);
     ensureSessionId();
-    logEvent("chat_user", { text });
+    logEvent("chat_user", { text, images: atts.length });
     setInput("");
     setSending(true);
     setError(null);
@@ -845,11 +901,22 @@ export function Converse({ onClose }: { onClose: () => void }) {
                     transcribing…
                   </div>
                 ) : (
-                  <div
-                    key={i}
-                    className="msg-text markdown user-bubble ml-auto w-fit max-w-[85%] whitespace-pre-wrap text-base"
-                  >
-                    {e.text}
+                  <div key={i} className="ml-auto flex w-fit max-w-[85%] flex-col items-end gap-1">
+                    {e.images && e.images.length > 0 && (
+                      <div className="flex flex-wrap justify-end gap-1">
+                        {e.images.map((src, k) => (
+                          <img
+                            key={k}
+                            src={src}
+                            alt="attachment"
+                            className="max-h-40 rounded-lg border border-border object-cover"
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {e.text && (
+                      <div className="msg-text markdown user-bubble whitespace-pre-wrap text-base">{e.text}</div>
+                    )}
                   </div>
                 )
               ) : e.role === "assistant" ? (
@@ -938,19 +1005,84 @@ export function Converse({ onClose }: { onClose: () => void }) {
           <WaveformRecorderRow rec={dict} />
         </div>
       ) : (
-        <form
-          className="flex items-end gap-2 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void sendChatText(input);
-          }}
-        >
+        <div className="border-t border-border bg-background">
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pt-2">
+              {attachments.map((a) => (
+                <div key={a.id} className="relative">
+                  <img
+                    src={a.dataUrl}
+                    alt={a.name}
+                    className="size-16 rounded-lg border border-border object-cover"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => removeAttachment(a.id)}
+                    className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-sm hover:text-foreground"
+                    aria-label={`Remove ${a.name}`}
+                  >
+                    <X className="size-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <form
+            className={`flex items-end gap-2 px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] ${
+              dragging ? "rounded-2xl ring-2 ring-primary/50" : ""
+            }`}
+            onSubmit={(e) => {
+              e.preventDefault();
+              void sendChatText(input);
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              if (!dragging) setDragging(true);
+            }}
+            onDragLeave={(e) => {
+              e.preventDefault();
+              setDragging(false);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragging(false);
+              void addFiles(e.dataTransfer?.files ?? null);
+            }}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void addFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={sending || attachments.length >= MAX_ATTACHMENTS}
+              aria-label="Attach image"
+              title="Attach an image"
+            >
+              <Paperclip className="size-5 md:size-4" />
+            </button>
           <textarea
             ref={inputRef}
             rows={1}
             className="lfg-gfield max-h-[40vh] min-h-11 min-w-0 flex-1 resize-none overflow-y-auto rounded-2xl border-transparent px-4 py-2.5 text-base leading-6 shadow-sm placeholder:text-muted-foreground"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onPaste={(e) => {
+              const files = e.clipboardData?.files;
+              if (files && Array.from(files).some((f) => f.type.startsWith("image/"))) {
+                e.preventDefault();
+                void addFiles(files);
+              }
+            }}
             onKeyDown={(e) => {
               // Enter sends; Shift+Enter (or ⌘/Ctrl+Enter) inserts a newline.
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
@@ -973,8 +1105,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
               <Mic className="size-5 md:size-4" />
             </button>
           )}
-          {/* Morphing button: ◉ voice when the box is empty, ↑ send when there's text. */}
-          {hasText ? (
+          {/* Morphing button: ◉ voice when empty, ↑ send when there's text or an image. */}
+          {hasText || attachments.length > 0 ? (
             <button
               type="submit"
               className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
@@ -998,7 +1130,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
               <AudioLines className="size-5 md:size-4" />
             </button>
           )}
-        </form>
+          </form>
+        </div>
       )}
     </div>
   );

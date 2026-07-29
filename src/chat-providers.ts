@@ -21,7 +21,13 @@ import { CHAT_INSTRUCTIONS } from "./converse-persona.ts";
 
 // ------------------------------------------------------------ types
 
-export type ChatTurnMessage = { role: "user" | "assistant"; content: string };
+// Multimodal content: a plain string, or an array of parts (text + inline images
+// as data: URLs). Hosted chat models take images as image_url parts — unlike the
+// coding-agent chat, which passes a local file PATH the agent reads off disk.
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+export type ChatTurnMessage = { role: "user" | "assistant"; content: string | ChatContentPart[] };
 export type ChatSettings = { provider: string; model: string };
 
 type RunTurnOpts = {
@@ -251,10 +257,19 @@ export async function runChatTurn(repoCwd: string, messages: ChatTurnMessage[]):
   if (!Array.isArray(messages) || messages.length === 0) return err(400, "expected { messages: [...] }");
   const clean: ChatTurnMessage[] = [];
   for (const m of messages) {
-    if ((m?.role !== "user" && m?.role !== "assistant") || typeof m?.content !== "string") {
-      return err(400, "each message needs role user|assistant and string content");
+    if (m?.role !== "user" && m?.role !== "assistant") {
+      return err(400, "each message needs role user|assistant");
     }
-    if (m.content.trim()) clean.push({ role: m.role, content: m.content });
+    const c = m.content;
+    if (typeof c === "string") {
+      if (c.trim()) clean.push({ role: m.role, content: c });
+    } else if (Array.isArray(c)) {
+      const hasText = c.some((p) => p?.type === "text" && p.text?.trim());
+      const hasImage = c.some((p) => p?.type === "image_url" && p.image_url?.url);
+      if (hasText || hasImage) clean.push({ role: m.role, content: c });
+    } else {
+      return err(400, "message content must be a string or a content-part array");
+    }
   }
   if (clean.length === 0 || clean[clean.length - 1].role !== "user") {
     return err(400, "last message must be a non-empty user turn");
