@@ -154,6 +154,42 @@ function safeLogId(id: string): string {
 }
 
 /**
+ * POST /api/voice/rt/upload-file?filename=… — proxy a non-image attachment (PDF,
+ * doc, etc.) to the OpenAI Files API (purpose=user_data) so the typed chat can
+ * reference it by file_id. The raw file is the request body; the OPENAI_API_KEY
+ * never reaches the browser. Returns { file_id, filename }. (Images don't come
+ * here — they go inline as base64 image_url parts. See converse.tsx.)
+ */
+export async function handleFileUpload(req: Request): Promise<Response> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return err(503, "OPENAI_API_KEY not set on the server");
+  const filename = new URL(req.url).searchParams.get("filename") || "upload";
+  const type = req.headers.get("content-type") || "application/octet-stream";
+  const bytes = await req.arrayBuffer();
+  if (bytes.byteLength === 0) return err(400, "empty file");
+  if (bytes.byteLength > 32 * 1024 * 1024) return err(413, "file too large (max 32 MB)");
+  try {
+    const fd = new FormData();
+    fd.append("purpose", "user_data");
+    fd.append("file", new Blob([bytes], { type }), filename);
+    const res = await fetch("https://api.openai.com/v1/files", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: fd,
+    });
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => "")).slice(0, 300);
+      return err(res.status, `files upload ${res.status}: ${detail}`);
+    }
+    const data = (await res.json()) as { id?: string };
+    if (!data.id) return err(502, "files upload returned no id");
+    return json({ ok: true, file_id: data.id, filename });
+  } catch (e) {
+    return err(502, `file upload failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
  * POST /api/voice/rt/log — append a batch of realtime events to this session's
  * debug log. The browser holds the WebRTC connection directly to OpenAI, so the
  * server never sees the transcript/turn events otherwise; the client streams them

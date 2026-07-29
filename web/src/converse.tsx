@@ -18,7 +18,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { marked } from "marked";
-import { ArrowUp, AudioLines, Mic, MicOff, Paperclip, Square, Volume2, VolumeX, X } from "lucide-react";
+import { ArrowUp, AudioLines, File as FileIcon, Mic, MicOff, Paperclip, Square, Volume2, VolumeX, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
 import { VoiceMeter } from "./components/voice-meter";
@@ -52,11 +52,20 @@ type LogEntry = {
   ok?: boolean;
   tool?: ToolDetail; // set on tool rows → expandable input/result preview
   images?: string[]; // data: URLs shown as thumbnails on a "you" turn
+  files?: string[]; // attached non-image file names shown as chips on a "you" turn
 };
 
-// An image the user has attached to the composer (inline data: URL — hosted
-// models take images as base64 parts, so no upload round-trip needed).
-type Attachment = { id: string; name: string; dataUrl: string };
+// Something the user attached to the composer. Images go inline as base64
+// (dataUrl); other files (PDF/doc) upload to the OpenAI Files API and carry a
+// fileId once the upload finishes.
+type Attachment = {
+  id: string;
+  name: string;
+  kind: "image" | "file";
+  dataUrl?: string; // images
+  fileId?: string; // files, once uploaded
+  status: "ready" | "uploading" | "failed";
+};
 const MAX_ATTACHMENTS = 6;
 
 // Friendly one-line label for a tool call — "Created project “X”", not raw
@@ -155,10 +164,11 @@ export function Converse({ onClose }: { onClose: () => void }) {
       return next;
     });
 
-  const appendUser = (text: string, images?: string[]) =>
+  const appendUser = (text: string, images?: string[], files?: string[]) =>
     setLog((l) => {
       const entry: LogEntry = { role: "you", text };
       if (images && images.length) entry.images = images;
+      if (files && files.length) entry.files = files;
       const next = [...l.slice(-60), entry];
       logRef.current = next;
       return next;
@@ -202,21 +212,45 @@ export function Converse({ onClose }: { onClose: () => void }) {
       r.readAsDataURL(file);
     });
   }
+  async function uploadFile(id: string, f: File) {
+    try {
+      const res = await fetch(`/api/voice/rt/upload-file?filename=${encodeURIComponent(f.name)}`, {
+        method: "POST",
+        headers: { "Content-Type": f.type || "application/octet-stream" },
+        body: f,
+      });
+      if (!res.ok) throw new Error((await res.text()).slice(0, 200));
+      const j = (await res.json()) as { file_id: string };
+      setAttachments((a) => a.map((x) => (x.id === id ? { ...x, fileId: j.file_id, status: "ready" } : x)));
+    } catch {
+      setAttachments((a) => a.map((x) => (x.id === id ? { ...x, status: "failed" } : x)));
+    }
+  }
   async function addFiles(files: FileList | File[] | null) {
     if (!files) return;
-    const imgs = Array.from(files).filter((f) => f.type.startsWith("image/"));
-    if (!imgs.length) return;
-    const room = MAX_ATTACHMENTS - attachments.length;
-    const picked = imgs.slice(0, Math.max(0, room));
-    const next: Attachment[] = [];
-    for (const f of picked) {
-      try {
-        next.push({ id: `${f.name}-${f.size}-${next.length}`, name: f.name, dataUrl: await readAsDataUrl(f) });
-      } catch {
-        /* skip unreadable file */
+    const arr = Array.from(files);
+    if (!arr.length) return;
+    const room = Math.max(0, MAX_ATTACHMENTS - attachments.length);
+    for (const f of arr.slice(0, room)) {
+      const id = `${f.name}-${f.size}-${Math.random().toString(36).slice(2, 7)}`;
+      if (f.type.startsWith("image/")) {
+        // images ride inline as base64 — no upload needed
+        try {
+          const dataUrl = await readAsDataUrl(f);
+          setAttachments((a) =>
+            a.length >= MAX_ATTACHMENTS ? a : [...a, { id, name: f.name, kind: "image", dataUrl, status: "ready" }],
+          );
+        } catch {
+          /* skip unreadable image */
+        }
+      } else {
+        // other files → upload to the Files API, reference by file_id
+        setAttachments((a) =>
+          a.length >= MAX_ATTACHMENTS ? a : [...a, { id, name: f.name, kind: "file", status: "uploading" }],
+        );
+        void uploadFile(id, f);
       }
     }
-    if (next.length) setAttachments((a) => [...a, ...next].slice(0, MAX_ATTACHMENTS));
   }
   const removeAttachment = (id: string) => setAttachments((a) => a.filter((x) => x.id !== id));
 
@@ -355,26 +389,36 @@ export function Converse({ onClose }: { onClose: () => void }) {
   // dictation stop-&-send path can use it.
   async function sendChatText(raw: string) {
     const text = raw.trim();
-    const atts = attachments;
-    if ((!text && atts.length === 0) || sending) return;
+    // Only send attachments that finished (drop still-uploading / failed ones).
+    const atts = attachments.filter((a) => a.status === "ready");
+    if ((!text && atts.length === 0) || sending || attachments.some((a) => a.status === "uploading")) return;
     if (!startedAtRef.current) startedAtRef.current = Date.now();
-    // Outgoing content: a plain string when there are no images, else a text +
-    // image_url parts array the hosted model reads directly (base64 data URLs).
-    const userContent =
-      atts.length > 0
-        ? [
-            ...(text ? [{ type: "text" as const, text }] : []),
-            ...atts.map((a) => ({ type: "image_url" as const, image_url: { url: a.dataUrl } })),
-          ]
-        : text;
+    // Outgoing content: a plain string when nothing's attached, else text + parts
+    // (images as inline base64 image_url; files as Files-API file_id references).
+    type Part =
+      | { type: "text"; text: string }
+      | { type: "image_url"; image_url: { url: string } }
+      | { type: "file"; file: { file_id: string } };
+    const parts: Part[] = [];
+    if (text) parts.push({ type: "text", text });
+    for (const a of atts) {
+      if (a.kind === "image" && a.dataUrl) parts.push({ type: "image_url", image_url: { url: a.dataUrl } });
+      else if (a.kind === "file" && a.fileId) parts.push({ type: "file", file: { file_id: a.fileId } });
+    }
+    const hasAttParts = parts.some((p) => p.type !== "text");
+    const userContent: string | Part[] = hasAttParts ? parts : text;
     const messages = [
       ...threadTurns().map((e) => ({ role: e.role === "you" ? "user" : "assistant", content: e.text })),
       { role: "user", content: userContent },
     ];
-    appendUser(text, atts.map((a) => a.dataUrl));
+    appendUser(
+      text,
+      atts.filter((a) => a.kind === "image" && a.dataUrl).map((a) => a.dataUrl as string),
+      atts.filter((a) => a.kind === "file").map((a) => a.name),
+    );
     setAttachments([]);
     ensureSessionId();
-    logEvent("chat_user", { text, images: atts.length });
+    logEvent("chat_user", { text, images: atts.filter((a) => a.kind === "image").length, files: atts.filter((a) => a.kind === "file").length });
     setInput("");
     setSending(true);
     setError(null);
@@ -812,6 +856,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const activeProvider = cfg?.providers.find((p) => p.id === cfg.settings.provider);
   const modelChip = cfg ? `${activeProvider?.label ?? cfg.settings.provider} · ${cfg.settings.model}` : null;
   const hasText = !!input.trim();
+  const uploading = attachments.some((a) => a.status === "uploading");
 
   return (
     <div className="fixed inset-0 z-[1000] flex flex-col bg-background text-foreground">
@@ -914,6 +959,19 @@ export function Converse({ onClose }: { onClose: () => void }) {
                         ))}
                       </div>
                     )}
+                    {e.files && e.files.length > 0 && (
+                      <div className="flex flex-wrap justify-end gap-1">
+                        {e.files.map((name, k) => (
+                          <span
+                            key={k}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground"
+                          >
+                            <FileIcon className="size-3.5 shrink-0" />
+                            <span className="max-w-[12rem] truncate">{name}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     {e.text && (
                       <div className="msg-text markdown user-bubble whitespace-pre-wrap text-base">{e.text}</div>
                     )}
@@ -1010,11 +1068,29 @@ export function Converse({ onClose }: { onClose: () => void }) {
             <div className="flex flex-wrap gap-2 px-3 pt-2">
               {attachments.map((a) => (
                 <div key={a.id} className="relative">
-                  <img
-                    src={a.dataUrl}
-                    alt={a.name}
-                    className="size-16 rounded-lg border border-border object-cover"
-                  />
+                  {a.kind === "image" ? (
+                    <img
+                      src={a.dataUrl}
+                      alt={a.name}
+                      className="size-16 rounded-lg border border-border object-cover"
+                    />
+                  ) : (
+                    <div
+                      className={`flex h-16 max-w-[10rem] items-center gap-2 rounded-lg border px-3 text-xs ${
+                        a.status === "failed"
+                          ? "border-destructive/40 bg-destructive/10 text-destructive"
+                          : "border-border bg-muted/40 text-muted-foreground"
+                      }`}
+                    >
+                      <FileIcon className="size-4 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="truncate">{a.name}</div>
+                        <div className="text-[10px] opacity-70">
+                          {a.status === "uploading" ? "uploading…" : a.status === "failed" ? "failed" : "ready"}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   <button
                     type="button"
                     onClick={() => removeAttachment(a.id)}
@@ -1052,7 +1128,6 @@ export function Converse({ onClose }: { onClose: () => void }) {
             <input
               ref={fileInputRef}
               type="file"
-              accept="image/*"
               multiple
               className="hidden"
               onChange={(e) => {
@@ -1065,8 +1140,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
               className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
               onClick={() => fileInputRef.current?.click()}
               disabled={sending || attachments.length >= MAX_ATTACHMENTS}
-              aria-label="Attach image"
-              title="Attach an image"
+              aria-label="Attach a file or image"
+              title="Attach a file or image (PDF, doc, image…)"
             >
               <Paperclip className="size-5 md:size-4" />
             </button>
@@ -1110,7 +1185,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
             <button
               type="submit"
               className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
-              disabled={sending}
+              disabled={sending || uploading}
+              title={uploading ? "Waiting for upload…" : "Send"}
               aria-label="Send"
             >
               <ArrowUp className="size-5 md:size-4" />

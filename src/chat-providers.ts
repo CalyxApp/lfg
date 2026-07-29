@@ -26,7 +26,8 @@ import { CHAT_INSTRUCTIONS } from "./converse-persona.ts";
 // coding-agent chat, which passes a local file PATH the agent reads off disk.
 export type ChatContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string } };
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "file"; file: { file_id: string } }; // a PDF/doc uploaded via the Files API
 export type ChatTurnMessage = { role: "user" | "assistant"; content: string | ChatContentPart[] };
 export type ChatSettings = { provider: string; model: string };
 
@@ -266,7 +267,8 @@ export async function runChatTurn(repoCwd: string, messages: ChatTurnMessage[]):
     } else if (Array.isArray(c)) {
       const hasText = c.some((p) => p?.type === "text" && p.text?.trim());
       const hasImage = c.some((p) => p?.type === "image_url" && p.image_url?.url);
-      if (hasText || hasImage) clean.push({ role: m.role, content: c });
+      const hasFile = c.some((p) => p?.type === "file" && p.file?.file_id);
+      if (hasText || hasImage || hasFile) clean.push({ role: m.role, content: c });
     } else {
       return err(400, "message content must be a string or a content-part array");
     }

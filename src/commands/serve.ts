@@ -327,7 +327,7 @@ import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
-import { handleRtToken, runRtTool, saveConversation, handleRtLog } from "../voice-rt.ts";
+import { handleRtToken, runRtTool, saveConversation, handleRtLog, handleFileUpload } from "../voice-rt.ts";
 import {
   getChatSettings,
   setChatSettings,
@@ -1643,6 +1643,11 @@ export async function cmdServe() {
       // every Converse call is recorded for debugging. See voice-rt.ts.
       if (path === "/api/voice/rt/log" && req.method === "POST") {
         return handleRtLog(req);
+      }
+      // Proxy a non-image attachment to the OpenAI Files API (purpose=user_data);
+      // the typed chat then references the returned file_id. See voice-rt.ts.
+      if (path === "/api/voice/rt/upload-file" && req.method === "POST") {
+        return handleFileUpload(req);
       }
       {
         const m = path.match(/^\/api\/voice\/rt\/tools\/([a-z0-9_]+)$/);
