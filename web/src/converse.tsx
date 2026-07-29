@@ -21,6 +21,7 @@ import { marked } from "marked";
 import { ArrowUp, AudioLines, Mic, MicOff, Square, Volume2, VolumeX, X } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
+import { VoiceMeter } from "./components/voice-meter";
 import {
   primeAudio,
   playReady,
@@ -617,10 +618,14 @@ export function Converse({ onClose }: { onClose: () => void }) {
     return `## Transcript\n\n${body}\n`;
   }
 
-  // Close the surface → tear down voice if live, then the save-review step
-  // (unless nothing was said, in which case just close).
-  function closeSurface() {
+  // Close the surface → tear down voice if live, AUTO-SAVE the conversation to the
+  // vault (no manual review step — Sam 2026-07-29: "just automatically save it
+  // somewhere so I can revisit these"), then close. Best-effort: we still close if
+  // the save fails (the raw per-session debug log under data/converse-logs is the
+  // backstop). Every conversation with real turns is kept.
+  async function closeSurface() {
     if (mode === "voice") setMode("chat"); // effect cleanup tears the session down
+    flushLog();
     if (threadTurns().length === 0) {
       onClose();
       return;
@@ -633,14 +638,23 @@ export function Converse({ onClose }: { onClose: () => void }) {
       ...(cfg ? [`${cfg.settings.provider}/${cfg.settings.model}`] : []),
       ...(usedVoiceRef.current ? [MODEL] : []),
     ];
-    setTitle(firstUser ? firstUser.slice(0, 60) : `Voice note ${dateStr}`);
-    setTags([]);
-    setProperties([
-      { key: "date", value: dateStr },
-      { key: "duration", value: formatDuration(durMs) },
-      { key: "model", value: models.join(" + ") || MODEL },
-    ]);
-    setPhase("review");
+    const noteTitle = firstUser ? firstUser.slice(0, 60) : `Voice note ${dateStr}`;
+    const noteProps = {
+      date: dateStr,
+      duration: formatDuration(durMs),
+      model: models.join(" + ") || MODEL,
+    };
+    try {
+      await fetch("/api/voice/rt/save-conversation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: noteTitle, tags: [], properties: noteProps, transcript: buildTranscript() }),
+        keepalive: true,
+      });
+    } catch {
+      /* raw debug log is the backstop */
+    }
+    onClose();
   }
 
   async function handleSave() {
@@ -809,7 +823,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
                     className="ml-auto w-fit max-w-[85%] text-sm italic text-muted-foreground"
                     aria-live="polite"
                   >
-                    🎤 transcribing…
+                    transcribing…
                   </div>
                 ) : (
                   <div
@@ -852,6 +866,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
       {mode === "voice" ? (
         <div className="flex items-center justify-center gap-3 border-t border-border px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          {voiceStatus === "live" && <VoiceMeter stream={micRef.current} active={voiceStatus === "live"} />}
           <span className="text-sm text-muted-foreground">
             {voiceStatus === "live"
               ? muted
