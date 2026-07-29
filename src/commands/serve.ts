@@ -316,7 +316,7 @@ import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
-import { handleRtToken, runRtTool, saveConversation } from "../voice-rt.ts";
+import { handleRtToken, runRtTool, saveConversation, handleRtLog } from "../voice-rt.ts";
 import {
   getChatSettings,
   setChatSettings,
@@ -1590,7 +1590,19 @@ export async function cmdServe() {
       // The browser holds WebRTC directly to OpenAI; these two routes just mint
       // the ephemeral token and run the relayed tool calls. See voice-rt.ts.
       if (path === "/api/voice/rt/token" && req.method === "POST") {
-        return handleRtToken(req);
+        // Resolve the same single workspace vault the tool relay uses, so the minted
+        // session can start with a live SESSION CONTEXT block (date/projects/tasks).
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo =
+          repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        return handleRtToken(req, repo?.cwd);
+      }
+      // Append a batch of realtime debug events to this session's local JSONL log
+      // (data/converse-logs/, git-ignored). The browser streams its events here so
+      // every Converse call is recorded for debugging. See voice-rt.ts.
+      if (path === "/api/voice/rt/log" && req.method === "POST") {
+        return handleRtLog(req);
       }
       {
         const m = path.match(/^\/api\/voice\/rt\/tools\/([a-z0-9_]+)$/);

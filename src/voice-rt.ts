@@ -12,11 +12,30 @@
 // only, and "user" is the soft ?user= identity, hashed into OpenAI-Safety-Identifier.
 
 import { createHash } from "node:crypto";
+import { appendFile, mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import { PATHS } from "./config.ts";
 import { writeRepoFile, withRepoLock, gitCommitPaths } from "./files.ts";
-import { slugify, buildFrontmatter, VAULT_TOOL_SCHEMAS, runVaultTool } from "./vault-tools.ts";
+import {
+  slugify,
+  buildFrontmatter,
+  buildVaultContext,
+  VAULT_TOOL_SCHEMAS,
+  WAIT_FOR_USER_TOOL,
+  runVaultTool,
+} from "./vault-tools.ts";
+import { buildVoiceInstructions } from "./converse-persona.ts";
 
-const MODEL = "gpt-realtime-2.1-mini";
+// Full gpt-realtime-2 (Sam, 2026-07-29): stronger tool selection + exact-entity
+// handling than the -mini for the vault/project/email work. Env-overridable so the
+// exact model id can be corrected without a code change if OpenAI's string differs.
+const MODEL = process.env.CONVERSE_RT_MODEL || "gpt-realtime-2";
 const CLIENT_SECRETS_URL = "https://api.openai.com/v1/realtime/client_secrets";
+
+// Per-session debug logs (Sam wants to track every realtime call for himself).
+// Under data/ which is git-ignored → local-only, never committed. Distinct from the
+// manual "save as vault note" flow (that stays a curated keepsake).
+const LOG_DIR = join(PATHS.data, "converse-logs");
 
 // ---- small local Response helpers (serve.ts's json/err are module-private) ----
 function json(obj: unknown, init?: ResponseInit) {
@@ -31,29 +50,37 @@ function err(status: number, message: string) {
 
 // Vault tool suite (navigate / retrieve / introspect / create / edit) — see vault-tools.ts.
 // slugify + buildFrontmatter live there too (saveConversation below reuses them).
-const TOOLS = VAULT_TOOL_SCHEMAS;
+// wait_for_user is voice-only (ambient-noise silence handling), appended here.
+const TOOLS = [...VAULT_TOOL_SCHEMAS, WAIT_FOR_USER_TOOL];
 
-function buildSessionConfig() {
+// `repoCwd` is the workspace vault (serve.ts resolves it) — used to inject a live
+// SESSION CONTEXT block (date, active projects, task windows) into the spoken
+// instructions so the assistant isn't cold on turn 1. Best-effort: no repo → no
+// context, session still mints. See docs/converse-voice-rt-improvements.md.
+async function buildSessionConfig(repoCwd?: string) {
+  const context = repoCwd ? buildVaultContext(repoCwd) : "";
   return {
     type: "realtime",
     model: MODEL,
     output_modalities: ["audio"],
     reasoning: { effort: "low" },
-    instructions:
-      "You are Calyx's voice assistant — warm, brief, and natural. You help the user work with their " +
-      "vault of notes by voice: explore it (describe_vault, browse), find things (search, list_by_type), " +
-      "read a note, create or update notes, and start whole projects (create_project). For current events or " +
-      "facts outside the vault, use web_search. When you're unsure what note types, tags, or projects " +
-      "exist, call describe_vault first to learn the real names before searching or creating. Keep spoken " +
-      "replies to one or two sentences; when you use a tool, say what you're doing in a few words. Read a " +
-      "note before answering questions about it — never invent file contents; if a search returns nothing, " +
-      "say so. Confirm the title before you finish creating or changing a note.",
+    // Structured, labelled persona (shared core + voice addendum) + live context.
+    instructions: buildVoiceInstructions(context),
+    // Bound reply length so a runaway response can't ramble; spoken turns are short
+    // anyway and tool-arg JSON fits comfortably.
+    max_output_tokens: 2048,
     audio: {
       input: {
-        transcription: { model: "gpt-4o-transcribe" },
+        // language hint speeds up + steadies user-side transcription (Sam is English).
+        transcription: { model: "gpt-4o-transcribe", language: "en" },
+        // Ambient-noise suppression on OpenAI's side (Sam uses earbuds + phone) so a
+        // TV / second voice is far less likely to false-trigger a barge-in.
+        noise_reduction: { type: "near_field" },
         turn_detection: {
           type: "semantic_vad",
-          eagerness: "auto",
+          // `low` waits longer before deciding the user is done / is interrupting —
+          // fewer accidental mid-reply cut-offs in a noisy room.
+          eagerness: "low",
           create_response: true,
           interrupt_response: true,
         },
@@ -68,14 +95,17 @@ function buildSessionConfig() {
 /**
  * POST /api/voice/rt/token — mint a browser ephemeral client secret bound to the
  * session config above. The real API key stays here. Returns { value, expires_at }.
+ * `repoCwd` (the workspace vault, resolved by serve.ts) lets the session start with
+ * a live SESSION CONTEXT block; omitted → the session still mints, just cold.
  */
-export async function handleRtToken(req: Request): Promise<Response> {
+export async function handleRtToken(req: Request, repoCwd?: string): Promise<Response> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return err(503, "OPENAI_API_KEY not set on the server");
 
   const user = new URL(req.url).searchParams.get("user") || "anon";
   const safetyId = createHash("sha256").update(user).digest("hex").slice(0, 64);
 
+  const session = await buildSessionConfig(repoCwd);
   let res: Response;
   try {
     res = await fetch(CLIENT_SECRETS_URL, {
@@ -85,7 +115,7 @@ export async function handleRtToken(req: Request): Promise<Response> {
         "Content-Type": "application/json",
         "OpenAI-Safety-Identifier": safetyId,
       },
-      body: JSON.stringify({ session: buildSessionConfig() }),
+      body: JSON.stringify({ session }),
     });
   } catch (e) {
     return err(502, `client_secrets request failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -112,6 +142,34 @@ export async function runRtTool(
   args: Record<string, unknown>,
 ): Promise<Response> {
   return runVaultTool(name, repoCwd, args);
+}
+
+/** Filesystem-safe log filename from a client session id. */
+function safeLogId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80) || "session";
+}
+
+/**
+ * POST /api/voice/rt/log — append a batch of realtime events to this session's
+ * debug log. The browser holds the WebRTC connection directly to OpenAI, so the
+ * server never sees the transcript/turn events otherwise; the client streams them
+ * here as it goes (so a crash/close loses nothing). One append-only JSONL file per
+ * session under data/converse-logs/ (git-ignored, local, for Sam's debugging).
+ * Body: { sessionId, events: [...] }.
+ */
+export async function handleRtLog(req: Request): Promise<Response> {
+  const body = (await req.json().catch(() => null)) as { sessionId?: string; events?: unknown[] } | null;
+  if (!body?.sessionId || !Array.isArray(body.events)) return err(400, "expected { sessionId, events: [...] }");
+  if (body.events.length === 0) return json({ ok: true, appended: 0 });
+  try {
+    await mkdir(LOG_DIR, { recursive: true });
+    const file = join(LOG_DIR, `${safeLogId(body.sessionId)}.jsonl`);
+    const lines = body.events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    await appendFile(file, lines, "utf8");
+    return json({ ok: true, appended: body.events.length });
+  } catch (e) {
+    return err(500, e instanceof Error ? e.message : String(e));
+  }
 }
 
 /**

@@ -17,6 +17,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { PATHS } from "./config.ts";
 import { VAULT_TOOL_SCHEMAS, runVaultTool } from "./vault-tools.ts";
+import { CHAT_INSTRUCTIONS } from "./converse-persona.ts";
 
 // ------------------------------------------------------------ types
 
@@ -51,19 +52,9 @@ function err(status: number, message: string) {
 
 // ------------------------------------------------------------ shared prompt/tools
 
-// Text-mode sibling of the spoken instructions in voice-rt.ts buildSessionConfig().
-// Same persona and vault behavior; only the delivery differs (written, can be a
-// little longer, markdown is fine).
-const INSTRUCTIONS =
-  "You are Calyx's assistant — warm, brief, and natural. This is the typed side of a chat that can " +
-  "also be spoken (the user may switch to voice mid-conversation; earlier turns may come from either). " +
-  "You help the user work with their vault of notes: explore it (describe_vault, browse), find things " +
-  "(search, list_by_type), read a note, create or update notes, and start whole projects (create_project). " +
-  "For current events or facts outside the vault, use web_search. When you're unsure what note types, " +
-  "tags, or projects exist, call describe_vault first to learn the real names before searching or " +
-  "creating. Keep replies short and conversational — a sentence or two unless the user asks for more; " +
-  "light markdown is fine. Read a note before answering questions about it — never invent file contents; " +
-  "if a search returns nothing, say so. Confirm the title before you finish creating or changing a note.";
+// Text-mode instructions now share a single persona core with the spoken side
+// (converse-persona.ts) so the two can't drift; only the channel addendum differs.
+const INSTRUCTIONS = CHAT_INSTRUCTIONS;
 
 // The realtime API takes flat {type:"function", name, ...}; chat completions
 // wants them nested under `function`. Same schemas, different envelope.
