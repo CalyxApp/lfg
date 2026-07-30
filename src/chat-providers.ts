@@ -16,7 +16,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { PATHS } from "./config.ts";
-import { VAULT_TOOL_SCHEMAS, runVaultTool } from "./vault-tools.ts";
+import { VAULT_TOOL_SCHEMAS, runVaultTool, buildVaultContext } from "./vault-tools.ts";
 import { CHAT_INSTRUCTIONS } from "./converse-persona.ts";
 
 // ------------------------------------------------------------ types
@@ -90,10 +90,16 @@ const openai: ChatProvider = {
     const key = process.env.OPENAI_API_KEY;
     if (!key) return err(503, "OPENAI_API_KEY not set on the server");
 
+    // Same live SESSION CONTEXT the voice path injects (date, active projects, task
+    // windows) so the typed assistant isn't cold either — Sam hit exactly this: it
+    // knew the date but not his projects, because only the voice path was wired.
+    // Best-effort: buildVaultContext returns "" on any failure.
+    const context = buildVaultContext(repoCwd);
+    const system = context ? `${INSTRUCTIONS}\n\n${context}` : INSTRUCTIONS;
     // Rolling message list: system + thread history, then tool-call exchanges
     // appended as the loop runs. `toolCalls` is the surfaced log for the UI.
     const convo: Record<string, unknown>[] = [
-      { role: "system", content: INSTRUCTIONS },
+      { role: "system", content: system },
       ...messages.map((m) => ({ role: m.role, content: m.content })),
     ];
     // Surfaced to the UI as friendly chips — includes the outcome (ok + a
