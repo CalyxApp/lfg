@@ -123,6 +123,10 @@ const openai: ChatProvider = {
             messages: convo,
             tools: CHAT_COMPLETION_TOOLS,
             tool_choice: "auto",
+            // Cap reply length to match the voice side's brevity (Sam: "concise is
+            // better"). These models require max_completion_tokens (max_tokens is
+            // rejected); a bit higher than voice's 2048 since typed can run longer.
+            max_completion_tokens: 1500,
             // GPT-5.6 tiers default to built-in reasoning, which /v1/chat/completions
             // rejects when combined with function tools ("use /v1/responses or set
             // reasoning_effort to 'none'"). "none" is right for a snappy chat surface
