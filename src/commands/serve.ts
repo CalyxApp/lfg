@@ -329,6 +329,12 @@ import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
 import { handleRtToken, runRtTool, saveConversation, handleRtLog, handleFileUpload } from "../voice-rt.ts";
 import {
+  saveConversationRecord,
+  listConversationSummaries,
+  getConversationRecord,
+  type ConversationRecord,
+} from "../converse-store.ts";
+import {
   getChatSettings,
   setChatSettings,
   listChatProviders,
@@ -1648,6 +1654,26 @@ export async function cmdServe() {
       // the typed chat then references the returned file_id. See voice-rt.ts.
       if (path === "/api/voice/rt/upload-file" && req.method === "POST") {
         return handleFileUpload(req);
+      }
+
+      // ---- Universal conversation store (Phase 4). A normalized HTTP contract
+      // over a storage adapter (converse-store.ts) so the browsing UI is decoupled
+      // from where records live. See docs/converse-universal-view.md.
+      if (path === "/api/converse/conversations" && req.method === "POST") {
+        const rec = (await req.json().catch(() => null)) as ConversationRecord | null;
+        if (!rec?.id || !Array.isArray(rec.turns)) return err(400, "expected a conversation record { id, turns[] }");
+        await saveConversationRecord(rec);
+        return json({ ok: true, id: rec.id });
+      }
+      if (path === "/api/converse/conversations" && req.method === "GET") {
+        return json(await listConversationSummaries());
+      }
+      {
+        const m = path.match(/^\/api\/converse\/conversations\/([A-Za-z0-9_-]+)$/);
+        if (m && req.method === "GET") {
+          const rec = await getConversationRecord(m[1]);
+          return rec ? json(rec) : err(404, "conversation not found");
+        }
       }
       {
         const m = path.match(/^\/api\/voice\/rt\/tools\/([a-z0-9_]+)$/);

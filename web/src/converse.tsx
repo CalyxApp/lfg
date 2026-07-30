@@ -17,12 +17,25 @@
 // the workspace vault as an `ai-voice-conversation` note (unchanged).
 
 import { useEffect, useRef, useState } from "react";
-import { marked } from "marked";
-import { ArrowUp, AudioLines, File as FileIcon, Mic, MicOff, Paperclip, Square, Volume2, VolumeX, X } from "lucide-react";
+import {
+  ArrowUp,
+  AudioLines,
+  File as FileIcon,
+  History,
+  Mic,
+  MicOff,
+  Paperclip,
+  Square,
+  Volume2,
+  VolumeX,
+  X,
+} from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
 import { VoiceMeter } from "./components/voice-meter";
-import { ToolCard, type ToolDetail } from "./components/tool-card";
+import { type ToolDetail } from "./components/tool-card";
+import { ConversationTurns } from "./components/conversation-turns";
+import { ConversationHistory } from "./conversation-history";
 import {
   primeAudio,
   playReady,
@@ -121,6 +134,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const [soundsMuted, setSoundsMutedState] = useState(areSoundsMuted());
   // Bumped to force a voice reconnect after a dropped WebRTC connection.
   const [connNonce, setConnNonce] = useState(0);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   // chat-mode state
   const [input, setInput] = useState("");
@@ -758,11 +772,10 @@ export function Converse({ onClose }: { onClose: () => void }) {
       ...(usedVoiceRef.current ? [MODEL] : []),
     ];
     const noteTitle = firstUser ? firstUser.slice(0, 60) : `Voice note ${dateStr}`;
-    const noteProps = {
-      date: dateStr,
-      duration: formatDuration(durMs),
-      model: models.join(" + ") || MODEL,
-    };
+    const model = models.join(" + ") || MODEL;
+    const noteProps = { date: dateStr, duration: formatDuration(durMs), model };
+
+    // (1) human-friendly markdown note in the vault (Calyx export, unchanged).
     try {
       await fetch("/api/voice/rt/save-conversation", {
         method: "POST",
@@ -772,6 +785,40 @@ export function Converse({ onClose }: { onClose: () => void }) {
       });
     } catch {
       /* raw debug log is the backstop */
+    }
+
+    // (2) structured record for the universal view — the machine-readable source
+    // of truth (keeps tool calls + attachments the markdown drops). Written behind
+    // the storage adapter (see docs/converse-universal-view.md).
+    ensureSessionId();
+    const turns = logRef.current
+      .filter((e) => !(e.role === "you" && e.text === "…"))
+      .filter((e) => e.text.trim() || (e.images && e.images.length) || (e.files && e.files.length) || e.tool)
+      .map((e) => ({
+        role: e.role,
+        text: e.text,
+        ...(e.ok !== undefined ? { ok: e.ok } : {}),
+        ...(e.tool ? { tool: e.tool } : {}),
+        ...(e.images ? { images: e.images } : {}),
+        ...(e.files ? { files: e.files } : {}),
+      }));
+    try {
+      await fetch("/api/converse/conversations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: sessionIdRef.current,
+          title: noteTitle,
+          date: dateStr,
+          model,
+          durationMs: durMs,
+          createdAt: new Date().toISOString(),
+          turns,
+        }),
+        keepalive: true,
+      });
+    } catch {
+      /* non-fatal — the markdown note + debug log still exist */
     }
     onClose();
   }
@@ -861,6 +908,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-[1000] flex flex-col bg-background text-foreground">
       <audio ref={audioRef} autoPlay />
+      {historyOpen && <ConversationHistory onClose={() => setHistoryOpen(false)} />}
 
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <strong className="text-base font-semibold">Chat</strong>
@@ -880,6 +928,14 @@ export function Converse({ onClose }: { onClose: () => void }) {
               {modelChip}
             </button>
           ) : null}
+          <button
+            className="flex size-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
+            onClick={() => setHistoryOpen(true)}
+            aria-label="Past conversations"
+            title="Past conversations"
+          >
+            <History className="size-4" />
+          </button>
           <button
             className="flex size-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
             onClick={closeSurface}
@@ -933,80 +989,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
           </div>
         ) : (
           <div className="flex flex-col gap-3">
-            {log.map((e, i) =>
-              e.role === "you" ? (
-                e.text === "…" ? (
-                  // Distinct "we're hearing you" state (not a real turn yet) vs a
-                  // finished user bubble — the transcript lands a beat later.
-                  <div
-                    key={i}
-                    className="ml-auto w-fit max-w-[85%] text-sm italic text-muted-foreground"
-                    aria-live="polite"
-                  >
-                    transcribing…
-                  </div>
-                ) : (
-                  <div key={i} className="ml-auto flex w-fit max-w-[85%] flex-col items-end gap-1">
-                    {e.images && e.images.length > 0 && (
-                      <div className="flex flex-wrap justify-end gap-1">
-                        {e.images.map((src, k) => (
-                          <img
-                            key={k}
-                            src={src}
-                            alt="attachment"
-                            className="max-h-40 rounded-lg border border-border object-cover"
-                          />
-                        ))}
-                      </div>
-                    )}
-                    {e.files && e.files.length > 0 && (
-                      <div className="flex flex-wrap justify-end gap-1">
-                        {e.files.map((name, k) => (
-                          <span
-                            key={k}
-                            className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-muted/40 px-2.5 py-1 text-xs text-muted-foreground"
-                          >
-                            <FileIcon className="size-3.5 shrink-0" />
-                            <span className="max-w-[12rem] truncate">{name}</span>
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                    {e.text && (
-                      <div className="msg-text markdown user-bubble whitespace-pre-wrap text-base">{e.text}</div>
-                    )}
-                  </div>
-                )
-              ) : e.role === "assistant" ? (
-                // Rendered markdown (same .msg-text.markdown styles as the
-                // agent chat) — assistant replies use headings/lists/bold.
-                <div
-                  key={i}
-                  className="msg-text markdown max-w-full text-base"
-                  dangerouslySetInnerHTML={{ __html: marked.parse(e.text, { async: false }) as string }}
-                />
-              ) : e.role === "tool" ? (
-                <div key={i} className="flex">
-                  {e.tool ? (
-                    <ToolCard label={e.text} detail={e.tool} />
-                  ) : (
-                    <span
-                      className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
-                        e.ok === false
-                          ? "border-destructive/40 bg-destructive/10 text-destructive"
-                          : "border-border bg-muted/40 text-muted-foreground"
-                      }`}
-                    >
-                      {e.ok === false ? "✗" : "✓"} {e.text}
-                    </span>
-                  )}
-                </div>
-              ) : (
-                <div key={i} className="text-center text-xs text-muted-foreground">
-                  {e.text}
-                </div>
-              ),
-            )}
+            <ConversationTurns turns={log} />
             {sending && <div className="text-sm text-muted-foreground">…</div>}
           </div>
         )}
