@@ -11,15 +11,19 @@ export function HtmlViewerOverlay({
   title,
   src,
   onClose,
+  escEnabled = true,
 }: {
   title: string;
   src: string;
   onClose: () => void;
+  // When a child overlay is stacked on top (e.g. a vault file opened from a
+  // report), disable this one's Escape so only the topmost overlay responds.
+  escEnabled?: boolean;
 }) {
-  // Escape closes; lock body scroll while open.
+  // Escape closes (unless suppressed); lock body scroll while open.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (escEnabled && e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     const prev = document.body.style.overflow;
@@ -28,7 +32,7 @@ export function HtmlViewerOverlay({
       window.removeEventListener("keydown", onKey);
       document.body.style.overflow = prev;
     };
-  }, [onClose]);
+  }, [onClose, escEnabled]);
 
   return (
     <div className="fixed inset-0 z-[100] flex flex-col bg-background">

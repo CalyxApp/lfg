@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Bot, FileText, Loader2, Newspaper, RefreshCw, Sparkles } from "lucide-react";
 import { getJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
+import { ReportOverlay } from "./ReportOverlay";
 
 export type ReportItem = {
   id: string;
@@ -19,6 +19,7 @@ export type ReportItem = {
   reportType?: string;
   format?: string;
   url: string;
+  repo?: string;
 };
 
 // briefing → sparkles, agent → bot, scheduled → newspaper, else document.
@@ -157,9 +158,7 @@ export function ReportsView() {
         ))}
       </div>
 
-      {open ? (
-        <HtmlViewerOverlay title={open.title} src={open.url} onClose={() => setOpen(null)} />
-      ) : null}
+      {open ? <ReportOverlay report={open} onClose={() => setOpen(null)} /> : null}
     </div>
   );
 }

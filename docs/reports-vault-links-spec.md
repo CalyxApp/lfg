@@ -75,16 +75,21 @@ click-forwarder that `postMessage`s the tapped path to the app.
   has spaces) and non-paths are left untouched, matching the desktop regex.
 - No frontend / navigation changes; nothing listens for the message yet.
 
-### Phase 2 — open the file
-- Resolve paths against the primary repo (`repo=PlatosRaveCave`, already
-  registered) via the existing `/api/repos/file` (md → JSON, rendered by
-  `MarkdownDoc`/`streamdown`) and `/api/repos/raw` (html → `HtmlViewerOverlay`).
-  No new repo registration.
-- App-level `message` listener (verify `event.source === iframe.contentWindow`,
-  the pattern `ArtifactsView` uses) receives `calyx-open-vault` → opens the file
-  using the **existing** viewer components (reuse, so it matches the Files tab).
-- Markdown currently renders *inline* in the Files pane; extract a read-only
-  full-screen variant of `MarkdownDoc` for the overlay case.
+### Phase 2 — open the file  ✅ DONE
+- `reports.ts`: each ReportItem now carries `repo` (= `primaryRepoName()`), so the
+  client knows where to resolve links.
+- `ReportOverlay.tsx` (new): wraps the report `HtmlViewerOverlay`, listens for the
+  `calyx-open-vault` message, and stacks a `VaultFileOverlay` on top. Passes
+  `escEnabled={!vaultPath}` so only the topmost overlay handles Escape (fixes the
+  double-close). Used by both `ReportsView` and `HomeView`.
+- `VaultFileOverlay.tsx` (new): resolves the path against `repo` (PlatosRaveCave)
+  via the **existing** endpoints — `/api/repos/file` → `<Streamdown>` for markdown
+  (same renderer as the Files tab), `/api/repos/raw` → `HtmlViewerOverlay` for html,
+  inline for image/pdf, `<pre>` for other text. A bare `projects/foo` path resolves
+  to `projects/foo/index.md` (Calyx folder convention). Graceful error on miss.
+- `HtmlViewerOverlay.tsx`: added `escEnabled` prop (default true).
+- Back-stack (this phase, via the in-app buttons): list → report → file → back →
+  report → back → list, verified. Phone hardware/gesture back is still Phase 3.
 
 ### Phase 3 — back-navigation (the hard part)
 Desired stack: `tab` (routed) → report overlay → file overlay. One "back" pops
