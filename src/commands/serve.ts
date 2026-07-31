@@ -207,6 +207,7 @@ import {
 import { testProfile } from "../browser/tool.ts";
 import { listCustomRepos, addCustomRepo, removeCustomRepo } from "../repos-store.ts";
 import { projectName, reposRoot } from "../projects.ts";
+import { listReports, getReportHtml, renderReportHtml as renderCalyxReportHtml } from "../reports.ts";
 import { resolveSessionCwd, startWorktreeSweep } from "../worktree.ts";
 import {
   synthesizeTts,
@@ -2794,6 +2795,32 @@ export async function cmdServe() {
         const repo = (await listRepos()).find((r) => r.name === url.searchParams.get("repo"));
         if (!repo) return err(404, "repo not found");
         return json({ repo: repo.name, ...vaultSummary(repo.cwd) });
+      }
+
+      // Calyx reports — read-only view over the vault's `reports/` folder.
+      // Self-contained HTML docs (chiron:* meta tags parsed into ReportItem).
+      if (path === "/api/calyx-reports" && req.method === "GET") {
+        const date = url.searchParams.get("date"); // YYYY-MM-DD (by created)
+        const type = url.searchParams.get("type"); // reportType
+        const source = url.searchParams.get("source");
+        let items = listReports();
+        if (date) items = items.filter((r) => (r.created || "").slice(0, 10) === date);
+        if (type) items = items.filter((r) => (r.reportType || "") === type);
+        if (source) items = items.filter((r) => (r.source || "") === source);
+        return json({ items });
+      }
+      const reportMatch = path.match(/^\/api\/calyx-reports\/(.+)$/);
+      if (reportMatch && req.method === "GET") {
+        const raw = getReportHtml(decodeURIComponent(reportMatch[1]));
+        if (raw == null) return err(404, "report not found");
+        // Vault paths -> desktop-style chips + click-forwarder (Phase 1).
+        const html = renderCalyxReportHtml(raw);
+        // Self-contained doc; rendered in a sandboxed iframe (sandbox=allow-scripts,
+        // no same-origin) client-side, same as HTML artifacts. Never cache — the
+        // nightly generator overwrites the day's file in place.
+        return new Response(html, {
+          headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
+        });
       }
 
       if (path === "/api/vault/items" && req.method === "GET") {
