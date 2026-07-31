@@ -1,6 +1,8 @@
 # Converse — universal conversation view (Phase 4), Rev 1
 
-Branch: `converse-voice-rt-improvements`. 2026-07-30.
+Branch: `converse-voice-rt-improvements` → merged to `main`. 2026-07-30.
+**Status: shipped & verified** — store round-trips (save→list→get) with tool calls
+preserved; viewer opens via the History button in the Converse header.
 
 A read-only page to browse and re-read every past Converse conversation (voice or
 typed). The point of this rev is **not** the UI — it's building it so the storage
