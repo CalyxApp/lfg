@@ -334,6 +334,7 @@ import {
   handleRtLog,
   handleFileUpload,
   handleRtInstructions,
+  handleFileText,
 } from "../voice-rt.ts";
 import {
   saveConversationRecord,
@@ -1670,6 +1671,11 @@ export async function cmdServe() {
       // the typed chat then references the returned file_id. See voice-rt.ts.
       if (path === "/api/voice/rt/upload-file" && req.method === "POST") {
         return handleFileUpload(req);
+      }
+      // Extract an uploaded file's text (by file_id) for injection into a voice
+      // session — realtime can't read documents directly. See voice-rt.ts.
+      if (path === "/api/voice/rt/file-text" && req.method === "POST") {
+        return handleFileText(req);
       }
 
       // ---- Universal conversation store (Phase 4). A normalized HTTP contract

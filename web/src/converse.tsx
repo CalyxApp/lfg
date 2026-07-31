@@ -66,6 +66,10 @@ type LogEntry = {
   tool?: ToolDetail; // set on tool rows → expandable input/result preview
   images?: string[]; // data: URLs shown as thumbnails on a "you" turn
   files?: string[]; // attached non-image file names shown as chips on a "you" turn
+  // Per-file plumbing for re-sending across turns/modes: file_id (chat, native) +
+  // extracted text (voice, since realtime can't read documents). `files` is the
+  // display-name mirror of this.
+  fileData?: { name: string; fileId?: string; text?: string }[];
 };
 
 // Something the user attached to the composer. Images go inline as base64
@@ -178,15 +182,43 @@ export function Converse({ onClose }: { onClose: () => void }) {
       return next;
     });
 
-  const appendUser = (text: string, images?: string[], files?: string[]) =>
+  const appendUser = (
+    text: string,
+    images?: string[],
+    fileData?: { name: string; fileId?: string; text?: string }[],
+  ) =>
     setLog((l) => {
       const entry: LogEntry = { role: "you", text };
       if (images && images.length) entry.images = images;
-      if (files && files.length) entry.files = files;
+      if (fileData && fileData.length) {
+        entry.fileData = fileData;
+        entry.files = fileData.map((f) => f.name);
+      }
       const next = [...l.slice(-60), entry];
       logRef.current = next;
       return next;
     });
+
+  // Build the prior-turn chat history as rich content so typed chat re-references
+  // earlier uploads (images + files) later in the conversation and across a
+  // voice→chat switch — not just on the turn they were attached.
+  function buildChatHistory(): { role: string; content: unknown }[] {
+    const out: { role: string; content: unknown }[] = [];
+    for (const e of logRef.current) {
+      if (e.role === "assistant") {
+        if (e.text) out.push({ role: "assistant", content: e.text });
+        continue;
+      }
+      if (e.role !== "you" || e.text === "…") continue;
+      const parts: Record<string, unknown>[] = [];
+      if (e.text) parts.push({ type: "text", text: e.text });
+      for (const src of e.images ?? []) parts.push({ type: "image_url", image_url: { url: src } });
+      for (const f of e.fileData ?? []) if (f.fileId) parts.push({ type: "file", file: { file_id: f.fileId } });
+      if (parts.length === 0) continue;
+      out.push({ role: "user", content: parts.length === 1 && e.text ? e.text : parts });
+    }
+    return out;
+  }
 
   // Tool row carrying the full call detail (name/args/result) so the chip can
   // expand to a preview. `label` stays the friendly one-liner from toolLabel().
@@ -422,14 +454,11 @@ export function Converse({ onClose }: { onClose: () => void }) {
     }
     const hasAttParts = parts.some((p) => p.type !== "text");
     const userContent: string | Part[] = hasAttParts ? parts : text;
-    const messages = [
-      ...threadTurns().map((e) => ({ role: e.role === "you" ? "user" : "assistant", content: e.text })),
-      { role: "user", content: userContent },
-    ];
+    const messages = [...buildChatHistory(), { role: "user", content: userContent }];
     appendUser(
       text,
       atts.filter((a) => a.kind === "image" && a.dataUrl).map((a) => a.dataUrl as string),
-      atts.filter((a) => a.kind === "file").map((a) => a.name),
+      atts.filter((a) => a.kind === "file").map((a) => ({ name: a.name, fileId: a.fileId })),
     );
     setAttachments([]);
     ensureSessionId();
@@ -643,6 +672,29 @@ export function Converse({ onClose }: { onClose: () => void }) {
         ensureSessionId();
         primeAudio(); // unlock WebAudio on this user-gesture-initiated connect
         logEvent("session_start", { user, model: MODEL, attempt: retryRef.current });
+        // Realtime can't read documents — pre-extract any attached files' text so
+        // the replay can hand it to the voice model as context (cached on the turn,
+        // so reconnects/re-switches don't re-extract).
+        const toExtract = logRef.current.flatMap((e) =>
+          e.role === "you" ? (e.fileData ?? []).filter((f) => f.fileId && !f.text) : [],
+        );
+        if (toExtract.length) {
+          await Promise.all(
+            toExtract.map(async (f) => {
+              try {
+                const r = await fetch("/api/voice/rt/file-text", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ file_id: f.fileId }),
+                });
+                if (r.ok) f.text = ((await r.json()) as { text?: string }).text || "";
+              } catch {
+                /* leave without text — replay falls back to a name mention */
+              }
+            }),
+          );
+          if (cancelled) return;
+        }
         const tokenRes = await fetch(`/api/voice/rt/token?user=${encodeURIComponent(user)}`, { method: "POST" });
         if (!tokenRes.ok) throw new Error(`token ${tokenRes.status}: ${await tokenRes.text()}`);
         const { value: ephemeralKey } = (await tokenRes.json()) as { value: string };
@@ -696,8 +748,13 @@ export function Converse({ onClose }: { onClose: () => void }) {
               content = [];
               if (e.text && e.text !== "…") content.push({ type: "input_text", text: e.text });
               for (const src of e.images ?? []) content.push({ type: "input_image", image_url: src });
-              for (const name of e.files ?? [])
-                content.push({ type: "input_text", text: `(The user shared a file: ${name})` });
+              for (const f of e.fileData ?? [])
+                content.push({
+                  type: "input_text",
+                  text: f.text
+                    ? `(Contents of the file "${f.name}" the user shared:\n${f.text})`
+                    : `(The user shared a file: ${f.name})`,
+                });
               if (content.length === 0) continue;
             } else {
               if (!e.text) continue;

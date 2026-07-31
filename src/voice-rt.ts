@@ -154,6 +154,52 @@ function safeLogId(id: string): string {
 }
 
 /**
+ * POST /api/voice/rt/file-text — extract the plain text of an uploaded file (by
+ * Files-API file_id) so it can be injected into a VOICE session as context. The
+ * realtime API can't read documents (text/audio/image only), so per OpenAI's
+ * guidance we extract the text (via a cheap chat model that CAN read the file) and
+ * hand it to voice as input_text. Body { file_id } → { text }.
+ */
+export async function handleFileText(req: Request): Promise<Response> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return err(503, "OPENAI_API_KEY not set on the server");
+  const body = (await req.json().catch(() => null)) as { file_id?: string } | null;
+  if (!body?.file_id) return err(400, "file_id required");
+  try {
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.CONVERSE_EXTRACT_MODEL || "gpt-5.6-luna",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: "Extract and return the plain text content of this document, verbatim and as complete as fits. If it is not primarily text (e.g. an image-only scan or a photo), briefly describe its contents instead. Output only the content — no preamble.",
+              },
+              { type: "file", file: { file_id: body.file_id } },
+            ],
+          },
+        ],
+        max_completion_tokens: 6000,
+        reasoning_effort: "none",
+      }),
+      signal: AbortSignal.timeout(90_000),
+    });
+    if (!r.ok) return err(502, `extract ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
+    const j = (await r.json().catch(() => null)) as {
+      choices?: { message?: { content?: string } }[];
+    } | null;
+    const text = (j?.choices?.[0]?.message?.content ?? "").trim();
+    return json({ text: text.slice(0, 24_000) });
+  } catch (e) {
+    return err(502, `extract failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
  * GET /api/voice/rt/instructions — the current voice instructions with a FRESH
  * SESSION CONTEXT block. The client re-pushes this into a live session via
  * `session.update` on a timer so the date/projects/tasks snapshot doesn't go stale
