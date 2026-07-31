@@ -3150,7 +3150,7 @@ export function App() {
                 aria-current="page"
                 className="flex items-center rounded-full px-1.5 transition-transform active:scale-[0.96]"
               >
-                <img src="/icon.svg" alt="lfg" className="mx-1 size-6 shrink-0" />
+                <Activity className="mx-1 size-6 shrink-0" />
               </button>
             ) : (
               <button
@@ -4347,9 +4347,6 @@ function WhoAreYou({
   return (
     <div className="flex h-dvh flex-col items-center justify-center bg-background px-6 text-foreground">
       <div className="w-full max-w-sm">
-        <div className="mb-4 flex items-center gap-2">
-          <img src="/icon.svg" alt="lfg" className="size-7 shrink-0" />
-        </div>
         <h1 className="text-xl font-semibold">Who are you?</h1>
         <p className="mb-5 mt-1 text-sm text-muted-foreground">
           Pick your profile so we can tag the sessions you start.
