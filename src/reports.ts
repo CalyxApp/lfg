@@ -24,16 +24,19 @@ export type ReportItem = {
   created: string; // ISO timestamp
   reportType?: string; // category, e.g. daily-briefing
   format?: string; // html | markdown (stored as html post-conversion)
-  url: string; // /api/reports/:id — raw HTML
+  url: string; // /api/calyx-reports/:id — raw HTML
+  repo: string; // registered repo the report + its vault links live in
 };
 
+// The registered repo name that holds reports and is the default write target.
+export function primaryRepoName(): string {
+  return process.env.CALYX_PRIMARY_REPO || process.env.CONVERSE_WORKSPACE || "PlatosRaveCave";
+}
+
 // The primary repo's `reports/` folder. Resolves to
-// <reposRoot>/<primary>/reports, where primary defaults to PlatosRaveCave.
-// LFG_REPORTS_DIR overrides the whole path if ever needed.
+// <reposRoot>/<primary>/reports. LFG_REPORTS_DIR overrides the whole path.
 function reportsDir(): string {
-  if (process.env.LFG_REPORTS_DIR) return process.env.LFG_REPORTS_DIR;
-  const primary = process.env.CALYX_PRIMARY_REPO || process.env.CONVERSE_WORKSPACE || "PlatosRaveCave";
-  return join(reposRoot(), primary, "reports");
+  return process.env.LFG_REPORTS_DIR || join(reposRoot(), primaryRepoName(), "reports");
 }
 
 // <meta name="calyx:KEY" content="VALUE"> (product) or the older chiron: codename,
@@ -116,6 +119,7 @@ export function listReports(): ReportItem[] {
         reportType: meta.reportType || undefined,
         format: meta.format || undefined,
         url: `/api/calyx-reports/${encodeURIComponent(id)}`,
+        repo: primaryRepoName(),
       });
     } catch {
       // unreadable file — skip, don't fail the whole listing

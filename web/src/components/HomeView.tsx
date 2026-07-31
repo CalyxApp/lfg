@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { getJson, postJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
+import { ReportOverlay } from "./ReportOverlay";
 
 type Report = {
   id: string;
@@ -30,6 +30,7 @@ type Report = {
   created: string;
   reportType?: string;
   url: string;
+  repo?: string;
 };
 
 function ReportIcon({ source, className }: { source: string; className?: string }) {
@@ -392,11 +393,7 @@ export function HomeView({
       </section>
 
       {openReport ? (
-        <HtmlViewerOverlay
-          title={openReport.title}
-          src={openReport.url}
-          onClose={() => setOpenReport(null)}
-        />
+        <ReportOverlay report={openReport} onClose={() => setOpenReport(null)} />
       ) : null}
     </div>
   );
