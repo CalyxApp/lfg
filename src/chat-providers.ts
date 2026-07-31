@@ -16,11 +16,19 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { PATHS } from "./config.ts";
-import { VAULT_TOOL_SCHEMAS, runVaultTool } from "./vault-tools.ts";
+import { VAULT_TOOL_SCHEMAS, runVaultTool, buildVaultContext } from "./vault-tools.ts";
+import { CHAT_INSTRUCTIONS } from "./converse-persona.ts";
 
 // ------------------------------------------------------------ types
 
-export type ChatTurnMessage = { role: "user" | "assistant"; content: string };
+// Multimodal content: a plain string, or an array of parts (text + inline images
+// as data: URLs). Hosted chat models take images as image_url parts — unlike the
+// coding-agent chat, which passes a local file PATH the agent reads off disk.
+export type ChatContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "file"; file: { file_id: string } }; // a PDF/doc uploaded via the Files API
+export type ChatTurnMessage = { role: "user" | "assistant"; content: string | ChatContentPart[] };
 export type ChatSettings = { provider: string; model: string };
 
 type RunTurnOpts = {
@@ -51,19 +59,9 @@ function err(status: number, message: string) {
 
 // ------------------------------------------------------------ shared prompt/tools
 
-// Text-mode sibling of the spoken instructions in voice-rt.ts buildSessionConfig().
-// Same persona and vault behavior; only the delivery differs (written, can be a
-// little longer, markdown is fine).
-const INSTRUCTIONS =
-  "You are Calyx's assistant — warm, brief, and natural. This is the typed side of a chat that can " +
-  "also be spoken (the user may switch to voice mid-conversation; earlier turns may come from either). " +
-  "You help the user work with their vault of notes: explore it (describe_vault, browse), find things " +
-  "(search, list_by_type), read a note, create or update notes, and start whole projects (create_project). " +
-  "For current events or facts outside the vault, use web_search. When you're unsure what note types, " +
-  "tags, or projects exist, call describe_vault first to learn the real names before searching or " +
-  "creating. Keep replies short and conversational — a sentence or two unless the user asks for more; " +
-  "light markdown is fine. Read a note before answering questions about it — never invent file contents; " +
-  "if a search returns nothing, say so. Confirm the title before you finish creating or changing a note.";
+// Text-mode instructions now share a single persona core with the spoken side
+// (converse-persona.ts) so the two can't drift; only the channel addendum differs.
+const INSTRUCTIONS = CHAT_INSTRUCTIONS;
 
 // The realtime API takes flat {type:"function", name, ...}; chat completions
 // wants them nested under `function`. Same schemas, different envelope.
@@ -92,15 +90,27 @@ const openai: ChatProvider = {
     const key = process.env.OPENAI_API_KEY;
     if (!key) return err(503, "OPENAI_API_KEY not set on the server");
 
+    // Same live SESSION CONTEXT the voice path injects (date, active projects, task
+    // windows) so the typed assistant isn't cold either — Sam hit exactly this: it
+    // knew the date but not his projects, because only the voice path was wired.
+    // Best-effort: buildVaultContext returns "" on any failure.
+    const context = buildVaultContext(repoCwd);
+    const system = context ? `${INSTRUCTIONS}\n\n${context}` : INSTRUCTIONS;
     // Rolling message list: system + thread history, then tool-call exchanges
     // appended as the loop runs. `toolCalls` is the surfaced log for the UI.
     const convo: Record<string, unknown>[] = [
-      { role: "system", content: INSTRUCTIONS },
+      { role: "system", content: system },
       ...messages.map((m) => ({ role: m.role, content: m.content })),
     ];
     // Surfaced to the UI as friendly chips — includes the outcome (ok + a
     // path/id detail when the tool returned one), not just the invocation.
-    const toolCalls: { name: string; args: Record<string, unknown>; ok?: boolean; detail?: string }[] = [];
+    const toolCalls: {
+      name: string;
+      args: Record<string, unknown>;
+      ok?: boolean;
+      detail?: string;
+      result?: string;
+    }[] = [];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       let res: Response;
@@ -113,6 +123,10 @@ const openai: ChatProvider = {
             messages: convo,
             tools: CHAT_COMPLETION_TOOLS,
             tool_choice: "auto",
+            // Cap reply length to match the voice side's brevity (Sam: "concise is
+            // better"). These models require max_completion_tokens (max_tokens is
+            // rejected); a bit higher than voice's 2048 since typed can run longer.
+            max_completion_tokens: 1500,
             // GPT-5.6 tiers default to built-in reasoning, which /v1/chat/completions
             // rejects when combined with function tools ("use /v1/responses or set
             // reasoning_effort to 'none'"). "none" is right for a snappy chat surface
@@ -169,7 +183,7 @@ const openai: ChatProvider = {
         } catch {
           /* non-JSON output — leave outcome unknown */
         }
-        toolCalls.push({ name: call.function.name, args, ok, detail });
+        toolCalls.push({ name: call.function.name, args, ok, detail, result: output.slice(0, 4000) });
         convo.push({ role: "tool", tool_call_id: call.id, content: output });
       }
     }
@@ -254,10 +268,20 @@ export async function runChatTurn(repoCwd: string, messages: ChatTurnMessage[]):
   if (!Array.isArray(messages) || messages.length === 0) return err(400, "expected { messages: [...] }");
   const clean: ChatTurnMessage[] = [];
   for (const m of messages) {
-    if ((m?.role !== "user" && m?.role !== "assistant") || typeof m?.content !== "string") {
-      return err(400, "each message needs role user|assistant and string content");
+    if (m?.role !== "user" && m?.role !== "assistant") {
+      return err(400, "each message needs role user|assistant");
     }
-    if (m.content.trim()) clean.push({ role: m.role, content: m.content });
+    const c = m.content;
+    if (typeof c === "string") {
+      if (c.trim()) clean.push({ role: m.role, content: c });
+    } else if (Array.isArray(c)) {
+      const hasText = c.some((p) => p?.type === "text" && p.text?.trim());
+      const hasImage = c.some((p) => p?.type === "image_url" && p.image_url?.url);
+      const hasFile = c.some((p) => p?.type === "file" && p.file?.file_id);
+      if (hasText || hasImage || hasFile) clean.push({ role: m.role, content: c });
+    } else {
+      return err(400, "message content must be a string or a content-part array");
+    }
   }
   if (clean.length === 0 || clean[clean.length - 1].role !== "user") {
     return err(400, "last message must be a non-empty user turn");

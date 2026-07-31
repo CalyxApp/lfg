@@ -327,7 +327,21 @@ import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
-import { handleRtToken, runRtTool, saveConversation } from "../voice-rt.ts";
+import {
+  handleRtToken,
+  runRtTool,
+  saveConversation,
+  handleRtLog,
+  handleFileUpload,
+  handleRtInstructions,
+  handleFileText,
+} from "../voice-rt.ts";
+import {
+  saveConversationRecord,
+  listConversationSummaries,
+  getConversationRecord,
+  type ConversationRecord,
+} from "../converse-store.ts";
 import {
   getChatSettings,
   setChatSettings,
@@ -1630,7 +1644,58 @@ export async function cmdServe() {
       // The browser holds WebRTC directly to OpenAI; these two routes just mint
       // the ephemeral token and run the relayed tool calls. See voice-rt.ts.
       if (path === "/api/voice/rt/token" && req.method === "POST") {
-        return handleRtToken(req);
+        // Resolve the same single workspace vault the tool relay uses, so the minted
+        // session can start with a live SESSION CONTEXT block (date/projects/tasks).
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo =
+          repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        return handleRtToken(req, repo?.cwd);
+      }
+      // Fresh voice instructions (re-pushed into a live session via session.update
+      // on a timer) so the context snapshot doesn't go stale mid-call. See voice-rt.ts.
+      if (path === "/api/voice/rt/instructions" && req.method === "GET") {
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo =
+          repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        return handleRtInstructions(req, repo?.cwd);
+      }
+      // Append a batch of realtime debug events to this session's local JSONL log
+      // (data/converse-logs/, git-ignored). The browser streams its events here so
+      // every Converse call is recorded for debugging. See voice-rt.ts.
+      if (path === "/api/voice/rt/log" && req.method === "POST") {
+        return handleRtLog(req);
+      }
+      // Proxy a non-image attachment to the OpenAI Files API (purpose=user_data);
+      // the typed chat then references the returned file_id. See voice-rt.ts.
+      if (path === "/api/voice/rt/upload-file" && req.method === "POST") {
+        return handleFileUpload(req);
+      }
+      // Extract an uploaded file's text (by file_id) for injection into a voice
+      // session — realtime can't read documents directly. See voice-rt.ts.
+      if (path === "/api/voice/rt/file-text" && req.method === "POST") {
+        return handleFileText(req);
+      }
+
+      // ---- Universal conversation store (Phase 4). A normalized HTTP contract
+      // over a storage adapter (converse-store.ts) so the browsing UI is decoupled
+      // from where records live. See docs/converse-universal-view.md.
+      if (path === "/api/converse/conversations" && req.method === "POST") {
+        const rec = (await req.json().catch(() => null)) as ConversationRecord | null;
+        if (!rec?.id || !Array.isArray(rec.turns)) return err(400, "expected a conversation record { id, turns[] }");
+        await saveConversationRecord(rec);
+        return json({ ok: true, id: rec.id });
+      }
+      if (path === "/api/converse/conversations" && req.method === "GET") {
+        return json(await listConversationSummaries());
+      }
+      {
+        const m = path.match(/^\/api\/converse\/conversations\/([A-Za-z0-9_-]+)$/);
+        if (m && req.method === "GET") {
+          const rec = await getConversationRecord(m[1]);
+          return rec ? json(rec) : err(404, "conversation not found");
+        }
       }
       {
         const m = path.match(/^\/api\/voice\/rt\/tools\/([a-z0-9_]+)$/);

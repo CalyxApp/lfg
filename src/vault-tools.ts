@@ -267,6 +267,83 @@ export function listByType(repoCwd: string, type: string, limit?: number): Respo
   return json({ type: t.toLowerCase(), count: items.length, returned: compact.length, truncated, items: compact });
 }
 
+// ---- live session context (injected at the start of a Converse session) ----
+
+// Statuses that mean "not active" for projects, and "not open" for tasks.
+const CLOSED_STATUS = new Set(["done", "complete", "completed", "cancelled", "canceled", "archived", "dropped"]);
+const WEEKDAY = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function ymd(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Build the SESSION CONTEXT block injected into a fresh Converse session so the
+ * assistant isn't cold on turn 1 (Sam: "the agent doesn't know the list of active
+ * projects, or tasks due from the past week"). Includes today's date, every active
+ * project, and the tasks overdue within the past 7 days or due in the next 7 days
+ * (no cap — Sam's call). Best-effort: any failure returns "" so token minting never
+ * breaks. Labelled "may be stale" so the model re-checks with list_by_type when it
+ * needs certainty. Email addresses are intentionally omitted for now (deferred).
+ */
+export function buildVaultContext(repoCwd: string, now: Date = new Date()): string {
+  try {
+    const today = ymd(now);
+    const past = new Date(now);
+    past.setDate(past.getDate() - 7);
+    const future = new Date(now);
+    future.setDate(future.getDate() + 7);
+    const past7 = ymd(past);
+    const next7 = ymd(future);
+
+    const { docs } = scanVault(repoCwd);
+    const projects: string[] = [];
+    for (const d of docs) {
+      if (d.type !== "project") continue;
+      const status = str(d.properties.status)?.toLowerCase();
+      if (status && CLOSED_STATUS.has(status)) continue;
+      projects.push(status && status !== "active" ? `${d.title} [${status}]` : d.title);
+    }
+
+    const { items } = vaultItems(repoCwd, "task");
+    const overdue: string[] = [];
+    const upcoming: string[] = [];
+    for (const it of items) {
+      const status = typeof it.status === "string" ? it.status.toLowerCase() : "";
+      if (status && CLOSED_STATUS.has(status)) continue;
+      const dueRaw = typeof it.due === "string" ? it.due.trim() : "";
+      const m = /^(\d{4}-\d{2}-\d{2})/.exec(dueRaw);
+      if (!m) continue;
+      const due = m[1];
+      const title = typeof it.title === "string" && it.title.trim() ? it.title.trim() : "(untitled)";
+      const bits: string[] = [`due ${due}`];
+      if (typeof it.priority === "string" && it.priority.trim()) bits.push(`${it.priority.trim()} priority`);
+      if (typeof it.project === "string" && it.project.trim()) bits.push(`project: ${it.project.trim()}`);
+      const line = `- ${title} — ${bits.join(", ")}`;
+      if (due >= past7 && due < today) overdue.push(line);
+      else if (due >= today && due <= next7) upcoming.push(line);
+    }
+    overdue.sort();
+    upcoming.sort();
+
+    const sections: string[] = [
+      "# Session context (live snapshot; may be stale — re-check with the tools)",
+      `Today is ${WEEKDAY[now.getDay()]}, ${today}.`,
+      projects.length
+        ? `Active projects (${projects.length}): ${projects.join("; ")}.`
+        : "Active projects: none found.",
+    ];
+    if (overdue.length) sections.push(`Tasks overdue (past 7 days), ${overdue.length}:\n${overdue.join("\n")}`);
+    if (upcoming.length) sections.push(`Tasks due in the next 7 days, ${upcoming.length}:\n${upcoming.join("\n")}`);
+    if (!overdue.length && !upcoming.length) {
+      sections.push("No tasks overdue in the past week or due in the next 7 days.");
+    }
+    return sections.join("\n\n");
+  } catch {
+    return "";
+  }
+}
+
 /** browse — one folder level; each .md entry enriched with its type + title. */
 export async function browseVault(repoCwd: string, path?: string): Promise<Response> {
   const rel = (path ?? "").trim().replace(/^\/+|\/+$/g, "");
@@ -692,12 +769,31 @@ export const VAULT_TOOL_SCHEMAS = [
 ];
 
 /**
+ * No-op tool the REALTIME voice model calls to stay silent when what it heard was
+ * ambient noise / silence / a side conversation rather than speech addressed to it
+ * (OpenAI's recommended "wait_for_user" pattern for noisy rooms). It's NOT part of
+ * the vault suite — the typed chat has no ambient audio — so voice-rt.ts appends it
+ * to the realtime tool list on its own. runVaultTool still dispatches it (harmless
+ * if the text model ever calls it). The client suppresses the follow-up
+ * response.create for this tool so the model isn't forced to speak.
+ */
+export const WAIT_FOR_USER_TOOL = {
+  type: "function",
+  name: "wait_for_user",
+  description:
+    "Stay silent and keep listening. Call this INSTEAD of replying when what you heard was not speech addressed to you — silence, background noise, music, a TV, or a side conversation. Takes no arguments and produces no spoken reply.",
+  parameters: { type: "object", properties: {} },
+};
+
+/**
  * Dispatch a relayed tool call. Pure over (repoCwd, args); serve.ts resolves the repo
  * inline. Returns stringifiable JSON the browser forwards to the model verbatim.
  */
 export async function runVaultTool(name: string, repoCwd: string, args: Record<string, unknown>): Promise<Response> {
   try {
     switch (name) {
+      case "wait_for_user":
+        return json({ ok: true, waiting: true });
       case "describe_vault":
         return describeVault(repoCwd, str(args.type));
       case "search":

@@ -17,13 +17,40 @@
 // the workspace vault as an `ai-voice-conversation` note (unchanged).
 
 import { useEffect, useRef, useState } from "react";
-import { marked } from "marked";
-import { ArrowUp, AudioLines, Mic, MicOff, Square, X } from "lucide-react";
+import {
+  ArrowUp,
+  AudioLines,
+  File as FileIcon,
+  History,
+  Mic,
+  MicOff,
+  Paperclip,
+  Square,
+  Volume2,
+  VolumeX,
+  X,
+} from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
+import { VoiceMeter } from "./components/voice-meter";
+import { type ToolDetail } from "./components/tool-card";
+import { ConversationTurns } from "./components/conversation-turns";
+import { ConversationHistory } from "./conversation-history";
+import {
+  primeAudio,
+  playReady,
+  playError,
+  startWorking,
+  stopWorking,
+  areSoundsMuted,
+  setSoundsMuted,
+} from "./lib/earcons";
 
 const CALLS_URL = "https://api.openai.com/v1/realtime/calls";
-const MODEL = "gpt-realtime-2.1-mini";
+const MODEL = "gpt-realtime-2.1";
+// Unresolved "…" speech placeholders are cleared after this long if no transcript
+// ever arrives (noise-triggered VAD, empty transcription) so they don't stick.
+const PLACEHOLDER_TTL_MS = 9000;
 
 type Mode = "chat" | "voice";
 type VoiceStatus = "connecting" | "live" | "error";
@@ -31,7 +58,32 @@ type Phase = "live" | "review";
 // `id` keys realtime-voice turns so their text can be upserted in place as
 // transcript deltas stream in (see handleEvent) — that's what keeps the thread
 // in sync with the audio you actually hear. `ok` marks a tool chip's outcome.
-type LogEntry = { role: "you" | "assistant" | "tool" | "system"; text: string; id?: string; ok?: boolean };
+type LogEntry = {
+  role: "you" | "assistant" | "tool" | "system";
+  text: string;
+  id?: string;
+  ok?: boolean;
+  tool?: ToolDetail; // set on tool rows → expandable input/result preview
+  images?: string[]; // data: URLs shown as thumbnails on a "you" turn
+  files?: string[]; // attached non-image file names shown as chips on a "you" turn
+  // Per-file plumbing for re-sending across turns/modes: file_id (chat, native) +
+  // extracted text (voice, since realtime can't read documents). `files` is the
+  // display-name mirror of this.
+  fileData?: { name: string; fileId?: string; text?: string }[];
+};
+
+// Something the user attached to the composer. Images go inline as base64
+// (dataUrl); other files (PDF/doc) upload to the OpenAI Files API and carry a
+// fileId once the upload finishes.
+type Attachment = {
+  id: string;
+  name: string;
+  kind: "image" | "file";
+  dataUrl?: string; // images
+  fileId?: string; // files, once uploaded
+  status: "ready" | "uploading" | "failed";
+};
+const MAX_ATTACHMENTS = 6;
 
 // Friendly one-line label for a tool call — "Created project “X”", not raw
 // JSON args (Sam, 2026-07-22: tool calls looked like "a whole bunch of random
@@ -82,6 +134,11 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<LogEntry[]>([]);
+  // cue-sound mute (earcons) — distinct from `muted` above, which mutes the mic
+  const [soundsMuted, setSoundsMutedState] = useState(areSoundsMuted());
+  // Bumped to force a voice reconnect after a dropped WebRTC connection.
+  const [connNonce, setConnNonce] = useState(0);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   // chat-mode state
   const [input, setInput] = useState("");
@@ -98,6 +155,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const [sending, setSending] = useState(false);
   const [cfg, setCfg] = useState<ChatConfig | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // review-step state
   const [title, setTitle] = useState("");
@@ -122,6 +182,56 @@ export function Converse({ onClose }: { onClose: () => void }) {
       return next;
     });
 
+  const appendUser = (
+    text: string,
+    images?: string[],
+    fileData?: { name: string; fileId?: string; text?: string }[],
+  ) =>
+    setLog((l) => {
+      const entry: LogEntry = { role: "you", text };
+      if (images && images.length) entry.images = images;
+      if (fileData && fileData.length) {
+        entry.fileData = fileData;
+        entry.files = fileData.map((f) => f.name);
+      }
+      const next = [...l.slice(-60), entry];
+      logRef.current = next;
+      return next;
+    });
+
+  // Build the prior-turn chat history as rich content so typed chat re-references
+  // earlier uploads (images + files) later in the conversation and across a
+  // voice→chat switch — not just on the turn they were attached.
+  function buildChatHistory(): { role: string; content: unknown }[] {
+    const out: { role: string; content: unknown }[] = [];
+    for (const e of logRef.current) {
+      if (e.role === "assistant") {
+        if (e.text) out.push({ role: "assistant", content: e.text });
+        continue;
+      }
+      if (e.role !== "you" || e.text === "…") continue;
+      const parts: Record<string, unknown>[] = [];
+      if (e.text) parts.push({ type: "text", text: e.text });
+      for (const src of e.images ?? []) parts.push({ type: "image_url", image_url: { url: src } });
+      for (const f of e.fileData ?? []) if (f.fileId) parts.push({ type: "file", file: { file_id: f.fileId } });
+      if (parts.length === 0) continue;
+      out.push({ role: "user", content: parts.length === 1 && e.text ? e.text : parts });
+    }
+    return out;
+  }
+
+  // Tool row carrying the full call detail (name/args/result) so the chip can
+  // expand to a preview. `label` stays the friendly one-liner from toolLabel().
+  const appendTool = (name: string, args: Record<string, unknown>, ok: boolean | undefined, result?: string) =>
+    setLog((l) => {
+      const next = [
+        ...l.slice(-60),
+        { role: "tool" as const, text: toolLabel(name, args, ok), ok, tool: { name, args, result, ok } },
+      ];
+      logRef.current = next;
+      return next;
+    });
+
   // Insert-or-update a voice turn by realtime item id. Lets speech placeholders
   // and streaming transcript deltas update one entry in place, in the position
   // it was first heard — instead of whole turns popping in out of order when
@@ -139,14 +249,155 @@ export function Converse({ onClose }: { onClose: () => void }) {
       logRef.current = next;
       return next;
     });
+  // ---- image attachments (typed chat) ----
+  function readAsDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result));
+      r.onerror = () => reject(r.error);
+      r.readAsDataURL(file);
+    });
+  }
+  async function uploadFile(id: string, f: File) {
+    try {
+      const res = await fetch(`/api/voice/rt/upload-file?filename=${encodeURIComponent(f.name)}`, {
+        method: "POST",
+        headers: { "Content-Type": f.type || "application/octet-stream" },
+        body: f,
+      });
+      if (!res.ok) throw new Error((await res.text()).slice(0, 200));
+      const j = (await res.json()) as { file_id: string };
+      setAttachments((a) => a.map((x) => (x.id === id ? { ...x, fileId: j.file_id, status: "ready" } : x)));
+    } catch {
+      setAttachments((a) => a.map((x) => (x.id === id ? { ...x, status: "failed" } : x)));
+    }
+  }
+  async function addFiles(files: FileList | File[] | null) {
+    if (!files) return;
+    const arr = Array.from(files);
+    if (!arr.length) return;
+    const room = Math.max(0, MAX_ATTACHMENTS - attachments.length);
+    for (const f of arr.slice(0, room)) {
+      const id = `${f.name}-${f.size}-${Math.random().toString(36).slice(2, 7)}`;
+      if (f.type.startsWith("image/")) {
+        // images ride inline as base64 — no upload needed
+        try {
+          const dataUrl = await readAsDataUrl(f);
+          setAttachments((a) =>
+            a.length >= MAX_ATTACHMENTS ? a : [...a, { id, name: f.name, kind: "image", dataUrl, status: "ready" }],
+          );
+        } catch {
+          /* skip unreadable image */
+        }
+      } else {
+        // other files → upload to the Files API, reference by file_id
+        setAttachments((a) =>
+          a.length >= MAX_ATTACHMENTS ? a : [...a, { id, name: f.name, kind: "file", status: "uploading" }],
+        );
+        void uploadFile(id, f);
+      }
+    }
+  }
+  const removeAttachment = (id: string) => setAttachments((a) => a.filter((x) => x.id !== id));
+
   // running transcript per realtime item while its deltas stream in
   const rtTextRef = useRef<Record<string, string>>({});
+  // timers that clear an unresolved "…" user placeholder (see handleEvent)
+  const placeholderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const retryRef = useRef(0); // reconnect attempts for the current voice session
+  const ctxTimerRef = useRef<ReturnType<typeof setInterval> | null>(null); // voice context refresh
+
+  // ---- per-session debug log (Sam wants every realtime call recorded) ----
+  // The browser holds WebRTC directly to OpenAI, so the server can't see the
+  // transcript/turn events. We batch them here and POST to /api/voice/rt/log,
+  // which appends JSONL to data/converse-logs/ (git-ignored, local). Buffered +
+  // flushed on a timer / at teardown so a crash mid-call still leaves a trail.
+  const sessionIdRef = useRef<string | null>(null);
+  const logBufRef = useRef<Record<string, unknown>[]>([]);
+  const logTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // One debug-log id per Converse surface — spans text turns, the voice call, and
+  // any reconnects, so a single conversation is one file.
+  function ensureSessionId() {
+    if (!sessionIdRef.current) {
+      sessionIdRef.current = `${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+    }
+  }
+
+  function flushLog() {
+    const sid = sessionIdRef.current;
+    if (logTimerRef.current) {
+      clearTimeout(logTimerRef.current);
+      logTimerRef.current = null;
+    }
+    if (!sid || logBufRef.current.length === 0) return;
+    const events = logBufRef.current;
+    logBufRef.current = [];
+    // fire-and-forget; keepalive lets it survive the surface closing
+    void fetch("/api/voice/rt/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId: sid, events }),
+      keepalive: true,
+    }).catch(() => {
+      /* best-effort debug log */
+    });
+  }
+
+  function logEvent(kind: string, data: Record<string, unknown>) {
+    if (!sessionIdRef.current) return;
+    logBufRef.current.push({ t: new Date().toISOString(), kind, ...data });
+    if (logBufRef.current.length >= 20) flushLog();
+    else if (!logTimerRef.current) logTimerRef.current = setTimeout(flushLog, 2500);
+  }
+
+  function toggleSounds() {
+    const next = !soundsMuted;
+    setSoundsMuted(next); // earcons module (persists + stops any working loop)
+    setSoundsMutedState(next); // local UI state for the toggle icon
+  }
+
+  // Resolve a user-speech transcript onto its placeholder. Prefer the matching
+  // item id; fall back to the most recent unresolved "…" placeholder when ids
+  // don't line up (or none was given) so the text can't land after the reply.
+  function resolveUserTranscript(itemId: string | undefined, text: string) {
+    if (itemId && placeholderTimers.current[itemId]) {
+      clearTimeout(placeholderTimers.current[itemId]);
+      delete placeholderTimers.current[itemId];
+    }
+    setLog((l) => {
+      let idx = itemId ? l.findIndex((e) => e.id === itemId) : -1;
+      if (idx < 0) {
+        for (let i = l.length - 1; i >= 0; i--) {
+          if (l[i].role === "you" && l[i].text === "…") {
+            idx = i;
+            break;
+          }
+        }
+      }
+      let next: LogEntry[];
+      if (idx >= 0) {
+        next = [...l];
+        next[idx] = { ...next[idx], role: "you", text };
+      } else {
+        next = [...l.slice(-60), { id: itemId, role: "you", text }];
+      }
+      logRef.current = next;
+      return next;
+    });
+  }
 
   // keep the thread pinned to the latest turn
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [log, sending, mode]);
+
+  // Flush any buffered debug events when the whole surface unmounts (covers a
+  // text-only conversation that never mounted the voice effect).
+  useEffect(() => () => flushLog(), []);
 
   // which chat model powers typed turns (selection persists server-side)
   useEffect(() => {
@@ -185,13 +436,33 @@ export function Converse({ onClose }: { onClose: () => void }) {
   // dictation stop-&-send path can use it.
   async function sendChatText(raw: string) {
     const text = raw.trim();
-    if (!text || sending) return;
+    // Only send attachments that finished (drop still-uploading / failed ones).
+    const atts = attachments.filter((a) => a.status === "ready");
+    if ((!text && atts.length === 0) || sending || attachments.some((a) => a.status === "uploading")) return;
     if (!startedAtRef.current) startedAtRef.current = Date.now();
-    const messages = [
-      ...threadTurns().map((e) => ({ role: e.role === "you" ? "user" : "assistant", content: e.text })),
-      { role: "user", content: text },
-    ];
-    append("you", text);
+    // Outgoing content: a plain string when nothing's attached, else text + parts
+    // (images as inline base64 image_url; files as Files-API file_id references).
+    type Part =
+      | { type: "text"; text: string }
+      | { type: "image_url"; image_url: { url: string } }
+      | { type: "file"; file: { file_id: string } };
+    const parts: Part[] = [];
+    if (text) parts.push({ type: "text", text });
+    for (const a of atts) {
+      if (a.kind === "image" && a.dataUrl) parts.push({ type: "image_url", image_url: { url: a.dataUrl } });
+      else if (a.kind === "file" && a.fileId) parts.push({ type: "file", file: { file_id: a.fileId } });
+    }
+    const hasAttParts = parts.some((p) => p.type !== "text");
+    const userContent: string | Part[] = hasAttParts ? parts : text;
+    const messages = [...buildChatHistory(), { role: "user", content: userContent }];
+    appendUser(
+      text,
+      atts.filter((a) => a.kind === "image" && a.dataUrl).map((a) => a.dataUrl as string),
+      atts.filter((a) => a.kind === "file").map((a) => ({ name: a.name, fileId: a.fileId })),
+    );
+    setAttachments([]);
+    ensureSessionId();
+    logEvent("chat_user", { text, images: atts.filter((a) => a.kind === "image").length, files: atts.filter((a) => a.kind === "file").length });
     setInput("");
     setSending(true);
     setError(null);
@@ -204,12 +475,15 @@ export function Converse({ onClose }: { onClose: () => void }) {
       if (!res.ok) throw new Error(`chat ${res.status}: ${(await res.text()).slice(0, 300)}`);
       const data = (await res.json()) as {
         text: string;
-        toolCalls?: { name: string; args: Record<string, unknown>; ok?: boolean }[];
+        toolCalls?: { name: string; args: Record<string, unknown>; ok?: boolean; result?: string }[];
       };
-      for (const tc of data.toolCalls ?? []) append("tool", toolLabel(tc.name, tc.args, tc.ok), tc.ok);
+      for (const tc of data.toolCalls ?? []) appendTool(tc.name, tc.args, tc.ok, tc.result);
       if (data.text) append("assistant", data.text);
+      logEvent("chat_assistant", { text: data.text, toolCalls: data.toolCalls ?? [] });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      logEvent("chat_error", { message: msg });
     } finally {
       setSending(false);
     }
@@ -233,6 +507,10 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
   // ---------------- voice mode: realtime session lifecycle ----------------
   function teardownVoice() {
+    if (ctxTimerRef.current) {
+      clearInterval(ctxTimerRef.current);
+      ctxTimerRef.current = null;
+    }
     try {
       dcRef.current?.close();
     } catch {
@@ -269,6 +547,25 @@ export function Converse({ onClose }: { onClose: () => void }) {
     } catch {
       /* leave empty */
     }
+
+    // wait_for_user: the model chose to stay silent on ambient noise/silence.
+    // Acknowledge the call but DON'T trigger a response (no forced reply) and
+    // don't clutter the thread with a chip.
+    if (name === "wait_for_user") {
+      logEvent("tool", { name, args, waiting: true });
+      const dc = dcRef.current;
+      if (dc && dc.readyState === "open") {
+        dc.send(
+          JSON.stringify({
+            type: "conversation.item.create",
+            item: { type: "function_call_output", call_id: callId, output: JSON.stringify({ ok: true, waiting: true }) },
+          }),
+        );
+      }
+      return;
+    }
+
+    startWorking(); // subtle "something's happening" heartbeat while the tool runs
     let output: string;
     try {
       const res = await fetch(`/api/voice/rt/tools/${name}`, {
@@ -279,6 +576,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
       output = await res.text();
     } catch (e) {
       output = JSON.stringify({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      stopWorking();
     }
     // Friendly outcome chip (not raw args): parse the tool result for ok/error.
     let ok: boolean | undefined;
@@ -288,7 +587,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
     } catch {
       /* unknown outcome */
     }
-    append("tool", toolLabel(name, args, ok), ok);
+    logEvent("tool", { name, args, ok, output: output.slice(0, 2000) });
+    appendTool(name, args, ok, output);
     const dc = dcRef.current;
     if (!dc || dc.readyState !== "open") return;
     dc.send(
@@ -301,6 +601,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
   }
 
   function handleEvent(ev: any) {
+    // Debug log: every realtime event, verbatim, to this session's JSONL.
+    logEvent("rt", { event: ev });
     switch (ev?.type) {
       case "response.done":
         for (const item of ev.response?.output ?? []) {
@@ -311,8 +613,23 @@ export function Converse({ onClose }: { onClose: () => void }) {
       // the transcription itself arrives seconds later (often AFTER the
       // assistant has begun replying), which is what made the transcript feel
       // out of sync with the audio. The placeholder pins the correct position.
+      // A TTL clears it if the transcription never arrives (noise-triggered VAD).
       case "input_audio_buffer.speech_started":
-        if (ev.item_id) upsert(ev.item_id, "you", "…");
+        if (ev.item_id) {
+          const id = ev.item_id as string;
+          upsert(id, "you", "…");
+          if (placeholderTimers.current[id]) clearTimeout(placeholderTimers.current[id]);
+          placeholderTimers.current[id] = setTimeout(() => {
+            delete placeholderTimers.current[id];
+            setLog((l) => {
+              const idx = l.findIndex((e) => e.id === id);
+              if (idx < 0 || l[idx].text !== "…") return l; // resolved meanwhile
+              const next = l.filter((_, i) => i !== idx);
+              logRef.current = next;
+              return next;
+            });
+          }, PLACEHOLDER_TTL_MS);
+        }
         break;
       // Stream the assistant's transcript word-by-word as it speaks (instead of
       // one paragraph popping in when the whole utterance is done).
@@ -331,13 +648,12 @@ export function Converse({ onClose }: { onClose: () => void }) {
         }
         break;
       case "conversation.item.input_audio_transcription.completed":
-        if (ev.transcript) {
-          if (ev.item_id) upsert(ev.item_id, "you", ev.transcript);
-          else append("you", ev.transcript);
-        }
+        // Resolve onto the pinned placeholder (id match, else newest unresolved).
+        if (ev.transcript) resolveUserTranscript(ev.item_id, ev.transcript);
         break;
       case "error":
         setError(ev.error?.message ?? "realtime error");
+        playError();
         break;
       default:
         break;
@@ -353,6 +669,32 @@ export function Converse({ onClose }: { onClose: () => void }) {
     async function connect() {
       try {
         const user = localStorage.getItem("lfg_user") || "anon";
+        ensureSessionId();
+        primeAudio(); // unlock WebAudio on this user-gesture-initiated connect
+        logEvent("session_start", { user, model: MODEL, attempt: retryRef.current });
+        // Realtime can't read documents — pre-extract any attached files' text so
+        // the replay can hand it to the voice model as context (cached on the turn,
+        // so reconnects/re-switches don't re-extract).
+        const toExtract = logRef.current.flatMap((e) =>
+          e.role === "you" ? (e.fileData ?? []).filter((f) => f.fileId && !f.text) : [],
+        );
+        if (toExtract.length) {
+          await Promise.all(
+            toExtract.map(async (f) => {
+              try {
+                const r = await fetch("/api/voice/rt/file-text", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ file_id: f.fileId }),
+                });
+                if (r.ok) f.text = ((await r.json()) as { text?: string }).text || "";
+              } catch {
+                /* leave without text — replay falls back to a name mention */
+              }
+            }),
+          );
+          if (cancelled) return;
+        }
         const tokenRes = await fetch(`/api/voice/rt/token?user=${encodeURIComponent(user)}`, { method: "POST" });
         if (!tokenRes.ok) throw new Error(`token ${tokenRes.status}: ${await tokenRes.text()}`);
         const { value: ephemeralKey } = (await tokenRes.json()) as { value: string };
@@ -363,6 +705,21 @@ export function Converse({ onClose }: { onClose: () => void }) {
         pcRef.current = pc;
         pc.ontrack = (e) => {
           if (audioRef.current) audioRef.current.srcObject = e.streams[0];
+        };
+        // Auto-reconnect once or twice on a dropped connection before giving up.
+        pc.onconnectionstatechange = () => {
+          const st = pc.connectionState;
+          logEvent("conn", { state: st });
+          if (st === "failed" && !cancelled) {
+            if (retryRef.current < 2) {
+              retryRef.current++;
+              setConnNonce((n) => n + 1); // effect cleanup tears down, then reconnects
+            } else {
+              setError("voice connection lost — tap End and start again");
+              setVoiceStatus("error");
+              playError();
+            }
+          }
         };
 
         // Explicit echo cancellation / noise suppression: the phone speaker's
@@ -380,27 +737,59 @@ export function Converse({ onClose }: { onClose: () => void }) {
         dc.onopen = () => {
           if (cancelled) return;
           // One shared thread: replay what was already typed/spoken into the new
-          // realtime session so the spoken assistant has the full conversation.
+          // realtime session so the spoken assistant has the full conversation —
+          // including images the user attached in chat (realtime supports image
+          // input). Files are noted by name (realtime can't read documents; the
+          // assistant's own replies about them carry over as text).
           for (const e of logRef.current) {
             if (e.role !== "you" && e.role !== "assistant") continue;
+            let content: Record<string, unknown>[];
+            if (e.role === "you") {
+              content = [];
+              if (e.text && e.text !== "…") content.push({ type: "input_text", text: e.text });
+              for (const src of e.images ?? []) content.push({ type: "input_image", image_url: src });
+              for (const f of e.fileData ?? [])
+                content.push({
+                  type: "input_text",
+                  text: f.text
+                    ? `(Contents of the file "${f.name}" the user shared:\n${f.text})`
+                    : `(The user shared a file: ${f.name})`,
+                });
+              if (content.length === 0) continue;
+            } else {
+              if (!e.text) continue;
+              content = [{ type: "text", text: e.text }];
+            }
             dc.send(
               JSON.stringify({
                 type: "conversation.item.create",
-                item: {
-                  type: "message",
-                  role: e.role === "you" ? "user" : "assistant",
-                  content: [
-                    e.role === "you"
-                      ? { type: "input_text", text: e.text }
-                      : { type: "text", text: e.text },
-                  ],
-                },
+                item: { type: "message", role: e.role === "you" ? "user" : "assistant", content },
               }),
             );
           }
           if (!startedAtRef.current) startedAtRef.current = Date.now();
           usedVoiceRef.current = true;
+          retryRef.current = 0; // a clean open clears the reconnect budget
           setVoiceStatus("live");
+          playReady(); // soft chime: the session is listening — start talking
+          // Keep the context snapshot fresh through a long call: re-push updated
+          // instructions (date/projects/tasks) via session.update every few minutes.
+          if (ctxTimerRef.current) clearInterval(ctxTimerRef.current);
+          ctxTimerRef.current = setInterval(() => {
+            const u = localStorage.getItem("lfg_user") || "anon";
+            void fetch(`/api/voice/rt/instructions?user=${encodeURIComponent(u)}`)
+              .then((r) => (r.ok ? r.json() : null))
+              .then((j) => {
+                const d = dcRef.current;
+                if (j?.instructions && d && d.readyState === "open") {
+                  d.send(JSON.stringify({ type: "session.update", session: { instructions: j.instructions } }));
+                  logEvent("context_refresh", {});
+                }
+              })
+              .catch(() => {
+                /* best-effort refresh */
+              });
+          }, 150000);
         };
         dc.onmessage = (e) => {
           try {
@@ -423,18 +812,23 @@ export function Converse({ onClose }: { onClose: () => void }) {
         if (!cancelled) append("system", "Voice connected — start talking.");
       } catch (e) {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : String(e));
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(msg);
         setVoiceStatus("error");
+        playError();
+        logEvent("error", { message: msg });
       }
     }
 
     void connect();
     return () => {
       cancelled = true;
+      stopWorking();
       teardownVoice();
+      flushLog(); // persist whatever's buffered before we drop the session
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [mode, connNonce]);
 
   // ---------------- close / save ----------------
   function buildTranscript(): string {
@@ -444,10 +838,14 @@ export function Converse({ onClose }: { onClose: () => void }) {
     return `## Transcript\n\n${body}\n`;
   }
 
-  // Close the surface → tear down voice if live, then the save-review step
-  // (unless nothing was said, in which case just close).
-  function closeSurface() {
+  // Close the surface → tear down voice if live, AUTO-SAVE the conversation to the
+  // vault (no manual review step — Sam 2026-07-29: "just automatically save it
+  // somewhere so I can revisit these"), then close. Best-effort: we still close if
+  // the save fails (the raw per-session debug log under data/converse-logs is the
+  // backstop). Every conversation with real turns is kept.
+  async function closeSurface() {
     if (mode === "voice") setMode("chat"); // effect cleanup tears the session down
+    flushLog();
     if (threadTurns().length === 0) {
       onClose();
       return;
@@ -460,14 +858,56 @@ export function Converse({ onClose }: { onClose: () => void }) {
       ...(cfg ? [`${cfg.settings.provider}/${cfg.settings.model}`] : []),
       ...(usedVoiceRef.current ? [MODEL] : []),
     ];
-    setTitle(firstUser ? firstUser.slice(0, 60) : `Voice note ${dateStr}`);
-    setTags([]);
-    setProperties([
-      { key: "date", value: dateStr },
-      { key: "duration", value: formatDuration(durMs) },
-      { key: "model", value: models.join(" + ") || MODEL },
-    ]);
-    setPhase("review");
+    const noteTitle = firstUser ? firstUser.slice(0, 60) : `Voice note ${dateStr}`;
+    const model = models.join(" + ") || MODEL;
+    const noteProps = { date: dateStr, duration: formatDuration(durMs), model };
+
+    // (1) human-friendly markdown note in the vault (Calyx export, unchanged).
+    try {
+      await fetch("/api/voice/rt/save-conversation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: noteTitle, tags: [], properties: noteProps, transcript: buildTranscript() }),
+        keepalive: true,
+      });
+    } catch {
+      /* raw debug log is the backstop */
+    }
+
+    // (2) structured record for the universal view — the machine-readable source
+    // of truth (keeps tool calls + attachments the markdown drops). Written behind
+    // the storage adapter (see docs/converse-universal-view.md).
+    ensureSessionId();
+    const turns = logRef.current
+      .filter((e) => !(e.role === "you" && e.text === "…"))
+      .filter((e) => e.text.trim() || (e.images && e.images.length) || (e.files && e.files.length) || e.tool)
+      .map((e) => ({
+        role: e.role,
+        text: e.text,
+        ...(e.ok !== undefined ? { ok: e.ok } : {}),
+        ...(e.tool ? { tool: e.tool } : {}),
+        ...(e.images ? { images: e.images } : {}),
+        ...(e.files ? { files: e.files } : {}),
+      }));
+    try {
+      await fetch("/api/converse/conversations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: sessionIdRef.current,
+          title: noteTitle,
+          date: dateStr,
+          model,
+          durationMs: durMs,
+          createdAt: new Date().toISOString(),
+          turns,
+        }),
+        keepalive: true,
+      });
+    } catch {
+      /* non-fatal — the markdown note + debug log still exist */
+    }
+    onClose();
   }
 
   async function handleSave() {
@@ -550,10 +990,12 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const activeProvider = cfg?.providers.find((p) => p.id === cfg.settings.provider);
   const modelChip = cfg ? `${activeProvider?.label ?? cfg.settings.provider} · ${cfg.settings.model}` : null;
   const hasText = !!input.trim();
+  const uploading = attachments.some((a) => a.status === "uploading");
 
   return (
     <div className="fixed inset-0 z-[1000] flex flex-col bg-background text-foreground">
       <audio ref={audioRef} autoPlay />
+      {historyOpen && <ConversationHistory onClose={() => setHistoryOpen(false)} />}
 
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <strong className="text-base font-semibold">Chat</strong>
@@ -573,6 +1015,14 @@ export function Converse({ onClose }: { onClose: () => void }) {
               {modelChip}
             </button>
           ) : null}
+          <button
+            className="flex size-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
+            onClick={() => setHistoryOpen(true)}
+            aria-label="Past conversations"
+            title="Past conversations"
+          >
+            <History className="size-4" />
+          </button>
           <button
             className="flex size-8 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
             onClick={closeSurface}
@@ -626,40 +1076,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
           </div>
         ) : (
           <div className="flex flex-col gap-3">
-            {log.map((e, i) =>
-              e.role === "you" ? (
-                <div
-                  key={i}
-                  className="msg-text markdown user-bubble ml-auto w-fit max-w-[85%] whitespace-pre-wrap text-base"
-                >
-                  {e.text}
-                </div>
-              ) : e.role === "assistant" ? (
-                // Rendered markdown (same .msg-text.markdown styles as the
-                // agent chat) — assistant replies use headings/lists/bold.
-                <div
-                  key={i}
-                  className="msg-text markdown max-w-full text-base"
-                  dangerouslySetInnerHTML={{ __html: marked.parse(e.text, { async: false }) as string }}
-                />
-              ) : e.role === "tool" ? (
-                <div key={i} className="flex">
-                  <span
-                    className={`inline-flex w-fit items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${
-                      e.ok === false
-                        ? "border-destructive/40 bg-destructive/10 text-destructive"
-                        : "border-border bg-muted/40 text-muted-foreground"
-                    }`}
-                  >
-                    {e.ok === false ? "✗" : "✓"} {e.text}
-                  </span>
-                </div>
-              ) : (
-                <div key={i} className="text-center text-xs text-muted-foreground">
-                  {e.text}
-                </div>
-              ),
-            )}
+            <ConversationTurns turns={log} />
             {sending && <div className="text-sm text-muted-foreground">…</div>}
           </div>
         )}
@@ -667,6 +1084,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
       {mode === "voice" ? (
         <div className="flex items-center justify-center gap-3 border-t border-border px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          {voiceStatus === "live" && <VoiceMeter stream={micRef.current} active={voiceStatus === "live"} />}
           <span className="text-sm text-muted-foreground">
             {voiceStatus === "live"
               ? muted
@@ -676,6 +1094,15 @@ export function Converse({ onClose }: { onClose: () => void }) {
                 ? "connecting…"
                 : "voice error"}
           </span>
+          <button
+            type="button"
+            className="flex size-9 items-center justify-center rounded-full border border-border text-muted-foreground hover:text-foreground"
+            onClick={toggleSounds}
+            title={soundsMuted ? "Cue sounds off" : "Cue sounds on"}
+            aria-label={soundsMuted ? "Turn cue sounds on" : "Turn cue sounds off"}
+          >
+            {soundsMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+          </button>
           <button
             type="button"
             onClick={toggleMute}
@@ -706,19 +1133,101 @@ export function Converse({ onClose }: { onClose: () => void }) {
           <WaveformRecorderRow rec={dict} />
         </div>
       ) : (
-        <form
-          className="flex items-end gap-2 border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void sendChatText(input);
-          }}
-        >
+        <div className="border-t border-border bg-background">
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pt-2">
+              {attachments.map((a) => (
+                <div key={a.id} className="relative">
+                  {a.kind === "image" ? (
+                    <img
+                      src={a.dataUrl}
+                      alt={a.name}
+                      className="size-16 rounded-lg border border-border object-cover"
+                    />
+                  ) : (
+                    <div
+                      className={`flex h-16 max-w-[10rem] items-center gap-2 rounded-lg border px-3 text-xs ${
+                        a.status === "failed"
+                          ? "border-destructive/40 bg-destructive/10 text-destructive"
+                          : "border-border bg-muted/40 text-muted-foreground"
+                      }`}
+                    >
+                      <FileIcon className="size-4 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="truncate">{a.name}</div>
+                        <div className="text-[10px] opacity-70">
+                          {a.status === "uploading" ? "uploading…" : a.status === "failed" ? "failed" : "ready"}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => removeAttachment(a.id)}
+                    className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full border border-border bg-background text-muted-foreground shadow-sm hover:text-foreground"
+                    aria-label={`Remove ${a.name}`}
+                  >
+                    <X className="size-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <form
+            className={`flex items-end gap-2 px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] ${
+              dragging ? "rounded-2xl ring-2 ring-primary/50" : ""
+            }`}
+            onSubmit={(e) => {
+              e.preventDefault();
+              void sendChatText(input);
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              if (!dragging) setDragging(true);
+            }}
+            onDragLeave={(e) => {
+              e.preventDefault();
+              setDragging(false);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragging(false);
+              void addFiles(e.dataTransfer?.files ?? null);
+            }}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void addFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={sending || attachments.length >= MAX_ATTACHMENTS}
+              aria-label="Attach a file or image"
+              title="Attach a file or image (PDF, doc, image…)"
+            >
+              <Paperclip className="size-5 md:size-4" />
+            </button>
           <textarea
             ref={inputRef}
             rows={1}
             className="lfg-gfield max-h-[40vh] min-h-11 min-w-0 flex-1 resize-none overflow-y-auto rounded-2xl border-transparent px-4 py-2.5 text-base leading-6 shadow-sm placeholder:text-muted-foreground"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onPaste={(e) => {
+              const files = e.clipboardData?.files;
+              if (files && Array.from(files).some((f) => f.type.startsWith("image/"))) {
+                e.preventDefault();
+                void addFiles(files);
+              }
+            }}
             onKeyDown={(e) => {
               // Enter sends; Shift+Enter (or ⌘/Ctrl+Enter) inserts a newline.
               if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
@@ -741,12 +1250,13 @@ export function Converse({ onClose }: { onClose: () => void }) {
               <Mic className="size-5 md:size-4" />
             </button>
           )}
-          {/* Morphing button: ◉ voice when the box is empty, ↑ send when there's text. */}
-          {hasText ? (
+          {/* Morphing button: ◉ voice when empty, ↑ send when there's text or an image. */}
+          {hasText || attachments.length > 0 ? (
             <button
               type="submit"
               className="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground disabled:opacity-50 md:size-9"
-              disabled={sending}
+              disabled={sending || uploading}
+              title={uploading ? "Waiting for upload…" : "Send"}
               aria-label="Send"
             >
               <ArrowUp className="size-5 md:size-4" />
@@ -755,7 +1265,10 @@ export function Converse({ onClose }: { onClose: () => void }) {
             <button
               type="button"
               className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
-              onClick={() => setMode("voice")}
+              onClick={() => {
+                retryRef.current = 0;
+                setMode("voice");
+              }}
               disabled={sending}
               title="Start realtime voice conversation"
               aria-label="Start voice mode"
@@ -763,7 +1276,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
               <AudioLines className="size-5 md:size-4" />
             </button>
           )}
-        </form>
+          </form>
+        </div>
       )}
     </div>
   );
