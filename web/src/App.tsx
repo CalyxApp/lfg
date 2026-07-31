@@ -40,6 +40,11 @@ import {
   Bot,
   Boxes,
   Braces,
+  BarChart3,
+  Code2,
+  FileText,
+  FolderOpen,
+  NotebookPen,
   CalendarClock,
   Images,
   Package,
@@ -116,6 +121,7 @@ import { SearchView } from "@/components/SearchView";
 import { ArtifactInlineCard, ArtifactsView } from "@/components/ArtifactsView";
 import { ShippedView } from "@/components/ShippedView";
 import { ReportsView } from "@/components/ReportsView";
+import { CommandPalette, type PaletteCommand } from "@/components/CommandPalette";
 
 // Injected by Vite `define` at build time (see vite.config.ts).
 declare const __BUILD_STAMP__: string;
@@ -1937,6 +1943,9 @@ export function App() {
   const [notepadOpen, setNotepadOpen] = useState(false);
   const [callOpen, setCallOpen] = useState(false);
   const [converseOpen, setConverseOpen] = useState(false);
+  // Cmd/Ctrl+K command palette — an app-wide fuzzy launcher for navigation,
+  // actions, projects and sessions.
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [runLog, setRunLog] = useState<string | null>(null);
   // Auto agents
   // Tabs are "live" | "settings" | "ask" | "term" | "browser". Auto agents and runtime
@@ -2699,6 +2708,131 @@ export function App() {
     document.documentElement.classList.toggle("dark", next);
     setDark(next);
   }
+
+  // Global Cmd/Ctrl+K toggles the command palette from anywhere — including
+  // while typing in a composer. Bound once; setPaletteOpen is stable. The
+  // desktop stage's own keydown handler ignores modifier combos, so there's no
+  // conflict with its vim-style `k`.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Command palette entries: navigation, actions, projects, and sessions. All
+  // sourced from in-memory state — no extra API calls.
+  const paletteCommands = useMemo<PaletteCommand[]>(() => {
+    const nav: { id: string; label: string; kw: string; icon: ReactNode }[] = [
+      { id: "home", label: "Home", kw: "dashboard", icon: <House className="size-4" /> },
+      { id: "live", label: "Live feed", kw: "sessions agents feed", icon: <Radio className="size-4" /> },
+      { id: "auto", label: "Auto agents", kw: "automation scheduled", icon: <Bot className="size-4" /> },
+      { id: "brain", label: "Brain", kw: "notes memory patterns", icon: <Brain className="size-4" /> },
+      { id: "ask", label: "Ask center", kw: "questions human review", icon: <Bell className="size-4" /> },
+      { id: "usage", label: "Usage", kw: "tokens cost spend", icon: <BarChart3 className="size-4" /> },
+      { id: "coding-agents", label: "Coding agents", kw: "code", icon: <Code2 className="size-4" /> },
+      { id: "files", label: "Files", kw: "vault documents", icon: <FolderOpen className="size-4" /> },
+      { id: "capture", label: "Capture", kw: "note new quick", icon: <NotebookPen className="size-4" /> },
+      { id: "search", label: "Search", kw: "find grep transcripts", icon: <Search className="size-4" /> },
+      { id: "term", label: "Terminal", kw: "shell console", icon: <TerminalSquare className="size-4" /> },
+      { id: "browser", label: "Browser", kw: "web profiles", icon: <Globe className="size-4" /> },
+      { id: "changelog", label: "Changelog", kw: "updates releases", icon: <FileText className="size-4" /> },
+      { id: "settings", label: "Settings", kw: "preferences config", icon: <Settings className="size-4" /> },
+    ];
+    const cmds: PaletteCommand[] = nav.map((n) => ({
+      id: `goto-${n.id}`,
+      group: "Go to",
+      label: n.label,
+      keywords: n.kw,
+      icon: n.icon,
+      run: () => setTab(n.id),
+    }));
+
+    cmds.push({
+      id: "act-new",
+      group: "Actions",
+      label: "New session",
+      keywords: "create chat compose start",
+      icon: <Plus className="size-4" />,
+      run: () => {
+        if (isMobile) {
+          setComposerOpen(true);
+          setComposerFocusNonce((n) => n + 1);
+        } else {
+          setNewOpen(true);
+        }
+      },
+    });
+    cmds.push({
+      id: "act-converse",
+      group: "Actions",
+      label: "Open Converse",
+      keywords: "voice chat talk realtime",
+      icon: <MessageCircle className="size-4" />,
+      run: () => setConverseOpen(true),
+    });
+    cmds.push({
+      id: "act-theme",
+      group: "Actions",
+      label: dark ? "Switch to light mode" : "Switch to dark mode",
+      keywords: "theme appearance dark light",
+      icon: dark ? <Sun className="size-4" /> : <Moon className="size-4" />,
+      run: toggleTheme,
+    });
+
+    cmds.push({
+      id: "proj-all",
+      group: "Projects",
+      label: "All projects",
+      keywords: "everything clear filter",
+      icon: <Folder className="size-4" />,
+      run: () => {
+        setProjectFilter("__all");
+        setTab("live");
+      },
+    });
+    for (const p of projectOptions) {
+      if (p === MOBILE_NOTEPAD_FILTER) continue;
+      cmds.push({
+        id: `proj-${p}`,
+        group: "Projects",
+        label: shortProject(p),
+        keywords: p,
+        icon: <Folder className="size-4" />,
+        run: () => {
+          setProjectFilter(p);
+          setTab("live");
+        },
+      });
+    }
+
+    for (const s of sessions) {
+      if (!s.sessionId) continue;
+      const label = (s.title || s.lastUserText || "Untitled session").trim();
+      const sub = [s.project ? shortProject(s.project) : null, s.agent]
+        .filter(Boolean)
+        .join(" · ");
+      cmds.push({
+        id: `sess-${s.sessionId}`,
+        group: "Sessions",
+        label,
+        sublabel: sub || undefined,
+        keywords: `${s.project ?? ""} ${s.agent ?? ""}`,
+        icon: <MessageSquare className="size-4" />,
+        run: () => {
+          if (s.project) setProjectFilter(s.project);
+          setTab("live");
+        },
+      });
+    }
+
+    return cmds;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions, projectOptions, dark, isMobile]);
 
   async function runAgent(agent: string) {
     setRunLog("Starting agent run...");
@@ -3509,6 +3643,12 @@ export function App() {
           <Converse onClose={() => setConverseOpen(false)} />
         </Suspense>
       ) : null}
+
+      <CommandPalette
+        open={paletteOpen}
+        onOpenChange={setPaletteOpen}
+        commands={paletteCommands}
+      />
 
       {openFinding ? (
         <FindingSheet
