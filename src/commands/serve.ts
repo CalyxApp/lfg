@@ -327,7 +327,14 @@ import { enqueueMessage, listQueue, retryMessage, clearResolved, reconcileQueued
 import { startFleetWatcher, subscribeFleet, type FleetEvent } from "../voice-bus.ts";
 import { handleElevenLlm, handleElevenToken } from "../voice-eleven-llm.ts";
 import { resolveVoiceIntent, type VoiceIntentRequest } from "../voice-intent.ts";
-import { handleRtToken, runRtTool, saveConversation, handleRtLog, handleFileUpload } from "../voice-rt.ts";
+import {
+  handleRtToken,
+  runRtTool,
+  saveConversation,
+  handleRtLog,
+  handleFileUpload,
+  handleRtInstructions,
+} from "../voice-rt.ts";
 import {
   saveConversationRecord,
   listConversationSummaries,
@@ -1643,6 +1650,15 @@ export async function cmdServe() {
         const repo =
           repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
         return handleRtToken(req, repo?.cwd);
+      }
+      // Fresh voice instructions (re-pushed into a live session via session.update
+      // on a timer) so the context snapshot doesn't go stale mid-call. See voice-rt.ts.
+      if (path === "/api/voice/rt/instructions" && req.method === "GET") {
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo =
+          repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        return handleRtInstructions(req, repo?.cwd);
       }
       // Append a batch of realtime debug events to this session's local JSONL log
       // (data/converse-logs/, git-ignored). The browser streams its events here so

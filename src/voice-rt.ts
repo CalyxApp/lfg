@@ -154,6 +154,17 @@ function safeLogId(id: string): string {
 }
 
 /**
+ * GET /api/voice/rt/instructions — the current voice instructions with a FRESH
+ * SESSION CONTEXT block. The client re-pushes this into a live session via
+ * `session.update` on a timer so the date/projects/tasks snapshot doesn't go stale
+ * during a long call (voice bakes context in at connect time; this refreshes it).
+ */
+export async function handleRtInstructions(_req: Request, repoCwd?: string): Promise<Response> {
+  const context = repoCwd ? buildVaultContext(repoCwd) : "";
+  return json({ instructions: buildVoiceInstructions(context) });
+}
+
+/**
  * POST /api/voice/rt/upload-file?filename=… — proxy a non-image attachment (PDF,
  * doc, etc.) to the OpenAI Files API (purpose=user_data) so the typed chat can
  * reference it by file_id. The raw file is the request body; the OPENAI_API_KEY

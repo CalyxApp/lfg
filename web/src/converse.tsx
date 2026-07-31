@@ -273,6 +273,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
   // timers that clear an unresolved "…" user placeholder (see handleEvent)
   const placeholderTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const retryRef = useRef(0); // reconnect attempts for the current voice session
+  const ctxTimerRef = useRef<ReturnType<typeof setInterval> | null>(null); // voice context refresh
 
   // ---- per-session debug log (Sam wants every realtime call recorded) ----
   // The browser holds WebRTC directly to OpenAI, so the server can't see the
@@ -477,6 +478,10 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
   // ---------------- voice mode: realtime session lifecycle ----------------
   function teardownVoice() {
+    if (ctxTimerRef.current) {
+      clearInterval(ctxTimerRef.current);
+      ctxTimerRef.current = null;
+    }
     try {
       dcRef.current?.close();
     } catch {
@@ -680,21 +685,28 @@ export function Converse({ onClose }: { onClose: () => void }) {
         dc.onopen = () => {
           if (cancelled) return;
           // One shared thread: replay what was already typed/spoken into the new
-          // realtime session so the spoken assistant has the full conversation.
+          // realtime session so the spoken assistant has the full conversation —
+          // including images the user attached in chat (realtime supports image
+          // input). Files are noted by name (realtime can't read documents; the
+          // assistant's own replies about them carry over as text).
           for (const e of logRef.current) {
             if (e.role !== "you" && e.role !== "assistant") continue;
+            let content: Record<string, unknown>[];
+            if (e.role === "you") {
+              content = [];
+              if (e.text && e.text !== "…") content.push({ type: "input_text", text: e.text });
+              for (const src of e.images ?? []) content.push({ type: "input_image", image_url: src });
+              for (const name of e.files ?? [])
+                content.push({ type: "input_text", text: `(The user shared a file: ${name})` });
+              if (content.length === 0) continue;
+            } else {
+              if (!e.text) continue;
+              content = [{ type: "text", text: e.text }];
+            }
             dc.send(
               JSON.stringify({
                 type: "conversation.item.create",
-                item: {
-                  type: "message",
-                  role: e.role === "you" ? "user" : "assistant",
-                  content: [
-                    e.role === "you"
-                      ? { type: "input_text", text: e.text }
-                      : { type: "text", text: e.text },
-                  ],
-                },
+                item: { type: "message", role: e.role === "you" ? "user" : "assistant", content },
               }),
             );
           }
@@ -703,6 +715,24 @@ export function Converse({ onClose }: { onClose: () => void }) {
           retryRef.current = 0; // a clean open clears the reconnect budget
           setVoiceStatus("live");
           playReady(); // soft chime: the session is listening — start talking
+          // Keep the context snapshot fresh through a long call: re-push updated
+          // instructions (date/projects/tasks) via session.update every few minutes.
+          if (ctxTimerRef.current) clearInterval(ctxTimerRef.current);
+          ctxTimerRef.current = setInterval(() => {
+            const u = localStorage.getItem("lfg_user") || "anon";
+            void fetch(`/api/voice/rt/instructions?user=${encodeURIComponent(u)}`)
+              .then((r) => (r.ok ? r.json() : null))
+              .then((j) => {
+                const d = dcRef.current;
+                if (j?.instructions && d && d.readyState === "open") {
+                  d.send(JSON.stringify({ type: "session.update", session: { instructions: j.instructions } }));
+                  logEvent("context_refresh", {});
+                }
+              })
+              .catch(() => {
+                /* best-effort refresh */
+              });
+          }, 150000);
         };
         dc.onmessage = (e) => {
           try {
