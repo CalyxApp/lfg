@@ -49,6 +49,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  FileText,
   Folder,
   House,
   GitFork,
@@ -114,6 +115,7 @@ import { HomeView } from "@/components/HomeView";
 import { SearchView } from "@/components/SearchView";
 import { ArtifactInlineCard, ArtifactsView } from "@/components/ArtifactsView";
 import { ShippedView } from "@/components/ShippedView";
+import { ReportsView } from "@/components/ReportsView";
 
 // Injected by Vite `define` at build time (see vite.config.ts).
 declare const __BUILD_STAMP__: string;
@@ -3341,6 +3343,8 @@ export function App() {
           />
         ) : tab === "artifacts" ? (
           <ArtifactsView />
+        ) : tab === "reports" ? (
+          <ReportsView />
         ) : tab === "shipped" ? (
           <ShippedView />
         ) : tab === "brain" ? (
@@ -3896,6 +3900,7 @@ const ROUTABLE_TABS = new Set([
   "auto",
   "artifacts",
   "shipped",
+  "reports",
   "ask",
   "usage",
   "coding-agents",
@@ -3915,6 +3920,7 @@ const AGENT_FAMILY_TABS = new Set([
   "auto",
   "artifacts",
   "shipped",
+  "reports",
   "ask",
   "usage",
   "coding-agents",
@@ -3931,6 +3937,7 @@ const AGENT_TOOL_TABS = new Set([
   "auto",
   "artifacts",
   "shipped",
+  "reports",
   "usage",
   "coding-agents",
   "agent-browser",
@@ -3944,6 +3951,7 @@ const AGENT_TOOL_TABS = new Set([
 function AgentToolChips({ onOpen }: { onOpen: (tab: string) => void }) {
   const tools = [
     { id: "auto", label: "Auto agents", icon: CalendarClock },
+    { id: "reports", label: "Reports", icon: FileText },
     { id: "artifacts", label: "Artifacts", icon: Images },
     { id: "shipped", label: "Shipped", icon: Package },
     { id: "agent-browser", label: "Agent browser", icon: GitFork },
