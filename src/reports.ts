@@ -229,8 +229,47 @@ function injectForwarder(html: string): string {
   return html.includes("</body>") ? html.replace("</body>", FORWARDER + "</body>") : html + FORWARDER;
 }
 
-// Full report HTML as served to the app: vault paths -> chips, chip styles +
-// click-forwarder injected. Pure string transform over the on-disk report.
+// ---------------------------------------------------------------------------
+// Mobile responsive FLOOR. A safety net so the existing back-catalogue (reports
+// authored before generators were made responsive) is readable on a phone —
+// prevents whole-page horizontal scroll: fluid width, media clamps, and wide
+// tables scroll WITHIN their block instead of pushing the page sideways. The
+// durable fix is the report generator itself (calyx-generate-report skill +
+// brand.html); this only guarantees a floor for reports that predate it.
+// ---------------------------------------------------------------------------
+const RESPONSIVE_FLOOR = `<style data-calyx-mobile-floor>
+  html, body { max-width: 100%; overflow-x: hidden; }
+  body > *, main { max-width: 100% !important; }
+  main { box-sizing: border-box; }
+  img, video, svg, canvas, iframe { max-width: 100%; height: auto; }
+  pre { overflow-x: auto; }
+  /* Wide tables scroll inside their own box rather than the whole page. */
+  table { display: block; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+</style>`;
+
+function injectViewport(html: string): string {
+  if (/<meta\s+name=["']viewport["']/i.test(html)) return html;
+  const tag = '<meta name="viewport" content="width=device-width, initial-scale=1">';
+  if (/<head[^>]*>/i.test(html)) return html.replace(/<head([^>]*)>/i, `<head$1>\n  ${tag}`);
+  return `${tag}\n${html}`;
+}
+
+// Injected LAST in <head> so it wins source-order ties over the report's own CSS.
+function injectResponsiveFloor(html: string): string {
+  if (html.includes("data-calyx-mobile-floor")) return html;
+  if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${RESPONSIVE_FLOOR}\n</head>`);
+  if (/<head[^>]*>/i.test(html)) return html.replace(/<head([^>]*)>/i, `<head$1>\n${RESPONSIVE_FLOOR}`);
+  return `${RESPONSIVE_FLOOR}\n${html}`;
+}
+
+// Full report HTML as served to the app: vault paths -> chips, chip styles,
+// mobile viewport + responsive floor, and the click-forwarder — all injected.
+// Pure string transform over the on-disk report.
 export function renderReportHtml(html: string): string {
-  return injectForwarder(injectChipStyles(linkifyVaultPaths(html)));
+  let out = linkifyVaultPaths(html);
+  out = injectChipStyles(out);
+  out = injectViewport(out);
+  out = injectResponsiveFloor(out);
+  out = injectForwarder(out);
+  return out;
 }
