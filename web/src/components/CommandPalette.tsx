@@ -64,11 +64,19 @@ export function CommandPalette({
   onOpenChange,
   commands,
   placeholder = "Search or jump to…",
+  mobile = false,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   commands: PaletteCommand[]
   placeholder?: string
+  /**
+   * Render as a near-fullscreen sheet (touch-first) instead of the centered
+   * desktop card. On phones the palette is opened by tapping the Search tab,
+   * not a keyboard shortcut, and wants the whole screen for its results + the
+   * soft keyboard.
+   */
+  mobile?: boolean
 }) {
   const [query, setQuery] = React.useState("")
   const [active, setActive] = React.useState(0)
@@ -155,7 +163,14 @@ export function CommandPalette({
         <DialogPrimitive.Backdrop className="pointer-events-auto fixed inset-0 z-[85] bg-black/40 backdrop-blur-sm duration-100 data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0" />
         <DialogPrimitive.Popup
           initialFocus={inputRef}
-          className="pointer-events-auto fixed left-1/2 top-[12vh] z-[85] flex max-h-[70vh] w-full max-w-[calc(100%-2rem)] -translate-x-1/2 flex-col overflow-hidden rounded-3xl bg-background text-sm shadow-2xl ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-xl data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95"
+          className={cn(
+            "pointer-events-auto fixed z-[85] flex flex-col overflow-hidden bg-background text-sm shadow-2xl ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-closed:animate-out data-closed:fade-out-0",
+            mobile
+              ? // Touch: a full-height sheet with small margins + safe-area insets.
+                "inset-x-2 top-[max(env(safe-area-inset-top),0.5rem)] bottom-[max(env(safe-area-inset-bottom),0.5rem)] rounded-3xl data-open:slide-in-from-bottom-4 data-closed:slide-out-to-bottom-4"
+              : // Pointer: a centered command-palette card near the top.
+                "left-1/2 top-[12vh] max-h-[70vh] w-full max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-3xl data-open:zoom-in-95 data-closed:zoom-out-95 sm:max-w-xl",
+          )}
         >
           <DialogPrimitive.Title className="sr-only">
             Command palette
