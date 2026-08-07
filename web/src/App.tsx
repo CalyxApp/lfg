@@ -3626,7 +3626,12 @@ export function App() {
       {/* Bottom tab bar — mobile only; tucks away while the keyboard is up or
           during a voice call so it never fights the composer for the bottom. */}
       {isMobile && !callOpen && !keyboardOpen ? (
-        <TabBar tab={tab} onSelect={setTab} onChat={() => setConverseOpen(true)} />
+        <TabBar
+          tab={tab}
+          onSelect={setTab}
+          onChat={() => setConverseOpen(true)}
+          onSearch={() => setPaletteOpen(true)}
+        />
       ) : null}
 
       {callOpen ? (
@@ -3648,6 +3653,7 @@ export function App() {
         open={paletteOpen}
         onOpenChange={setPaletteOpen}
         commands={paletteCommands}
+        mobile={isMobile}
       />
 
       {openFinding ? (
@@ -4130,6 +4136,7 @@ function TabBar({
   tab,
   onSelect,
   onChat,
+  onSearch,
 }: {
   tab: string;
   onSelect: (tab: string) => void;
@@ -4137,6 +4144,9 @@ function TabBar({
   // is active. Sam (2026-07-22): the entry belongs in the bottom menu, not a
   // corner icon.
   onChat: () => void;
+  // Search opens the command palette overlay (jump to anything) rather than
+  // navigating to a tab — the phone's entry point into the Cmd/Ctrl+K launcher.
+  onSearch: () => void;
 }) {
   const items = [
     { id: "home", label: "Home", icon: House, active: tab === "home" || tab === "files" },
@@ -4162,7 +4172,13 @@ function TabBar({
             <button
               key={it.id}
               type="button"
-              onClick={() => (it.id === "chat" ? onChat() : onSelect(it.id))}
+              onClick={() =>
+                it.id === "chat"
+                  ? onChat()
+                  : it.id === "search"
+                    ? onSearch()
+                    : onSelect(it.id)
+              }
               aria-label={it.label}
               aria-current={it.active ? "page" : undefined}
               className={cn(
