@@ -42,7 +42,6 @@ import {
   Braces,
   BarChart3,
   Code2,
-  FileText,
   FolderOpen,
   NotebookPen,
   CalendarClock,
