@@ -6233,6 +6233,30 @@ function SkillTextarea({
   );
 }
 
+// Per-session composer drafts. The composer's text is component-local state on
+// SessionChat, and SessionChat unmounts whenever its preview/stage column is
+// dismissed (an outside click, the ✕) — which used to silently drop whatever
+// you'd typed. Persist the unsent text keyed by sid so it survives the unmount,
+// a preview↔full-screen switch, or a reload; cleared on a successful send.
+const COMPOSER_DRAFT_PREFIX = "lfg:composer-draft:";
+function loadComposerDraft(sid: string | null | undefined): string {
+  if (!sid) return "";
+  try {
+    return localStorage.getItem(COMPOSER_DRAFT_PREFIX + sid) ?? "";
+  } catch {
+    return "";
+  }
+}
+function saveComposerDraft(sid: string | null | undefined, text: string) {
+  if (!sid) return;
+  try {
+    if (text.trim()) localStorage.setItem(COMPOSER_DRAFT_PREFIX + sid, text);
+    else localStorage.removeItem(COMPOSER_DRAFT_PREFIX + sid);
+  } catch {
+    /* storage disabled / full — draft persistence is best-effort */
+  }
+}
+
 function SessionChat({
   session,
   messages,
@@ -6265,7 +6289,22 @@ function SessionChat({
   onDictatingChange?: (recording: boolean) => void;
 }) {
   const sid = session.sessionId;
-  const [messageText, setMessageText] = useState("");
+  // Seed the composer from any saved draft so an unsent message survives this
+  // component being unmounted (see loadComposerDraft). `setMessageText` wraps the
+  // raw setter to persist every change under the currently-bound sid.
+  const [messageText, setMessageTextState] = useState(() => loadComposerDraft(sid));
+  const draftSidRef = useRef(sid);
+  const setMessageText = useCallback((text: string) => {
+    setMessageTextState(text);
+    saveComposerDraft(draftSidRef.current, text);
+  }, []);
+  // If this instance is reused for a different session (sid changes), load that
+  // session's draft — without writing back to the previous one.
+  useEffect(() => {
+    if (draftSidRef.current === sid) return;
+    draftSidRef.current = sid;
+    setMessageTextState(loadComposerDraft(sid));
+  }, [sid]);
   const [sending, setSending] = useState(false);
   // Waveform dictation for session follow-ups ("sick of having to type" —
   // Sam, 2026-07-22): tap the mic → the composer row swaps to the shared
@@ -6574,7 +6613,7 @@ function SessionChat({
                 disabled={sending}
                 rows={1}
                 className={cn(
-                  "lfg-gfield h-11 min-h-11 max-h-11 min-w-0 resize-none overflow-y-auto rounded-2xl border-transparent px-4 py-3 text-base leading-5 shadow-sm transition-[background-color,border-color,box-shadow] duration-300 ease-ios placeholder:text-muted-foreground [field-sizing:fixed] md:h-9 md:min-h-9 md:max-h-9 md:rounded-[1.125rem] md:px-3.5 md:py-2 md:text-sm",
+                  "lfg-gfield field-sizing-content min-h-11 max-h-32 min-w-0 resize-none overflow-y-auto rounded-2xl border-transparent px-4 py-3 text-base leading-5 shadow-sm transition-[background-color,border-color,box-shadow] duration-300 ease-ios placeholder:text-muted-foreground md:min-h-9 md:max-h-40 md:rounded-[1.125rem] md:px-3.5 md:py-2 md:text-sm",
                 )}
               />
             </div>
