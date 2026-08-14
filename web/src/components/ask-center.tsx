@@ -27,6 +27,8 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import {
+  Bot,
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -45,6 +47,40 @@ type Question = {
   createdAt: number;
 };
 
+// ── Calyx asks ───────────────────────────────────────────────────────────────
+// A second kind of question, from a different world. An LFG question comes from
+// an agent that is still running and long-polling for your reply. A Calyx ask
+// comes from an agent task that hit a fork, wrote its question into the vault,
+// and *exited* — so it survives restarts and days of silence, and your answer is
+// what starts the work again. Same inbox, different promise; the UI says which.
+type CalyxAskOption = {
+  label: string;
+  description?: string;
+  recommended?: boolean;
+};
+
+type CalyxAskQuestion = {
+  text: string;
+  header?: string;
+  options: CalyxAskOption[];
+  multiSelect?: boolean;
+  allowOther?: boolean;
+};
+
+type CalyxAsk = {
+  id: string;
+  path: string;
+  title: string;
+  reason?: string;
+  questions: CalyxAskQuestion[];
+  project?: string;
+  agent?: string;
+  /** Answer already written; the runner just hasn't picked it up yet. */
+  answered: boolean;
+  answer?: string;
+  repo: string;
+};
+
 const POLL_MS = 5000;
 
 type AskContextValue = {
@@ -54,6 +90,9 @@ type AskContextValue = {
   /** Tuck the floating card away "for later" without answering. */
   collapsed: boolean;
   setCollapsed: (v: boolean) => void;
+  /** Stopped agent tasks waiting on a decision. */
+  calyxAsks: CalyxAsk[];
+  answerCalyx: (ask: CalyxAsk, text: string) => Promise<void>;
 };
 
 const AskContext = createContext<AskContextValue | null>(null);
@@ -64,18 +103,22 @@ function useAsk(): AskContextValue {
   return ctx;
 }
 
-// Read-only count of open questions — for nav badges etc.
+// Read-only count of everything waiting on you — for nav badges etc.
+// Answered-but-not-yet-resumed Calyx asks are excluded: they no longer need you.
 export function useAskCount(): number {
-  return useAsk().questions.length;
+  const { questions, calyxAsks } = useAsk();
+  return questions.length + calyxAsks.filter((a) => !a.answered).length;
 }
 
 // Owns the single poll loop + queue + shared UI state so the nav button, the
 // floating card, and the page all read one source of truth.
 export function AskProvider({ children }: { children: React.ReactNode }) {
   const [questions, setQuestions] = useState<Question[]>([]);
+  const [calyxAsks, setCalyxAsks] = useState<CalyxAsk[]>([]);
   const [busy, setBusy] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
   const seen = useRef<Set<string>>(new Set());
+  const seenCalyx = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     try {
@@ -115,9 +158,30 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  // Calyx asks live in the vault, so they change on the runner's clock, not
+  // ours — a slower poll is plenty and keeps a phone off the network.
+  const refreshCalyx = useCallback(async () => {
+    try {
+      const res = await fetch("/api/vault/asks", { cache: "no-store" });
+      if (!res.ok) return; // no vault configured on this server — feature is simply absent
+      const data = (await res.json()) as { asks?: CalyxAsk[] };
+      const asks = data.asks || [];
+      setCalyxAsks(asks);
+      for (const a of asks) {
+        if (a.answered || seenCalyx.current.has(a.id)) continue;
+        seenCalyx.current.add(a.id);
+        toast("An agent task stopped to ask you something", { description: a.title });
+      }
+    } catch {
+      // transient — next tick retries
+    }
+  }, []);
+
   useEffect(() => {
     void refresh();
+    void refreshCalyx();
     const t = setInterval(() => void refresh(), POLL_MS);
+    const tc = setInterval(() => void refreshCalyx(), POLL_MS * 3);
     const onVis = () => {
       if (document.visibilityState === "visible") void refresh();
     };
@@ -125,10 +189,11 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
     window.addEventListener("focus", onVis);
     return () => {
       clearInterval(t);
+      clearInterval(tc);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("focus", onVis);
     };
-  }, [refresh]);
+  }, [refresh, refreshCalyx]);
 
   const answer = useCallback(
     async (q: Question, text: string) => {
@@ -154,9 +219,41 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
     [busy],
   );
 
+  // Answering a Calyx ask writes into the task file — which IS the resumption.
+  // There is no "send to the agent" here: the agent is gone. The runner notices
+  // the written answer on its next tick and starts a fresh attempt with your
+  // words in its context.
+  const answerCalyx = useCallback(
+    async (ask: CalyxAsk, text: string) => {
+      if (busy || !text.trim()) return;
+      setBusy(true);
+      try {
+        const res = await fetch("/api/vault/asks/answer", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repo: ask.repo, path: ask.path, answer: text.trim() }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        // Optimistic: flip to "answered" rather than removing it, so you can see
+        // what you said while the runner picks it up.
+        setCalyxAsks((prev) =>
+          prev.map((a) => (a.id === ask.id ? { ...a, answered: true, answer: text.trim() } : a)),
+        );
+        toast("Answer saved — the task will pick it up", {
+          description: "Runs on your server, so it resumes even with this closed.",
+        });
+      } catch {
+        toast.error("Could not save your answer");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy],
+  );
+
   return (
     <AskContext.Provider
-      value={{ questions, busy, answer, collapsed, setCollapsed }}
+      value={{ questions, busy, answer, collapsed, setCollapsed, calyxAsks, answerCalyx }}
     >
       {children}
     </AskContext.Provider>
@@ -173,8 +270,10 @@ export function AskNavButton({
   active?: boolean;
   onOpen: () => void;
 }) {
-  const { questions, setCollapsed } = useAsk();
-  const count = questions.length;
+  const { questions, calyxAsks, setCollapsed } = useAsk();
+  // One badge for both kinds — the user doesn't care which system asked, only
+  // that something is waiting on them.
+  const count = questions.length + calyxAsks.filter((a) => !a.answered).length;
   const waiting = count > 0;
   // No question in flight: don't show the button in the right top island
   // (stay visible while the Ask tab is open so the user can navigate back out).
@@ -317,11 +416,225 @@ export function AskCenter({ onExpand }: { onExpand: () => void }) {
 
 // Full app page (its own tab) — a Tinder-style deck of open questions. The top
 // card is answerable inline; swipe (or arrow) to move through the stack.
-export function AskPage() {
-  const { questions } = useAsk();
-  const count = questions.length;
+// ── The Calyx ask card ───────────────────────────────────────────────────────
+// Order is deliberate and settled with Sam: orientation → the question → the
+// options → the briefing. You need to know what you're reading *for*; and when
+// you already have the context you answer in one glance instead of scrolling
+// past a briefing you didn't need.
+//
+// Every option stays visible — they get smaller, never fewer. A hidden option is
+// one you won't consider. What collapses is the briefing.
+function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
+  const { answerCalyx, busy } = useAsk();
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [body, setBody] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string[]>([]);
+
+  const q = ask.questions[0];
+  const multi = q?.multiSelect === true;
+
+  // The briefing is fetched only when opened — a list of twenty asks shouldn't
+  // drag twenty note bodies onto a phone.
+  useEffect(() => {
+    if (!open || body !== null) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/vault/asks/body?repo=${encodeURIComponent(ask.repo)}&path=${encodeURIComponent(ask.path)}`,
+          { cache: "no-store" },
+        );
+        const data = res.ok ? ((await res.json()) as { body?: string }) : {};
+        if (alive) setBody(data.body || "");
+      } catch {
+        if (alive) setBody("");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [open, body, ask.repo, ask.path]);
+
+  const send = (value: string) => void answerCalyx(ask, value);
+
+  const toggle = (label: string) => {
+    if (!multi) {
+      send(label);
+      return;
+    }
+    setPicked((p) => (p.includes(label) ? p.filter((x) => x !== label) : [...p, label]));
+  };
+
+  if (ask.answered) {
+    return (
+      <div className="rounded-2xl border border-border/60 bg-muted/30 p-4">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Check className="size-4 text-primary" />
+          Answered — restarting
+        </div>
+        <div className="mt-1 text-xs text-muted-foreground">{ask.title}</div>
+        {ask.answer ? (
+          <div className="mt-2 rounded-lg bg-background/60 px-3 py-2 text-sm">“{ask.answer}”</div>
+        ) : null}
+      </div>
+    );
+  }
+
   return (
-    <div className="mx-auto flex h-full w-full max-w-xl flex-col">
+    <div className="overflow-hidden rounded-2xl border border-border bg-card">
+      <div className="p-4">
+        {/* Orientation — which piece of work is stopped. */}
+        <div className="flex items-start gap-2 text-xs text-muted-foreground">
+          <Bot className="mt-0.5 size-3.5 shrink-0" />
+          <span className="min-w-0 truncate">
+            {ask.project ? `${ask.project} · ` : ""}
+            {ask.title}
+          </span>
+        </div>
+
+        {/* The question. */}
+        <div className="mt-2 text-[15px] font-medium leading-snug">
+          {q?.text || ask.reason || "This task needs a decision from you."}
+        </div>
+
+        {/* The options — each stating its consequence. */}
+        {q?.options?.length ? (
+          <div className="mt-3 flex flex-col gap-2">
+            {q.options.map((o) => {
+              const on = picked.includes(o.label);
+              return (
+                <button
+                  key={o.label}
+                  type="button"
+                  disabled={busy}
+                  onClick={() => toggle(o.label)}
+                  className={cn(
+                    "w-full rounded-xl border px-3 py-2.5 text-left transition-colors active:scale-[0.99] disabled:opacity-60",
+                    on
+                      ? "border-primary bg-primary/10"
+                      : "border-border bg-background hover:bg-muted/60",
+                  )}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium">{o.label}</span>
+                    {o.recommended ? (
+                      <span className="rounded-full bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                        Recommended
+                      </span>
+                    ) : null}
+                    {multi && on ? <Check className="ml-auto size-4 text-primary" /> : null}
+                  </div>
+                  {o.description ? (
+                    <div className="mt-0.5 text-xs leading-snug text-muted-foreground">
+                      {o.description}
+                    </div>
+                  ) : null}
+                </button>
+              );
+            })}
+            {multi ? (
+              <Button
+                size="sm"
+                disabled={busy || picked.length === 0}
+                onClick={() => send(picked.join(", "))}
+              >
+                Send {picked.length || ""}
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {/* Free text. Any reply wakes the agent — including "I don't follow". */}
+        <div className="mt-3 flex items-end gap-2">
+          <Textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={q?.options?.length ? "Or say something else…" : "Your answer…"}
+            rows={2}
+            className="min-h-[44px] resize-none text-sm"
+          />
+          <Button
+            size="icon"
+            disabled={busy || !text.trim()}
+            onClick={() => {
+              send(text);
+              setText("");
+            }}
+            aria-label="Send answer"
+          >
+            <Send className="size-4" />
+          </Button>
+        </div>
+
+        {/* The promise — honest about where it runs. */}
+        <div className="mt-2 text-[11px] text-muted-foreground">
+          Answering restarts this task on your server — it resumes even with this closed.
+        </div>
+      </div>
+
+      {/* The briefing, collapsed. */}
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 border-t border-border/60 px-4 py-2.5 text-xs text-muted-foreground hover:bg-muted/40"
+      >
+        <ChevronDown className={cn("size-3.5 transition-transform", open && "rotate-180")} />
+        {open ? "Hide the details" : "Why it stopped, and where it got to"}
+      </button>
+      {open ? (
+        <div className="border-t border-border/60 bg-muted/20 px-4 py-3">
+          {ask.reason ? (
+            <div className="mb-2 text-xs font-medium">{ask.reason}</div>
+          ) : null}
+          {body === null ? (
+            <div className="text-xs text-muted-foreground">Loading…</div>
+          ) : body ? (
+            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words font-sans text-xs leading-relaxed text-muted-foreground">
+              {body}
+            </pre>
+          ) : (
+            <div className="text-xs text-muted-foreground">
+              No briefing was written for this one.
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** The "work is stopped" section — Calyx agent tasks waiting on a decision. */
+function CalyxAskSection() {
+  const { calyxAsks } = useAsk();
+  if (calyxAsks.length === 0) return null;
+  const waiting = calyxAsks.filter((a) => !a.answered).length;
+  return (
+    <div className="mb-6">
+      <div className="mb-2 flex items-baseline gap-2">
+        <h2 className="text-sm font-medium">Work is stopped</h2>
+        <span className="text-xs text-muted-foreground">
+          {waiting > 0
+            ? `${waiting} task${waiting === 1 ? "" : "s"} waiting on you`
+            : "all answered"}
+        </span>
+      </div>
+      <div className="flex flex-col gap-3">
+        {calyxAsks.map((a) => (
+          <CalyxAskCard key={a.id} ask={a} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function AskPage() {
+  const { questions, calyxAsks } = useAsk();
+  const count = questions.length;
+  const calyxWaiting = calyxAsks.filter((a) => !a.answered).length;
+  const total = count + calyxWaiting;
+  return (
+    <div className="mx-auto flex h-full w-full max-w-xl flex-col overflow-y-auto">
       <div className="mb-4 flex items-center gap-3">
         <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-primary/15 text-primary">
           <MessageCircleQuestion className="size-6" />
@@ -331,14 +644,17 @@ export function AskPage() {
             Questions for you
           </h1>
           <p className="text-sm text-muted-foreground">
-            {count > 0
-              ? `${count} agent${count === 1 ? "" : "s"} waiting on your input`
+            {total > 0
+              ? `${total} waiting on your input`
               : "You're all caught up"}
           </p>
         </div>
       </div>
 
-      {count === 0 ? (
+      {/* Stopped agent tasks first — these are the ones holding work up. */}
+      <CalyxAskSection />
+
+      {count === 0 && calyxAsks.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border py-20 text-center">
           <div className="flex size-14 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
             <Inbox className="size-7" />
@@ -349,9 +665,9 @@ export function AskPage() {
             notification.
           </div>
         </div>
-      ) : (
+      ) : count > 0 ? (
         <SwipeStack questions={questions} />
-      )}
+      ) : null}
     </div>
   );
 }

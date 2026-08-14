@@ -1,5 +1,5 @@
 import { readdir, realpath, stat } from "node:fs/promises";
-import { appendFileSync, statSync, mkdirSync, readFileSync, type Dirent } from "node:fs";
+import { appendFileSync, statSync, mkdirSync, readFileSync, writeFileSync, type Dirent } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -133,6 +133,7 @@ import { capturePaneScroll, capturePaneEscaped, paneWidth } from "../tmux.ts";
 import { detectUrls } from "../links.ts";
 import { listDir, readRepoFile, gitGrep, writeRepoFile, gitCommitPaths, readRepoFileRaw, withRepoLock } from "../files.ts";
 import { vaultSummary, vaultItems, updateVaultDoc } from "../vault.ts";
+import { listCalyxAsks, answerCalyxAsk, readAskBody } from "../vault-asks.ts";
 
 // ── Calyx content factory (runtime-import from sibling clone) ─────────────────
 // Uses the compiled .js from the sibling mdEditorTestExtenstionVscode clone on
@@ -242,6 +243,86 @@ import { listSkillCatalog } from "../skills-catalog.ts";
 const REPOS_ROOT = reposRoot();
 const SELF_REPO = PATHS.root;
 const EVLOG_DIR = join(PATHS.data, "evlogs");
+
+// ── Calyx asks: repo resolution + the new-ask watcher ────────────────────────
+// Same workspace scoping as Converse — one vault by default (PlatosRaveCave),
+// overridable per request, so the phone doesn't have to know repo names.
+async function resolveVaultRepo(name: string | null) {
+  const repos = await listRepos();
+  if (name) return repos.find((r) => r.name === name);
+  const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+  return repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+}
+
+// A blocked agent task is work that has STOPPED — the whole point is that you
+// are not watching when it happens. So we scan for new ones and push, rather
+// than waiting for the phone to poll. Seen ids persist so a server restart
+// doesn't re-notify you about questions you already know about.
+const ASKS_SEEN_FILE = join(PATHS.data, "calyx-asks-seen.json");
+const ASK_WATCH_MS = 60_000;
+let asksSeen: Set<string> | null = null;
+
+function loadAsksSeen(): Set<string> {
+  if (asksSeen) return asksSeen;
+  try {
+    const raw = JSON.parse(readFileSync(ASKS_SEEN_FILE, "utf8"));
+    asksSeen = new Set(Array.isArray(raw) ? (raw as string[]) : []);
+  } catch {
+    asksSeen = new Set();
+  }
+  return asksSeen;
+}
+
+function saveAsksSeen(seen: Set<string>) {
+  try {
+    mkdirSync(PATHS.data, { recursive: true });
+    // Bounded — an id is a task path, and stale ones cost nothing but bytes.
+    writeFileSync(ASKS_SEEN_FILE, JSON.stringify([...seen].slice(-500)), "utf8");
+  } catch {
+    // best-effort; worst case is one duplicate notification after a crash
+  }
+}
+
+/** Suppress a push for an ask we already acted on (e.g. just answered it). */
+function markAskNotified(id: string) {
+  const seen = loadAsksSeen();
+  if (!seen.has(id)) {
+    seen.add(id);
+    saveAsksSeen(seen);
+  }
+}
+
+async function watchCalyxAsks(): Promise<void> {
+  try {
+    const repo = await resolveVaultRepo(null);
+    if (!repo) return;
+    const asks = listCalyxAsks(repo.cwd, repo.name);
+    const seen = loadAsksSeen();
+    const live = new Set(asks.map((a) => `${repo.name}:${a.id}`));
+    let fresh = 0;
+    for (const a of asks) {
+      if (a.answered) continue; // already dealt with; not news
+      const key = `${repo.name}:${a.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      fresh++;
+    }
+    // Forget asks that no longer exist, so a task that blocks again re-notifies.
+    for (const key of [...seen]) {
+      if (key.startsWith(`${repo.name}:`) && !live.has(key)) seen.delete(key);
+    }
+    if (fresh > 0) {
+      saveAsksSeen(seen);
+      evlog("calyx_ask_new", { count: fresh, repo: repo.name });
+      void notifyAll().catch(() => {});
+    } else {
+      saveAsksSeen(seen);
+    }
+  } catch {
+    // A vault that is mid-sync or briefly unreadable is not an error worth
+    // surfacing — the next tick picks it up.
+  }
+}
 
 function evlog(event: string, fields: Record<string, unknown> = {}) {
   try {
@@ -2912,6 +2993,65 @@ export async function cmdServe() {
         }
       }
 
+      // ---- Calyx asks: questions left behind by a stopped agent task ----------
+      // These are NOT the /api/ask questions above. Those come from LFG's own
+      // headless agents, which are alive and long-polling. A Calyx agent writes
+      // its question into the task file and exits — so the record is the vault
+      // file, and writing the answer back into it is what resumes the work.
+      // See src/vault-asks.ts for the frontmatter contract.
+      if (path === "/api/vault/asks" && req.method === "GET") {
+        const repo = await resolveVaultRepo(url.searchParams.get("repo"));
+        if (!repo) return err(404, "no vault repo available");
+        try {
+          return json({ repo: repo.name, asks: listCalyxAsks(repo.cwd, repo.name) });
+        } catch (e) {
+          return err(500, e instanceof Error ? e.message : String(e));
+        }
+      }
+
+      // The briefing — the task note's body. Fetched only when a card is opened,
+      // so listing twenty asks doesn't drag twenty note bodies to the phone.
+      if (path === "/api/vault/asks/body" && req.method === "GET") {
+        const repo = await resolveVaultRepo(url.searchParams.get("repo"));
+        const rel = url.searchParams.get("path");
+        if (!repo) return err(404, "no vault repo available");
+        if (!rel) return err(400, "path is required");
+        return json({ path: rel, body: readAskBody(repo.cwd, rel) });
+      }
+
+      // Answering is the resumption. We write `unblock_comments` and nothing
+      // else — the runner owns `execution_status`, and racing it would strand
+      // the task between states.
+      if (path === "/api/vault/asks/answer" && req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as {
+          repo?: string;
+          path?: string;
+          answer?: string;
+        } | null;
+        if (!body?.path || !body.answer?.trim()) return err(400, "path and answer are required");
+        const repo = await resolveVaultRepo(body.repo ?? null);
+        if (!repo) return err(404, "no vault repo available");
+        try {
+          const { result, commit } = await withRepoLock(repo.cwd, async () => {
+            const result = await answerCalyxAsk(repo.cwd, body.path!, body.answer!);
+            return {
+              result,
+              commit: gitCommitPaths(
+                repo.cwd,
+                [body.path!],
+                `mobile: answer agent question — ${body.path}`,
+              ),
+            };
+          });
+          // The ask is answered the moment the file is written; the runner picks
+          // it up on its next tick. Mark it seen so the watcher can't re-push it.
+          markAskNotified(`${repo.name}:${body.path}`);
+          return json({ path: result.path, answered: result.answered, commit });
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e));
+        }
+      }
+
       if (path === "/api/sessions") {
         const sessions = await listSessions();
         warmTranscriptIndexes(sessions);
@@ -4883,6 +5023,11 @@ export async function cmdServe() {
   // Watch the fleet for busy -> idle transitions and fan "completed" events out
   // to voice subscribers (/api/voice/events). Idempotent + best-effort.
   startFleetWatcher();
+  // Watch the vault for agent tasks that have stopped to ask a question, and
+  // push. A blocked task is work that is *waiting on you*, and by definition you
+  // aren't looking — so it has to reach out rather than wait to be polled.
+  void watchCalyxAsks();
+  setInterval(() => void watchCalyxAsks(), ASK_WATCH_MS);
 
   console.log(`lfg web → http://${server.hostname}:${server.port}`);
   console.log(`  agents dir: ${AGENTS_DIR}`);
