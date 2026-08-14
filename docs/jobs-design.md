@@ -180,3 +180,39 @@ data/jobs/<id>/
    feedback. Validate by running one job by hand. (The noise fix lives here.)
 2. **Scheduler** — cron loop in serve; now autonomous.
 3. **UI** — inbox + New Job form.
+
+## Idea: long-running background projects via cron + Ask (Sam, 2026-07-28)
+
+A recurring project (e.g. "prepare my tax return") shouldn't need me sitting in a
+session. Reuse the Job cron loop as the background thread, and use the existing
+**Ask** card/queue (`src/ask/`, `web/src/components/ask-center.tsx`) as the
+pause/resume gate. The interface the user sees is identical to any other agent
+question — no separate surface.
+
+Loop:
+
+1. The Job runs on its cron `schedule` and does whatever work it can unattended.
+2. When it hits a decision it can't make alone, instead of stalling it **emits an
+   Ask-user question** (POST to the ask store) and ends the run cleanly — it does
+   not block waiting.
+3. The user answers whenever they get to the Ask card / Action Inbox. The answer
+   is **persisted** against the job (not just streamed to a live long-poll).
+4. On the **next cron tick**, the job reads any answers accumulated since last run
+   and continues from there. If an answer arrives and it's cheap to act on
+   immediately, it can also **kick off a run early** rather than wait for the tick.
+
+Why this fits what's already here:
+- Cron loop = the "keeps going in the background" thread (`scheduler.ts`).
+- Ask = the pop-up the user responds to; steer-injection / persisted answers feed
+  the reply back in (see `tracking/workstreams/lfg-mobile.md`: "ask-user with
+  steer-injection").
+- Job items persist across runs, so state survives between ticks by design.
+
+Open questions to work through later:
+- Where answers live: on the Ask record, mirrored into the job's state, or both.
+- Answer-arrives-early trigger vs. wait-for-tick (latency vs. cost).
+- A job that's "waiting on the user" needs a distinct state so it isn't re-run
+  pointlessly and so the inbox can show "blocked on you".
+- User-configured recurring *questions* (the "every couple of days, ask me about
+  X — family members, key dates" case) are the same mechanism with an empty/simple
+  work step: the whole point of the run is to raise the Ask.
