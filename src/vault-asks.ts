@@ -35,6 +35,8 @@ export type CalyxAskOption = {
   /** What happens if you choose this — including the ugly part. */
   description?: string;
   recommended?: boolean;
+  /** A vault file that IS this option (an HTML mockup, a diagram). */
+  preview?: string;
 };
 
 export type CalyxAskQuestion = {
@@ -44,6 +46,8 @@ export type CalyxAskQuestion = {
   options: CalyxAskOption[];
   multiSelect?: boolean;
   allowOther?: boolean;
+  /** Vault files to look at before deciding — diagrams, screenshots, write-ups. */
+  attachments?: string[];
 };
 
 export type CalyxAsk = {
@@ -74,6 +78,27 @@ const MAX_TEXT = 2000;
 const MAX_LABEL = 200;
 const MAX_DESCRIPTION = 500;
 const MAX_HEADER = 24;
+const MAX_ATTACHMENTS = 6;
+const MAX_PATH = 400;
+
+/**
+ * A vault-relative path, or nothing.
+ *
+ * Re-validated here even though Calyx validates on write, because this reader
+ * is the thing that hands a path to a file reader on the phone's behalf, and
+ * the file it read could have been edited by hand or arrived over sync. Mirrors
+ * `cleanVaultPath` in Calyx's src/lib/shared/askQuestions.ts.
+ */
+function cleanPath(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const raw = v.trim().replace(/\\/g, "/");
+  if (!raw || raw.length > MAX_PATH) return undefined;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) return undefined; // http:, file:, data:…
+  if (raw.startsWith("/") || raw.startsWith("~")) return undefined;
+  const parts = raw.split("/");
+  if (parts.some((p) => p === "..")) return undefined;
+  return parts.filter((p) => p && p !== ".").join("/") || undefined;
+}
 
 function clean(v: unknown, max: number): string | undefined {
   if (typeof v !== "string") return undefined;
@@ -115,7 +140,16 @@ export function normalizeQuestions(raw: unknown): CalyxAskQuestion[] {
           label,
           description: clean(opt.description, MAX_DESCRIPTION),
           recommended: opt.recommended === true,
+          preview: cleanPath(opt.preview),
         });
+      }
+    }
+
+    const attachments: string[] = [];
+    if (Array.isArray(q.attachments)) {
+      for (const a of q.attachments.slice(0, MAX_ATTACHMENTS)) {
+        const p = cleanPath(a);
+        if (p && !attachments.includes(p)) attachments.push(p);
       }
     }
 
@@ -125,6 +159,7 @@ export function normalizeQuestions(raw: unknown): CalyxAskQuestion[] {
       options,
       multiSelect: q.multiSelect === true,
       allowOther: q.allowOther !== false,
+      ...(attachments.length ? { attachments } : {}),
     });
   }
   return out;

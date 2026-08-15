@@ -26,9 +26,13 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { Streamdown } from "streamdown";
+import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
 import {
   Bot,
   Check,
+  FileText,
+  Image as ImageIcon,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -36,6 +40,7 @@ import {
   Maximize2,
   MessageCircleQuestion,
   Send,
+  X,
 } from "lucide-react";
 
 type Question = {
@@ -57,6 +62,8 @@ type CalyxAskOption = {
   label: string;
   description?: string;
   recommended?: boolean;
+  /** A vault file that IS this option — an HTML mockup, a diagram. */
+  preview?: string;
 };
 
 type CalyxAskQuestion = {
@@ -65,6 +72,8 @@ type CalyxAskQuestion = {
   options: CalyxAskOption[];
   multiSelect?: boolean;
   allowOther?: boolean;
+  /** Vault files to look at before deciding. */
+  attachments?: string[];
 };
 
 type CalyxAsk = {
@@ -432,9 +441,11 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
   const [text, setText] = useState("");
   const [body, setBody] = useState<string | null>(null);
   const [picked, setPicked] = useState<string[]>([]);
+  const [viewing, setViewing] = useState<string | null>(null);
 
   const q = ask.questions[0];
   const multi = q?.multiSelect === true;
+
 
   // The briefing is fetched only when opened — a list of twenty asks shouldn't
   // drag twenty note bodies onto a phone.
@@ -500,6 +511,29 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
           {q?.text || ask.reason || "This task needs a decision from you."}
         </div>
 
+        {/* Things to look at before deciding. Above the options deliberately —
+            if the agent thought you needed to see something, you need it before
+            you choose, not after. */}
+        {q?.attachments?.length ? (
+          <div className="mt-2.5 flex flex-wrap gap-1.5">
+            {q.attachments.map((a) => (
+              <button
+                key={a}
+                type="button"
+                onClick={() => setViewing(a)}
+                className="flex items-center gap-1.5 rounded-lg border border-border bg-background px-2 py-1 text-xs hover:bg-muted/60 active:scale-[0.98]"
+              >
+                {isImagePath(a) ? (
+                  <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="max-w-[13rem] truncate">{fileLabel(a)}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
         {/* The options — each stating its consequence. */}
         {q?.options?.length ? (
           <div className="mt-3 flex flex-col gap-2">
@@ -531,6 +565,30 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
                     <div className="mt-0.5 text-xs leading-snug text-muted-foreground">
                       {o.description}
                     </div>
+                  ) : null}
+                  {/* Looking must not mean choosing. When the option IS a
+                      rendered thing, you need to open it before you can decide,
+                      so previewing is its own tap. */}
+                  {o.preview ? (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setViewing(o.preview!);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setViewing(o.preview!);
+                        }
+                      }}
+                      className="mt-1.5 inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted/70"
+                    >
+                      <Maximize2 className="size-3" />
+                      Preview
+                    </span>
                   ) : null}
                 </button>
               );
@@ -602,6 +660,109 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
           )}
         </div>
       ) : null}
+
+      {viewing ? (
+        <AttachmentOverlay repo={ask.repo} path={viewing} onClose={() => setViewing(null)} />
+      ) : null}
+    </div>
+  );
+}
+
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|avif)$/i;
+const isImagePath = (p: string) => IMAGE_RE.test(p);
+/** What the raw endpoint will actually serve — anything else needs the text path. */
+const IFRAME_RE = /\.(html?|png|jpe?g|gif|webp|svg|avif|pdf)$/i;
+/** Last path segment, which is what a human recognises. */
+const fileLabel = (p: string) => p.split("/").filter(Boolean).pop() || p;
+
+/**
+ * Open one attachment, by the route its type actually supports.
+ *
+ * HTML, images and PDFs go through the raw endpoint and the shared sandboxed
+ * viewer — CSP `sandbox allow-scripts`, nosniff, no network. Markdown and plain
+ * text do NOT: the raw endpoint's type allowlist deliberately excludes them, so
+ * they come back as JSON and render through the app's own markdown renderer.
+ * That is the safer half anyway — React rendering, no iframe, nothing executes.
+ */
+function AttachmentOverlay({
+  repo,
+  path,
+  onClose,
+}: {
+  repo: string;
+  path: string;
+  onClose: () => void;
+}) {
+  const [text, setText] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const iframeable = IFRAME_RE.test(path);
+
+  useEffect(() => {
+    if (iframeable) return;
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await fetch(
+          `/api/repos/file?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`,
+          { cache: "no-store" },
+        );
+        if (!res.ok) throw new Error("unreadable");
+        const data = (await res.json()) as {
+          content?: string;
+          tooLarge?: boolean;
+          binary?: boolean;
+        };
+        if (!alive) return;
+        // readRepoFile answers honestly instead of returning junk for these.
+        if (data.tooLarge) setText("_This file is too large to preview here._");
+        else if (data.binary) setText("_This file isn't text, so there's nothing to show._");
+        else setText(data.content ?? "");
+      } catch {
+        if (alive) setFailed(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [repo, path, iframeable]);
+
+  if (iframeable) {
+    return (
+      <HtmlViewerOverlay
+        title={fileLabel(path)}
+        src={`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`}
+        onClose={onClose}
+      />
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-[100] flex flex-col bg-background">
+      <div
+        className="flex shrink-0 items-center gap-2 border-b border-border bg-background/95 px-3 pb-2 backdrop-blur"
+        style={{ paddingTop: "max(env(safe-area-inset-top), 0.5rem)" }}
+      >
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="flex size-9 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
+        >
+          <X className="size-5" />
+        </button>
+        <div className="min-w-0 flex-1 truncate text-sm font-medium">{fileLabel(path)}</div>
+      </div>
+      <div className="flex-1 overflow-y-auto px-4 py-4">
+        {failed ? (
+          <div className="text-sm text-muted-foreground">Couldn't open this file.</div>
+        ) : text === null ? (
+          <div className="text-sm text-muted-foreground">Loading…</div>
+        ) : (
+          <div className="prose prose-sm dark:prose-invert max-w-none">
+            <Streamdown>{text}</Streamdown>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
