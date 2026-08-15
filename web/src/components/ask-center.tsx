@@ -275,9 +275,11 @@ export function AskNavButton({
   // that something is waiting on them.
   const count = questions.length + calyxAsks.filter((a) => !a.answered).length;
   const waiting = count > 0;
-  // No question in flight: don't show the button in the right top island
-  // (stay visible while the Ask tab is open so the user can navigate back out).
-  if (!waiting && !active) return null;
+  // Always present (Sam, 2026-08-16). This is the inbox — a door you can only
+  // find when something is already behind it isn't a door. It used to hide when
+  // the queue was empty, which meant answering the last question made the way
+  // back disappear. Empty state is muted; the badge and the pulse are what
+  // change, not the button's existence.
   return (
     <button
       type="button"
@@ -288,10 +290,10 @@ export function AskNavButton({
       aria-current={active ? "page" : undefined}
       aria-label={
         waiting
-          ? `${count} question${count === 1 ? "" : "s"} for you`
-          : "Questions"
+          ? `Inbox — ${count} waiting for you`
+          : "Inbox — nothing waiting"
       }
-      title={waiting ? `${count} waiting for you` : "Questions"}
+      title={waiting ? `${count} waiting for you` : "Inbox"}
       className={cn(
         "relative flex size-9 shrink-0 items-center justify-center rounded-full transition-colors duration-200 ease-out active:scale-[0.96]",
         active
