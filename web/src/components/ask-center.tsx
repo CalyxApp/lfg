@@ -804,6 +804,19 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
             placeholder={q?.options?.length ? "Or say something else…" : "Your answer…"}
             rows={2}
             className="min-h-[44px] resize-none text-sm"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                // Free text takes priority when the box has content.
+                if (text.trim()) {
+                  recordAndAdvance(text.trim());
+                } else if (multi && currentPicks.length > 0) {
+                  // No text but multi-select picks exist — same as tapping
+                  // the "Next" / "Send" button.
+                  recordAndAdvance(currentPicks.join(", "));
+                }
+              }
+            }}
           />
           <MicButton
             baseText={text}
