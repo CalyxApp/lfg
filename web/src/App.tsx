@@ -1869,7 +1869,16 @@ function PushBell({ user }: { user?: string | null }) {
 
   useEffect(() => {
     if (!supported) return;
-    void isSubscribed().then(setOn);
+    // isSubscribed() awaits navigator.serviceWorker.ready + pushManager
+    // .getSubscription(). On iOS (Safari/Brave) those reject with a bare
+    // DOMException when Web Push isn't actually usable here — the page is a
+    // browser tab, not an installed PWA. A DOMException isn't an Error and
+    // serializes to "{}", so an uncaught rejection would surface as an
+    // unhandledrejection finding. Swallow it: a probe that can't answer means
+    // "not subscribed".
+    void isSubscribed()
+      .then(setOn)
+      .catch(() => setOn(false));
   }, [supported]);
 
   if (!supported) return null;
