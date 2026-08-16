@@ -27,6 +27,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { Streamdown } from "streamdown";
+import { MicButton } from "@/components/dictation";
 import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
 import {
   Bot,
@@ -442,9 +443,41 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
   const [body, setBody] = useState<string | null>(null);
   const [picked, setPicked] = useState<string[]>([]);
   const [viewing, setViewing] = useState<string | null>(null);
+  const [pendingChoice, setPendingChoice] = useState<string | null>(null);
 
   const q = ask.questions[0];
   const multi = q?.multiSelect === true;
+
+  /**
+   * A choice made *inside* an attachment — the agent's HTML can make its own
+   * options clickable, which is the point of shipping a navigable document
+   * rather than three dead pages.
+   *
+   * It selects; it does not answer. The confirm tap is deliberate and is the
+   * whole security model here: that HTML is written by the agent and runs with
+   * scripts enabled, so a page that could submit directly could also submit
+   * *without you* — the agent answering its own question and resuming itself,
+   * silently. One tap removes that entire class of failure.
+   *
+   * Two guards, since the iframe is sandboxed without `allow-same-origin` and
+   * therefore posts from an opaque origin we cannot check:
+   *  1. only while a viewer is actually open, and
+   *  2. only a label we genuinely offered — the page cannot invent an answer,
+   *     only point at one of ours.
+   */
+  useEffect(() => {
+    if (!viewing) return;
+    const onMessage = (e: MessageEvent) => {
+      const d = e.data as { type?: string; label?: unknown } | null;
+      if (!d || d.type !== "calyx-ask-choose" || typeof d.label !== "string") return;
+      const match = q?.options.find((o) => o.label === d.label);
+      if (!match) return;
+      setPendingChoice(match.label);
+      setViewing(null);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [viewing, q]);
 
 
   // The briefing is fetched only when opened — a list of twenty asks shouldn't
@@ -605,7 +638,31 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
           </div>
         ) : null}
 
-        {/* Free text. Any reply wakes the agent — including "I don't follow". */}
+        {/* A choice made inside an attachment, waiting on your tap. */}
+        {pendingChoice ? (
+          <div className="mt-3 rounded-xl border border-primary/40 bg-primary/5 p-3">
+            <div className="text-xs text-muted-foreground">From the preview you opened</div>
+            <div className="mt-0.5 text-sm font-medium">{pendingChoice}</div>
+            <div className="mt-2 flex gap-2">
+              <Button size="sm" disabled={busy} onClick={() => send(pendingChoice)}>
+                Confirm
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={busy}
+                onClick={() => setPendingChoice(null)}
+              >
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Free text. Any reply wakes the agent — including "I don't follow".
+            The mic is the same one every other surface uses, so it behaves
+            identically here (and its PCM→WAV path is the one that works on
+            iOS). */}
         <div className="mt-3 flex items-end gap-2">
           <Textarea
             value={text}
@@ -613,6 +670,16 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
             placeholder={q?.options?.length ? "Or say something else…" : "Your answer…"}
             rows={2}
             className="min-h-[44px] resize-none text-sm"
+          />
+          <MicButton
+            baseText={text}
+            onText={(t) => setText(t)}
+            onAutoSubmit={(t) => {
+              // Spoken and finished: fill the box, don't send. An answer here
+              // restarts real work on the server, so it gets read back first.
+              setText(t);
+            }}
+            minimal
           />
           <Button
             size="icon"
