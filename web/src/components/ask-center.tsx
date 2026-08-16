@@ -768,7 +768,17 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
             <div className="text-xs text-muted-foreground">From the preview you opened</div>
             <div className="mt-0.5 text-sm font-medium">{pendingChoice}</div>
             <div className="mt-2 flex gap-2">
-              <Button size="sm" disabled={busy} onClick={() => send(pendingChoice)}>
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => {
+                  // Goes through the same path as tapping the option itself, so
+                  // a confirmed preview-choice advances a multi-question ask
+                  // rather than short-circuiting it.
+                  recordAndAdvance(pendingChoice);
+                  setPendingChoice(null);
+                }}
+              >
                 Confirm
               </Button>
               <Button
