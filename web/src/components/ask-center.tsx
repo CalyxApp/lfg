@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils";
 import { Streamdown } from "streamdown";
 import { MicButton } from "@/components/dictation";
 import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
+import { EmptyState } from "@/components/ui/empty-state";
 import {
   Bot,
   Check,
@@ -1035,16 +1036,12 @@ export function AskPage() {
       <CalyxAskSection />
 
       {count === 0 && calyxAsks.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border py-20 text-center">
-          <div className="flex size-14 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
-            <Inbox className="size-7" />
-          </div>
-          <div className="text-sm font-medium">No questions right now</div>
-          <div className="max-w-xs text-xs text-muted-foreground">
-            When an agent needs a decision, it'll show up here and you'll get a
-            notification.
-          </div>
-        </div>
+        <EmptyState
+          icon={<Inbox className="size-5" />}
+          title="Nothing waiting on you"
+          description="When an agent hits a fork it'll stop and ask here. You'll get a notification."
+          className="py-20"
+        />
       ) : count > 0 ? (
         <SwipeStack questions={questions} />
       ) : null}
