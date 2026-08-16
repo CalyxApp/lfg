@@ -90,6 +90,8 @@ type CalyxAsk = {
   answered: boolean;
   answer?: string;
   repo: string;
+  /** When this task blocked (epoch ms). Used for the relative-time label. */
+  blockedAt?: number;
 };
 
 const POLL_MS = 5000;
@@ -607,13 +609,16 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-border bg-card">
       <div className="p-4">
-        {/* Orientation — which piece of work is stopped. */}
+        {/* Orientation — which piece of work is stopped, and how long ago. */}
         <div className="flex items-start gap-2 text-xs text-muted-foreground">
           <Bot className="mt-0.5 size-3.5 shrink-0" />
           <span className="min-w-0 truncate">
             {ask.project ? `${ask.project} · ` : ""}
             {ask.title}
           </span>
+          {ask.blockedAt ? (
+            <span className="ml-auto shrink-0 tabular-nums">{timeAgo(ask.blockedAt)}</span>
+          ) : null}
         </div>
 
         {/* Step indicator — only when there are multiple questions. Shows a
@@ -884,6 +889,18 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
       ) : null}
     </div>
   );
+}
+
+/** Relative time label — matches the style used across the app. */
+function timeAgo(ts?: number): string {
+  if (!ts) return "";
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|avif)$/i;
@@ -1304,6 +1321,11 @@ function QuestionCard({
             Agent needs your input
           </div>
         )}
+        {q.createdAt ? (
+          <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {timeAgo(q.createdAt)}
+          </span>
+        ) : null}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
