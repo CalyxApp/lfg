@@ -14,7 +14,7 @@
 // the model as function_call_output.
 
 import { scanVault, vaultItems, updateVaultDoc, isVault, type VaultDoc } from "./vault.ts";
-import { listDir, readRepoFile, writeRepoFile, withRepoLock, gitCommitPaths, gitGrep } from "./files.ts";
+import { listDir, readRepoFile, writeRepoFile, deleteRepoFile, withRepoLock, gitCommitPaths, gitGrep } from "./files.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 
 // ---- Response + value helpers ----
@@ -549,6 +549,30 @@ export async function updateNote(
   }
 }
 
+/** delete — resolve a note, remove its file, and commit the deletion (recoverable in git history). */
+export async function deleteNote(repoCwd: string, input: { name: string }): Promise<Response> {
+  const q = (input.name ?? "").trim();
+  if (!q) return err(400, "name required");
+
+  const resolved = resolveDoc(repoCwd, q);
+  if (!resolved.doc) {
+    if (resolved.candidates?.length) return json({ ambiguous: true, candidates: resolved.candidates });
+    return err(404, `no note found for "${q}"`);
+  }
+  const rel = resolved.doc.path;
+  const label = resolved.doc.title;
+  try {
+    const result = await withRepoLock(repoCwd, async () => {
+      await deleteRepoFile(repoCwd, rel);
+      const commit = gitCommitPaths(repoCwd, [rel], `converse: delete ${label}`);
+      return { commit };
+    });
+    return json({ ok: true, path: rel, deleted: label, ...result });
+  } catch (e) {
+    return err(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
 // ---- schemas advertised to the realtime model (client-executed, relayed here) ----
 export const VAULT_TOOL_SCHEMAS = [
   {
@@ -689,6 +713,19 @@ export const VAULT_TOOL_SCHEMAS = [
       required: ["name"],
     },
   },
+  {
+    type: "function",
+    name: "delete",
+    description:
+      "Permanently remove a note from the vault (the deletion is committed to git history, so it can be recovered). Use for 'delete X', 'remove the note about Y', 'get rid of Z'. Only deletes when the user clearly asks to; confirm the exact note first if there's any ambiguity.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The note's title, filename, or path." },
+      },
+      required: ["name"],
+    },
+  },
 ];
 
 /**
@@ -724,6 +761,8 @@ export async function runVaultTool(name: string, repoCwd: string, args: Record<s
         });
       case "update":
         return await updateNote(repoCwd, { name: String(args.name ?? ""), properties: obj(args.properties), append: str(args.append) });
+      case "delete":
+        return await deleteNote(repoCwd, { name: String(args.name ?? "") });
       default:
         return err(404, `unknown tool: ${name}`);
     }

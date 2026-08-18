@@ -58,6 +58,8 @@ function toolLabel(name: string, args: Record<string, unknown>, ok?: boolean): s
       return `${failed ? "Couldn't create" : "Created"} project${a("title") ? ` “${a("title")}”` : ""}`;
     case "update":
       return `${failed ? "Couldn't update" : "Updated"} “${a("name")}”`;
+    case "delete":
+      return `${failed ? "Couldn't delete" : "Deleted"} “${a("name")}”`;
     default:
       return name.replaceAll("_", " ");
   }
