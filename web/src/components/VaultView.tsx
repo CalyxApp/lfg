@@ -78,10 +78,13 @@ export function VaultView({
   repos,
   deepLink,
   onDeepLinkConsumed,
+  onContinueChat,
 }: {
   repos: Repo[];
   deepLink?: { repo: string; path: string } | null;
   onDeepLinkConsumed?: () => void;
+  /** Reopen a saved AI chat note back in the chat surface (repo-scoped). */
+  onContinueChat?: (repo: string, path: string, content: string) => void;
 }) {
   const [repo, setRepo] = useState<string | null>(null);
   const [pane, setPane] = useState<Pane>("files");
@@ -249,6 +252,9 @@ export function VaultView({
           openPath={openPath}
           onOpenPathConsumed={() => setOpenPath(null)}
           onExitRepo={() => setRepo(null)}
+          onContinueChat={
+            onContinueChat ? (path, content) => onContinueChat(repo, path, content) : undefined
+          }
         />
       ) : pane === "tasks" ? (
         <>

@@ -15,6 +15,7 @@ import {
   FileText,
   Folder,
   Loader2,
+  MessageSquare,
   Pencil,
   X,
 } from "lucide-react";
@@ -73,11 +74,14 @@ export function FilesView({
   openPath,
   onOpenPathConsumed,
   onExitRepo,
+  onContinueChat,
 }: {
   repo: string;
   openPath?: string | null;
   onOpenPathConsumed?: () => void;
   onExitRepo?: () => void;
+  /** Reopen a saved AI chat note back in the chat surface to keep it going. */
+  onContinueChat?: (path: string, content: string) => void;
 }) {
   const [dir, setDir] = useState("");
   const [entries, setEntries] = useState<TreeEntry[]>([]);
@@ -200,6 +204,14 @@ export function FilesView({
     : "";
   const editable = !!file && !file.raw && !file.binary && !file.tooLarge;
   const isMd = !!file && MD_RE.test(file.path);
+  // A saved AI chat (from Converse): lives under ai-voice-conversations/, or is
+  // typed as such in frontmatter. These get a "Continue chat" affordance.
+  const isConversation =
+    !!file &&
+    (file.path.startsWith("ai-voice-conversations/") ||
+      splitFrontmatter(file.content ?? "").fm.some(
+        ([k, v]) => k === "type" && v === "ai-voice-conversation",
+      ));
 
   return (
     <div className="flex flex-col gap-3">
@@ -257,6 +269,17 @@ export function FilesView({
         </div>
 
         {/* Contextual actions */}
+        {file && isConversation && mode === "view" && onContinueChat ? (
+          <button
+            type="button"
+            onClick={() => onContinueChat(file.path, file.content ?? "")}
+            aria-label="Continue chat"
+            title="Continue this chat"
+            className="flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground active:scale-[0.96]"
+          >
+            <MessageSquare className="size-4" />
+          </button>
+        ) : null}
         {file && editable && mode === "view" ? (
           <button
             type="button"

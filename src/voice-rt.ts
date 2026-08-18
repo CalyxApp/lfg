@@ -121,7 +121,14 @@ export async function runRtTool(
  */
 export async function saveConversation(
   repoCwd: string,
-  input: { title: string; transcript: string; tags?: string[]; properties?: Record<string, unknown> },
+  input: {
+    title: string;
+    transcript: string;
+    tags?: string[];
+    properties?: Record<string, unknown>;
+    /** Existing note being continued — update it in place instead of creating a new slug. */
+    path?: string;
+  },
 ): Promise<Response> {
   const title = input.title.trim();
   if (!title || !input.transcript) return err(400, "title and transcript are required");
@@ -135,6 +142,18 @@ export async function saveConversation(
   const content = `${frontmatter}\n\n${input.transcript}\n`;
   try {
     const result = await withRepoLock(repoCwd, async () => {
+      // Continuing a saved chat: overwrite that exact note so the thread keeps a
+      // single history file. Constrained to the conversations folder so a stray
+      // path can never clobber an unrelated vault file.
+      if (input.path) {
+        const rel = input.path;
+        if (!rel.startsWith("ai-voice-conversations/") || !rel.endsWith(".md")) {
+          throw new Error("invalid conversation path");
+        }
+        const updated = await writeRepoFile(repoCwd, rel, content, { createOnly: false });
+        const commit = gitCommitPaths(repoCwd, [updated.path], `converse: continue conversation — ${title}`);
+        return { path: updated.path, commit };
+      }
       let written: { path: string } | null = null;
       for (let n = 1; n <= 20; n++) {
         const rel =
