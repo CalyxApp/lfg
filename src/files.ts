@@ -6,7 +6,7 @@
 // every git invocation uses an arg array (no shell) so a query or path can't
 // inject. lfg's web API has no auth of its own, so these are a real surface.
 
-import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 
 const MAX_FILE_BYTES = 1_000_000; // 1 MB — larger files return { tooLarge } for a mobile viewer
@@ -111,6 +111,24 @@ export async function writeRepoFile(
   if (!st) await mkdir(dirname(abs), { recursive: true });
   await writeFile(abs, content, "utf8");
   return { path: rel, size, created: !st };
+}
+
+/**
+ * Delete a single file from the repo (path-safe; never a directory). The removal
+ * is committed by the caller via gitCommitPaths — `git add -- <path>` stages a
+ * deletion — so it stays recoverable in history.
+ */
+export async function deleteRepoFile(repoCwd: string, rel: string): Promise<{ path: string }> {
+  if (!rel) throw new Error("path required");
+  const abs = await safeResolve(repoCwd, rel);
+  const st = await stat(abs).catch((e) => {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw e;
+  });
+  if (!st) throw new Error("file does not exist");
+  if (!st.isFile()) throw new Error("not a file");
+  await unlink(abs);
+  return { path: rel };
 }
 
 /**

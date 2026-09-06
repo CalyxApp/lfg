@@ -1929,6 +1929,14 @@ export function App() {
   const [notepadOpen, setNotepadOpen] = useState(false);
   const [callOpen, setCallOpen] = useState(false);
   const [converseOpen, setConverseOpen] = useState(false);
+  // Set when reopening a saved chat from history (Files → "Continue chat"); the
+  // chat surface parses this note's transcript to pick up where it left off and
+  // updates the same note on save. Cleared whenever a fresh chat is opened.
+  const [converseSeed, setConverseSeed] = useState<{
+    repo: string;
+    path: string;
+    content: string;
+  } | null>(null);
   // Cmd/Ctrl+K command palette — an app-wide fuzzy launcher for navigation,
   // actions, projects and sessions.
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -2759,7 +2767,10 @@ export function App() {
       label: "Open Converse",
       keywords: "voice chat talk realtime",
       icon: <MessageCircle className="size-4" />,
-      run: () => setConverseOpen(true),
+      run: () => {
+        setConverseSeed(null);
+        setConverseOpen(true);
+      },
     });
     cmds.push({
       id: "act-theme",
@@ -3334,7 +3345,10 @@ export function App() {
             {!isMobile && !converseOpen ? (
               <button
                 type="button"
-                onClick={() => setConverseOpen(true)}
+                onClick={() => {
+                  setConverseSeed(null);
+                  setConverseOpen(true);
+                }}
                 title="Converse — chat & voice, one thread (type, dictate, or talk)"
                 aria-label="Open Converse chat"
                 style={{
@@ -3504,6 +3518,10 @@ export function App() {
             repos={repos}
             deepLink={vaultDeepLink}
             onDeepLinkConsumed={() => setVaultDeepLink(null)}
+            onContinueChat={(repo, path, content) => {
+              setConverseSeed({ repo, path, content });
+              setConverseOpen(true);
+            }}
           />
         ) : tab === "capture" ? (
           <CaptureView repos={repos} />
@@ -3596,7 +3614,10 @@ export function App() {
         <TabBar
           tab={tab}
           onSelect={setTab}
-          onChat={() => setConverseOpen(true)}
+          onChat={() => {
+            setConverseSeed(null);
+            setConverseOpen(true);
+          }}
           onSearch={() => setPaletteOpen(true)}
         />
       ) : null}
@@ -3612,7 +3633,13 @@ export function App() {
 
       {converseOpen ? (
         <Suspense fallback={null}>
-          <Converse onClose={() => setConverseOpen(false)} />
+          <Converse
+            seed={converseSeed ?? undefined}
+            onClose={() => {
+              setConverseOpen(false);
+              setConverseSeed(null);
+            }}
+          />
         </Suspense>
       ) : null}
 

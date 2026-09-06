@@ -58,6 +58,8 @@ function toolLabel(name: string, args: Record<string, unknown>, ok?: boolean): s
       return `${failed ? "Couldn't create" : "Created"} project${a("title") ? ` “${a("title")}”` : ""}`;
     case "update":
       return `${failed ? "Couldn't update" : "Updated"} “${a("name")}”`;
+    case "delete":
+      return `${failed ? "Couldn't delete" : "Deleted"} “${a("name")}”`;
     default:
       return name.replaceAll("_", " ");
   }
@@ -75,12 +77,54 @@ function formatDuration(ms: number): string {
   return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
 }
 
-export function Converse({ onClose }: { onClose: () => void }) {
+// Reopening a saved chat from history: turn the stored note markdown back into
+// thread turns so the user can pick up where they left off. The transcript is
+// written by buildTranscript() as `**You:** …` / `**Assistant:** …` blocks
+// (turns joined by a blank line); an assistant turn can itself span multiple
+// lines/paragraphs, so a new turn only begins at a line that STARTS with the
+// `**You:**` / `**Assistant:**` marker — everything else is appended to the
+// current turn. Frontmatter and the `## Transcript` header are ignored.
+function parseTranscript(md: string): LogEntry[] {
+  const body = md.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "");
+  const out: LogEntry[] = [];
+  let cur: LogEntry | null = null;
+  const flush = () => {
+    if (cur && cur.text.trim()) out.push({ role: cur.role, text: cur.text.trim() });
+    cur = null;
+  };
+  for (const line of body.split(/\r?\n/)) {
+    const you = /^\*\*You:\*\*\s?(.*)$/.exec(line);
+    const asst = /^\*\*Assistant:\*\*\s?(.*)$/.exec(line);
+    if (you) {
+      flush();
+      cur = { role: "you", text: you[1] };
+    } else if (asst) {
+      flush();
+      cur = { role: "assistant", text: asst[1] };
+    } else if (cur) {
+      cur.text += `\n${line}`;
+    }
+  }
+  flush();
+  return out;
+}
+
+// `seed` reopens Converse on a saved conversation note (from the Files view's
+// "Continue chat" action): repo + repo-relative path + the note's raw markdown.
+// The path is echoed back on save so the SAME note is updated in place instead
+// of spawning a duplicate history file.
+export type ConverseSeed = { repo?: string; path?: string; content?: string };
+
+export function Converse({ onClose, seed }: { onClose: () => void; seed?: ConverseSeed }) {
   const [mode, setMode] = useState<Mode>("chat");
   const [phase, setPhase] = useState<Phase>("live");
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("connecting");
   const [error, setError] = useState<string | null>(null);
-  const [log, setLog] = useState<LogEntry[]>([]);
+  // Seed the thread from a saved conversation when continuing from history,
+  // otherwise start empty. Lazy init so the transcript is parsed exactly once.
+  const [log, setLog] = useState<LogEntry[]>(() =>
+    seed?.content ? parseTranscript(seed.content) : [],
+  );
 
   // chat-mode state
   const [input, setInput] = useState("");
@@ -101,7 +145,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const startedAtRef = useRef<number | null>(null);
   const usedVoiceRef = useRef(false);
-  const logRef = useRef<LogEntry[]>([]);
+  // Kept in lockstep with `log` (append/upsert write both). Seeded from the same
+  // initial value so sendChatText / voice replay see the prior turns immediately.
+  const logRef = useRef<LogEntry[]>(log);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const append = (role: LogEntry["role"], text: string, ok?: boolean) =>
@@ -457,7 +503,15 @@ export function Converse({ onClose }: { onClose: () => void }) {
       const res = await fetch("/api/voice/rt/save-conversation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title.trim(), tags, properties: props, transcript: buildTranscript() }),
+        body: JSON.stringify({
+          title: title.trim(),
+          tags,
+          properties: props,
+          transcript: buildTranscript(),
+          // Continuing a saved chat → update that note in place (no duplicate).
+          ...(seed?.path ? { sourcePath: seed.path } : {}),
+          ...(seed?.repo ? { repo: seed.repo } : {}),
+        }),
       });
       if (!res.ok) throw new Error(`save ${res.status}: ${await res.text()}`);
       onClose();

@@ -1621,6 +1621,8 @@ export async function cmdServe() {
           tags?: string[];
           properties?: Record<string, unknown>;
           repo?: string;
+          // Set when continuing a saved chat: update that note in place.
+          sourcePath?: string;
         } | null;
         if (!body?.title?.trim() || !body.transcript) return err(400, "title and transcript are required");
         const repos = await listRepos();
@@ -1634,6 +1636,7 @@ export async function cmdServe() {
           transcript: body.transcript,
           tags: body.tags,
           properties: body.properties,
+          path: body.sourcePath,
         });
       }
 
