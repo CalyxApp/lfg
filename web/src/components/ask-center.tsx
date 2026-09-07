@@ -132,6 +132,23 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false);
   const seen = useRef<Set<string>>(new Set());
   const seenCalyx = useRef<Set<string>>(new Set());
+  // Ids of asks that have been auto-cleared from the UI. Filters them out of
+  // subsequent server polls so a still-blocked (but already-answered) task
+  // doesn't keep re-appearing until the runner clears execution_status.
+  const dismissed = useRef<Set<string>>(new Set());
+  const clearTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  // Schedule auto-removal of an answered ask after `delayMs`. Safe to call
+  // multiple times for the same id — only the first call registers a timer.
+  const scheduleClear = useCallback((id: string, delayMs: number) => {
+    if (clearTimers.current.has(id)) return;
+    const t = setTimeout(() => {
+      clearTimers.current.delete(id);
+      dismissed.current.add(id);
+      setCalyxAsks((prev) => prev.filter((a) => a.id !== id));
+    }, delayMs);
+    clearTimers.current.set(id, t);
+  }, []); // only refs + stable setState dispatch — no reactive deps
 
   const refresh = useCallback(async () => {
     try {
@@ -179,16 +196,25 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
       if (!res.ok) return; // no vault configured on this server — feature is simply absent
       const data = (await res.json()) as { asks?: CalyxAsk[] };
       const asks = data.asks || [];
-      setCalyxAsks(asks);
-      for (const a of asks) {
-        if (a.answered || seenCalyx.current.has(a.id)) continue;
+      // Don't re-show asks we've already auto-cleared; they'll vanish from the
+      // server feed once the runner resumes and clears execution_status.
+      const visible = asks.filter((a) => !dismissed.current.has(a.id));
+      setCalyxAsks(visible);
+      for (const a of visible) {
+        if (a.answered) {
+          // Already answered (previous session or another device) — schedule a
+          // quick auto-clear so the confirmation banner doesn't linger forever.
+          scheduleClear(a.id, 2000);
+          continue; // no toast for work that's already been dealt with
+        }
+        if (seenCalyx.current.has(a.id)) continue;
         seenCalyx.current.add(a.id);
         toast("An agent task stopped to ask you something", { description: a.title });
       }
     } catch {
       // transient — next tick retries
     }
-  }, []);
+  }, [scheduleClear]);
 
   useEffect(() => {
     void refresh();
@@ -205,6 +231,8 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
       clearInterval(tc);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("focus", onVis);
+      // Cancel any pending auto-clear timers.
+      for (const timer of clearTimers.current.values()) clearTimeout(timer);
     };
   }, [refresh, refreshCalyx]);
 
@@ -247,11 +275,14 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
           body: JSON.stringify({ repo: ask.repo, path: ask.path, answer: text.trim() }),
         });
         if (!res.ok) throw new Error(await res.text());
-        // Optimistic: flip to "answered" rather than removing it, so you can see
-        // what you said while the runner picks it up.
+        // Optimistic: flip to "answered" so you see the "Answered — restarting"
+        // confirmation. A 4-second timer then auto-removes the card entirely —
+        // the runner will pick up the answer and clear execution_status on its
+        // own; the card doesn't need to linger here.
         setCalyxAsks((prev) =>
           prev.map((a) => (a.id === ask.id ? { ...a, answered: true, answer: text.trim() } : a)),
         );
+        scheduleClear(ask.id, 4000);
         toast("Answer saved — the task will pick it up", {
           description: "Runs on your server, so it resumes even with this closed.",
         });
@@ -261,7 +292,7 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
         setBusy(false);
       }
     },
-    [busy],
+    [busy, scheduleClear],
   );
 
   return (
