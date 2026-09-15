@@ -25,7 +25,7 @@
 // (the "the-card.md" vocabulary). It is intentionally the SAME vocabulary, not a
 // second one — if that file changes, change this reader with it.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { scanVault, updateVaultDoc, stripWikilink, type VaultDoc } from "./vault.ts";
 
@@ -69,6 +69,8 @@ export type CalyxAsk = {
   answer?: string;
   /** Which repo/vault this came from, so a multi-vault phone can say. */
   repo: string;
+  /** When this task blocked (epoch ms). Best-effort from frontmatter or file mtime. */
+  blockedAt?: number;
 };
 
 // Calyx's own limits, mirrored so a malformed file can't produce a runaway card.
@@ -180,7 +182,7 @@ function isBlockedTask(d: VaultDoc): boolean {
   return str(d.properties.execution_status)?.toLowerCase() === "blocked";
 }
 
-function toAsk(d: VaultDoc, repo: string): CalyxAsk {
+function toAsk(d: VaultDoc, repo: string, repoCwd: string): CalyxAsk {
   const p = d.properties;
   const answer = str(p.unblock_comments);
   return {
@@ -194,13 +196,48 @@ function toAsk(d: VaultDoc, repo: string): CalyxAsk {
     answered: Boolean(answer),
     answer,
     repo,
+    blockedAt: deriveBlockedAt(p, repoCwd, d.path),
   };
+}
+
+/**
+ * Best-effort epoch ms for when this task blocked. Checks (in order):
+ *   1. agent_execution.last_update — set by the runner when it parks the task
+ *   2. execution_started_at — the run that ended by blocking
+ *   3. updated_at / created_at — generic frontmatter timestamps
+ *   4. File mtime — always available, worst precision
+ */
+function deriveBlockedAt(
+  p: Record<string, unknown>,
+  repoCwd: string,
+  relPath: string,
+): number | undefined {
+  // agent_execution is an object with ISO string fields
+  const exec = p.agent_execution as Record<string, unknown> | undefined;
+  const candidates: unknown[] = [
+    exec?.last_update,
+    str(p.execution_started_at),
+    str(p.updated_at),
+    str(p.created_at),
+  ];
+  for (const v of candidates) {
+    if (typeof v === "string" && v) {
+      const ms = Date.parse(v);
+      if (!isNaN(ms)) return ms;
+    }
+  }
+  // Fallback: file mtime
+  try {
+    return statSync(join(repoCwd, relPath)).mtimeMs;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Every stopped-and-waiting task in one vault, newest-looking first. */
 export function listCalyxAsks(repoCwd: string, repoName: string): CalyxAsk[] {
   const { docs } = scanVault(repoCwd);
-  const asks = docs.filter(isBlockedTask).map((d) => toAsk(d, repoName));
+  const asks = docs.filter(isBlockedTask).map((d) => toAsk(d, repoName, repoCwd));
   // Unanswered first — those are the ones actually holding work up.
   return asks.sort((a, b) => Number(a.answered) - Number(b.answered));
 }

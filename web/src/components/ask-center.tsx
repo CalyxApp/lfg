@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils";
 import { Streamdown } from "streamdown";
 import { MicButton } from "@/components/dictation";
 import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
+import { EmptyState } from "@/components/ui/empty-state";
 import {
   Bot,
   Check,
@@ -89,6 +90,8 @@ type CalyxAsk = {
   answered: boolean;
   answer?: string;
   repo: string;
+  /** When this task blocked (epoch ms). Used for the relative-time label. */
+  blockedAt?: number;
 };
 
 const POLL_MS = 5000;
@@ -129,6 +132,23 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
   const [collapsed, setCollapsed] = useState(false);
   const seen = useRef<Set<string>>(new Set());
   const seenCalyx = useRef<Set<string>>(new Set());
+  // Ids of asks that have been auto-cleared from the UI. Filters them out of
+  // subsequent server polls so a still-blocked (but already-answered) task
+  // doesn't keep re-appearing until the runner clears execution_status.
+  const dismissed = useRef<Set<string>>(new Set());
+  const clearTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  // Schedule auto-removal of an answered ask after `delayMs`. Safe to call
+  // multiple times for the same id — only the first call registers a timer.
+  const scheduleClear = useCallback((id: string, delayMs: number) => {
+    if (clearTimers.current.has(id)) return;
+    const t = setTimeout(() => {
+      clearTimers.current.delete(id);
+      dismissed.current.add(id);
+      setCalyxAsks((prev) => prev.filter((a) => a.id !== id));
+    }, delayMs);
+    clearTimers.current.set(id, t);
+  }, []); // only refs + stable setState dispatch — no reactive deps
 
   const refresh = useCallback(async () => {
     try {
@@ -176,16 +196,25 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
       if (!res.ok) return; // no vault configured on this server — feature is simply absent
       const data = (await res.json()) as { asks?: CalyxAsk[] };
       const asks = data.asks || [];
-      setCalyxAsks(asks);
-      for (const a of asks) {
-        if (a.answered || seenCalyx.current.has(a.id)) continue;
+      // Don't re-show asks we've already auto-cleared; they'll vanish from the
+      // server feed once the runner resumes and clears execution_status.
+      const visible = asks.filter((a) => !dismissed.current.has(a.id));
+      setCalyxAsks(visible);
+      for (const a of visible) {
+        if (a.answered) {
+          // Already answered (previous session or another device) — schedule a
+          // quick auto-clear so the confirmation banner doesn't linger forever.
+          scheduleClear(a.id, 2000);
+          continue; // no toast for work that's already been dealt with
+        }
+        if (seenCalyx.current.has(a.id)) continue;
         seenCalyx.current.add(a.id);
         toast("An agent task stopped to ask you something", { description: a.title });
       }
     } catch {
       // transient — next tick retries
     }
-  }, []);
+  }, [scheduleClear]);
 
   useEffect(() => {
     void refresh();
@@ -202,6 +231,8 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
       clearInterval(tc);
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("focus", onVis);
+      // Cancel any pending auto-clear timers.
+      for (const timer of clearTimers.current.values()) clearTimeout(timer);
     };
   }, [refresh, refreshCalyx]);
 
@@ -244,11 +275,14 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
           body: JSON.stringify({ repo: ask.repo, path: ask.path, answer: text.trim() }),
         });
         if (!res.ok) throw new Error(await res.text());
-        // Optimistic: flip to "answered" rather than removing it, so you can see
-        // what you said while the runner picks it up.
+        // Optimistic: flip to "answered" so you see the "Answered — restarting"
+        // confirmation. A 4-second timer then auto-removes the card entirely —
+        // the runner will pick up the answer and clear execution_status on its
+        // own; the card doesn't need to linger here.
         setCalyxAsks((prev) =>
           prev.map((a) => (a.id === ask.id ? { ...a, answered: true, answer: text.trim() } : a)),
         );
+        scheduleClear(ask.id, 4000);
         toast("Answer saved — the task will pick it up", {
           description: "Runs on your server, so it resumes even with this closed.",
         });
@@ -258,7 +292,7 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
         setBusy(false);
       }
     },
-    [busy],
+    [busy, scheduleClear],
   );
 
   return (
@@ -436,17 +470,64 @@ export function AskCenter({ onExpand }: { onExpand: () => void }) {
 //
 // Every option stays visible — they get smaller, never fewer. A hidden option is
 // one you won't consider. What collapses is the briefing.
+
+/**
+ * Combine per-question answers into one `unblock_comments` string.
+ *
+ * Single-question asks return the raw answer for backward compatibility — the
+ * agent gets exactly what it got before pagination existed. Multi-question asks
+ * format each answer under its header so the agent can parse them apart.
+ */
+function formatMultiAnswer(
+  questions: CalyxAskQuestion[],
+  answers: string[],
+): string {
+  if (questions.length <= 1) return answers[0] || "";
+  return questions
+    .map((q, i) => {
+      const label = q.header || `Question ${i + 1}`;
+      return `${label}: ${answers[i] || "(no answer)"}`;
+    })
+    .join("\n\n");
+}
+
 function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
   const { answerCalyx, busy } = useAsk();
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [body, setBody] = useState<string | null>(null);
-  const [picked, setPicked] = useState<string[]>([]);
   const [viewing, setViewing] = useState<string | null>(null);
   const [pendingChoice, setPendingChoice] = useState<string | null>(null);
 
-  const q = ask.questions[0];
+  // ── Multi-question pagination ──────────────────────────────────────────
+  // When an ask carries more than one question the user steps through them
+  // one at a time. Each answer is stored locally; on the last one the whole
+  // set is formatted into `unblock_comments` as a single string. For a
+  // single question the pagination state is inert and the UI is unchanged.
+  const totalQ = ask.questions.length;
+  const [qIdx, setQIdx] = useState(0);
+  const [answers, setAnswers] = useState<string[]>(
+    () => Array.from({ length: Math.max(totalQ, 1) }, () => ""),
+  );
+  const [picks, setPicks] = useState<string[][]>(
+    () => Array.from({ length: Math.max(totalQ, 1) }, () => []),
+  );
+
+  const q = totalQ > 0 ? ask.questions[qIdx] : undefined;
   const multi = q?.multiSelect === true;
+  const isLast = qIdx >= totalQ - 1;
+  const currentPicks = picks[qIdx] || [];
+
+  // Sync the free-text draft when switching questions. Pre-fill with the
+  // recorded answer if it was free-text (not an option tap); leave it empty
+  // when the answer matches an option label since the highlight suffices.
+  useEffect(() => {
+    const cur = answers[qIdx] || "";
+    const isOptionAnswer =
+      q?.options?.some((o) => o.label === cur) ?? false;
+    setText(isOptionAnswer ? "" : cur);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qIdx]);
 
   /**
    * A choice made *inside* an attachment — the agent's HTML can make its own
@@ -502,14 +583,43 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
     };
   }, [open, body, ask.repo, ask.path]);
 
-  const send = (value: string) => void answerCalyx(ask, value);
+  // Record the current question's answer and either advance to the next or —
+  // on the last question — format every answer into one string and submit.
+  const recordAndAdvance = useCallback(
+    (answer: string) => {
+      const next = [...answers];
+      next[qIdx] = answer;
+      setAnswers(next);
+
+      if (isLast) {
+        const formatted = formatMultiAnswer(ask.questions, next);
+        void answerCalyx(ask, formatted);
+      } else {
+        setQIdx((i) => i + 1);
+      }
+    },
+    [qIdx, isLast, answers, ask, answerCalyx],
+  );
 
   const toggle = (label: string) => {
     if (!multi) {
-      send(label);
+      // Single-select: record and advance in one tap.
+      const nextPicks = [...picks];
+      nextPicks[qIdx] = [label];
+      setPicks(nextPicks);
+      recordAndAdvance(label);
       return;
     }
-    setPicked((p) => (p.includes(label) ? p.filter((x) => x !== label) : [...p, label]));
+    // Multi-select: toggle the label in the current question's pick list.
+    setPicks((prev) => {
+      const cur = prev[qIdx] || [];
+      const next = cur.includes(label)
+        ? cur.filter((x) => x !== label)
+        : [...cur, label];
+      const out = [...prev];
+      out[qIdx] = next;
+      return out;
+    });
   };
 
   if (ask.answered) {
@@ -530,14 +640,61 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
   return (
     <div className="overflow-hidden rounded-2xl border border-border bg-card">
       <div className="p-4">
-        {/* Orientation — which piece of work is stopped. */}
+        {/* Orientation — which piece of work is stopped, and how long ago. */}
         <div className="flex items-start gap-2 text-xs text-muted-foreground">
           <Bot className="mt-0.5 size-3.5 shrink-0" />
           <span className="min-w-0 truncate">
             {ask.project ? `${ask.project} · ` : ""}
             {ask.title}
           </span>
+          {ask.blockedAt ? (
+            <span className="ml-auto shrink-0 tabular-nums">{timeAgo(ask.blockedAt)}</span>
+          ) : null}
         </div>
+
+        {/* Step indicator — only when there are multiple questions. Shows a
+            dot per question: active, answered, or pending. */}
+        {totalQ > 1 ? (
+          <div className="mt-2.5 flex items-center gap-2">
+            {qIdx > 0 ? (
+              <button
+                type="button"
+                onClick={() => setQIdx((i) => i - 1)}
+                className="flex items-center gap-0.5 text-xs text-muted-foreground hover:text-foreground active:scale-[0.97]"
+              >
+                <ChevronLeft className="size-3" />
+                Back
+              </button>
+            ) : (
+              <span className="w-10" />
+            )}
+            <div className="flex flex-1 items-center justify-center gap-1.5">
+              {ask.questions.map((_, i) => (
+                <span
+                  key={i}
+                  className={cn(
+                    "h-1.5 rounded-full transition-all duration-200",
+                    i === qIdx
+                      ? "w-4 bg-primary"
+                      : answers[i]
+                        ? "w-1.5 bg-primary/40"
+                        : "w-1.5 bg-muted-foreground/25",
+                  )}
+                />
+              ))}
+            </div>
+            <span className="w-10 text-right text-[11px] tabular-nums text-muted-foreground">
+              {qIdx + 1}/{totalQ}
+            </span>
+          </div>
+        ) : null}
+
+        {/* Header chip — visible on multi-question asks to label each step. */}
+        {totalQ > 1 && q?.header ? (
+          <div className="mt-2 inline-block rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+            {q.header}
+          </div>
+        ) : null}
 
         {/* The question. */}
         <div className="mt-2 text-[15px] font-medium leading-snug">
@@ -571,7 +728,9 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
         {q?.options?.length ? (
           <div className="mt-3 flex flex-col gap-2">
             {q.options.map((o) => {
-              const on = picked.includes(o.label);
+              const on = multi
+                ? currentPicks.includes(o.label)
+                : answers[qIdx] === o.label;
               return (
                 <button
                   key={o.label}
@@ -592,7 +751,7 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
                         Recommended
                       </span>
                     ) : null}
-                    {multi && on ? <Check className="ml-auto size-4 text-primary" /> : null}
+                    {on ? <Check className="ml-auto size-4 text-primary" /> : null}
                   </div>
                   {o.description ? (
                     <div className="mt-0.5 text-xs leading-snug text-muted-foreground">
@@ -629,10 +788,12 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
             {multi ? (
               <Button
                 size="sm"
-                disabled={busy || picked.length === 0}
-                onClick={() => send(picked.join(", "))}
+                disabled={busy || currentPicks.length === 0}
+                onClick={() => recordAndAdvance(currentPicks.join(", "))}
               >
-                Send {picked.length || ""}
+                {isLast
+                  ? `Send ${currentPicks.length || ""}`
+                  : `Next · ${currentPicks.length} selected`}
               </Button>
             ) : null}
           </div>
@@ -644,7 +805,17 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
             <div className="text-xs text-muted-foreground">From the preview you opened</div>
             <div className="mt-0.5 text-sm font-medium">{pendingChoice}</div>
             <div className="mt-2 flex gap-2">
-              <Button size="sm" disabled={busy} onClick={() => send(pendingChoice)}>
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => {
+                  // Goes through the same path as tapping the option itself, so
+                  // a confirmed preview-choice advances a multi-question ask
+                  // rather than short-circuiting it.
+                  recordAndAdvance(pendingChoice);
+                  setPendingChoice(null);
+                }}
+              >
                 Confirm
               </Button>
               <Button
@@ -670,6 +841,19 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
             placeholder={q?.options?.length ? "Or say something else…" : "Your answer…"}
             rows={2}
             className="min-h-[44px] resize-none text-sm"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                // Free text takes priority when the box has content.
+                if (text.trim()) {
+                  recordAndAdvance(text.trim());
+                } else if (multi && currentPicks.length > 0) {
+                  // No text but multi-select picks exist — same as tapping
+                  // the "Next" / "Send" button.
+                  recordAndAdvance(currentPicks.join(", "));
+                }
+              }
+            }}
           />
           <MicButton
             baseText={text}
@@ -684,19 +868,22 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
           <Button
             size="icon"
             disabled={busy || !text.trim()}
-            onClick={() => {
-              send(text);
-              setText("");
-            }}
-            aria-label="Send answer"
+            onClick={() => recordAndAdvance(text.trim())}
+            aria-label={isLast || totalQ <= 1 ? "Send answer" : "Next question"}
           >
-            <Send className="size-4" />
+            {isLast || totalQ <= 1 ? (
+              <Send className="size-4" />
+            ) : (
+              <ChevronRight className="size-4" />
+            )}
           </Button>
         </div>
 
         {/* The promise — honest about where it runs. */}
         <div className="mt-2 text-[11px] text-muted-foreground">
-          Answering restarts this task on your server — it resumes even with this closed.
+          {totalQ > 1 && !isLast
+            ? `Question ${qIdx + 1} of ${totalQ} — your answers are sent together after the last one.`
+            : "Answering restarts this task on your server — it resumes even with this closed."}
         </div>
       </div>
 
@@ -733,6 +920,18 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
       ) : null}
     </div>
   );
+}
+
+/** Relative time label — matches the style used across the app. */
+function timeAgo(ts?: number): string {
+  if (!ts) return "";
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|avif)$/i;
@@ -885,16 +1084,12 @@ export function AskPage() {
       <CalyxAskSection />
 
       {count === 0 && calyxAsks.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-border py-20 text-center">
-          <div className="flex size-14 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
-            <Inbox className="size-7" />
-          </div>
-          <div className="text-sm font-medium">No questions right now</div>
-          <div className="max-w-xs text-xs text-muted-foreground">
-            When an agent needs a decision, it'll show up here and you'll get a
-            notification.
-          </div>
-        </div>
+        <EmptyState
+          icon={<Inbox className="size-5" />}
+          title="Nothing waiting on you"
+          description="When an agent hits a fork it'll stop and ask here. You'll get a notification."
+          className="py-20"
+        />
       ) : count > 0 ? (
         <SwipeStack questions={questions} />
       ) : null}
@@ -1157,6 +1352,11 @@ function QuestionCard({
             Agent needs your input
           </div>
         )}
+        {q.createdAt ? (
+          <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">
+            {timeAgo(q.createdAt)}
+          </span>
+        ) : null}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
