@@ -44,6 +44,7 @@ import {
   type OriginDeliveryMedia,
 } from "../origin-deliveries.ts";
 import {
+  createFileArtifact,
   createImageArtifact,
   createVideoArtifact,
   deleteArtifact,
@@ -53,6 +54,7 @@ import {
   publishHtmlArtifact,
   type ImageArtifact,
 } from "../artifacts.ts";
+import { contentDisposition } from "../artifact-headers.ts";
 import { deleteImagePreview, getOrCreateImagePreview } from "../artifact-previews.ts";
 import { addShipPost, listShipPosts } from "../shipped.ts";
 import {
@@ -4133,6 +4135,12 @@ export async function cmdServe() {
             // Video seeking (and Safari playback) needs byte-range support.
             "Accept-Ranges": "bytes",
           };
+          // `file` artifacts are downloads, not inline renders: force an
+          // attachment so an agent-written .html/.svg saves instead of
+          // executing as the user. The name is agent-chosen; see artifact-headers.
+          if ((artifact.media ?? "image") === "file") {
+            baseHeaders["Content-Disposition"] = contentDisposition("attachment", artifact.name);
+          }
           // Honor a single-range request so the <video> element can seek without
           // re-downloading the whole file. Bun.file().slice() streams the slice.
           const range = req.headers.get("range");
@@ -4257,6 +4265,32 @@ export async function cmdServe() {
             return json({ ok: true, artifact, message: imageArtifactToMessage(artifact), indexed: true });
           } catch (e) {
             return err(400, e instanceof Error ? e.message : "could not create video artifact");
+          }
+        }
+      }
+
+      {
+        const m = path.match(/^\/api\/sessions\/([0-9a-fA-F-]{36})\/artifacts\/files$/);
+        if (m && req.method === "POST") {
+          const body = (await req.json().catch(() => null)) as {
+            path?: string;
+            caption?: string;
+            alt?: string;
+          } | null;
+          if (!body?.path?.trim()) return err(400, "path required");
+          try {
+            const transcriptPath = await resolveTranscript(m[1]);
+            const indexPath = transcriptPath ?? sessionIndexKey(m[1]);
+            const artifact = createFileArtifact({
+              sessionId: m[1],
+              path: body.path,
+              caption: body.caption,
+              alt: body.alt,
+            });
+            indexArtifactMessage(indexPath, m[1], artifact);
+            return json({ ok: true, artifact, message: imageArtifactToMessage(artifact), indexed: true });
+          } catch (e) {
+            return err(400, e instanceof Error ? e.message : "could not create file artifact");
           }
         }
       }

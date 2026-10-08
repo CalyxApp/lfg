@@ -591,6 +591,37 @@ export async function cmdMcp() {
   );
 
   server.registerTool(
+    "lfg_display_file",
+    {
+      title: "Display File In LFG",
+      description:
+        "Give the user a local file in the LFG session transcript: a PDF, an audio clip, a CSV, a log, an archive, or any other document. The transcript shows a named card with its size and a download button; the file is downloaded, not rendered in place. Use lfg_display_image for screenshots and lfg_display_video for recordings, which do render inline.",
+      inputSchema: {
+        path: z.string().min(1).describe("Absolute path to the file on this machine. Any file type is accepted, up to 100 MB."),
+        caption: z.string().optional().describe("Short caption shown under the file. Say what the file is and why it matters."),
+        alt: z.string().optional().describe("Short accessible description of the file contents."),
+        sessionId: z.string().optional().describe("Target LFG session id. Defaults to LFG_SESSION_ID."),
+      },
+    },
+    async ({ path, caption, alt, sessionId }) => {
+      const sid = activeSessionId(sessionId);
+      const data = await api<ImageArtifactResponse>(
+        `/api/sessions/${encodeURIComponent(sid)}/artifacts/files`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path, caption, alt }),
+        },
+      );
+      return result({
+        displayed: true,
+        sessionId: sid,
+        artifact: data.artifact,
+      });
+    },
+  );
+
+  server.registerTool(
     "lfg_publish_artifact",
     {
       title: "Publish HTML Artifact In LFG",

@@ -4,14 +4,24 @@
 // backend enforces via CSP; re-published ids show a version badge.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Film, Globe, Image as ImageIcon, Loader2, Maximize2, RefreshCw, X } from "lucide-react";
+import {
+  Download,
+  File as FileIcon,
+  Film,
+  Globe,
+  Image as ImageIcon,
+  Loader2,
+  Maximize2,
+  RefreshCw,
+  X,
+} from "lucide-react";
 import { getJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
 
 export type ArtifactCard = {
   id: string;
-  kind: "image" | "video" | "html";
+  kind: "image" | "video" | "html" | "file";
   url: string;
   name?: string;
   title?: string;
@@ -31,7 +41,17 @@ const KINDS = [
   { key: "image", label: "Images" },
   { key: "video", label: "Videos" },
   { key: "html", label: "Live" },
+  { key: "file", label: "Files" },
 ] as const;
+
+function formatBytes(bytes?: number): string {
+  if (!bytes || bytes < 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+}
 
 function timeAgo(ts?: number): string {
   if (!ts) return "";
@@ -45,8 +65,38 @@ function timeAgo(ts?: number): string {
 }
 
 function KindIcon({ kind, className }: { kind: ArtifactCard["kind"]; className?: string }) {
-  const Icon = kind === "video" ? Film : kind === "html" ? Globe : ImageIcon;
+  const Icon =
+    kind === "video" ? Film : kind === "html" ? Globe : kind === "file" ? FileIcon : ImageIcon;
   return <Icon className={className} />;
+}
+
+// Downloadable file artifact: a filename + size row, no inline render. Reused by
+// the gallery tile (full) and the transcript inline card (compact).
+function FileCard({ artifact, full }: { artifact: ArtifactCard; full?: boolean }) {
+  return (
+    <a
+      href={artifact.url}
+      download={artifact.name}
+      target="_blank"
+      rel="noreferrer"
+      className={cn(
+        "flex items-center gap-3 bg-card px-3 text-left",
+        full ? "py-4" : "aspect-video",
+      )}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <FileIcon className="h-8 w-8 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-medium">
+          {artifact.name || artifact.title || artifact.id}
+        </div>
+        <div className="truncate text-[11px] text-muted-foreground">
+          {[formatBytes(artifact.size), artifact.caption].filter(Boolean).join(" · ")}
+        </div>
+      </div>
+      <Download className="h-4 w-4 shrink-0 text-muted-foreground" />
+    </a>
+  );
 }
 
 // Sandboxed live-HTML embed. The frame is cross-origin by CSP sandbox, so the
@@ -80,6 +130,7 @@ function HtmlEmbed({ artifact, full }: { artifact: ArtifactCard; full?: boolean 
 }
 
 function ArtifactMedia({ artifact, full }: { artifact: ArtifactCard; full?: boolean }) {
+  if (artifact.kind === "file") return <FileCard artifact={artifact} full={full} />;
   if (artifact.kind === "html") return <HtmlEmbed artifact={artifact} full={full} />;
   if (artifact.kind === "video")
     return (
@@ -116,24 +167,38 @@ export function ArtifactInlineCard({
     caption?: string;
     text?: string;
     version?: number;
+    name?: string;
+    size?: number;
   };
 }) {
   const [reader, setReader] = useState(false);
   if (!artifact.url) return null;
-  const kind = (artifact.kind === "video" || artifact.kind === "html" ? artifact.kind : "image") as
-    | "image"
-    | "video"
-    | "html";
+  const kind = (
+    artifact.kind === "video" || artifact.kind === "html" || artifact.kind === "file"
+      ? artifact.kind
+      : "image"
+  ) as "image" | "video" | "html" | "file";
   const card: ArtifactCard = {
     id: artifact.artifactId ?? artifact.url,
     kind,
     url: artifact.url,
+    name: artifact.name,
     title: artifact.title,
     caption: artifact.caption ?? artifact.text,
     sessionId: "",
     version: artifact.version,
+    size: artifact.size,
   };
   const label = artifact.title || artifact.caption || artifact.text;
+
+  // Downloadable file: a single tappable download card, no inline media.
+  if (kind === "file") {
+    return (
+      <div className="my-1.5 w-full max-w-md overflow-hidden rounded-xl border bg-card shadow-sm">
+        <FileCard artifact={card} full />
+      </div>
+    );
+  }
 
   // HTML documents: compact tappable preview → full-screen reader, the same
   // doc-open gesture as tapping an .html file in Files.

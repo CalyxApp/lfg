@@ -26,13 +26,14 @@ function indexPath(): string {
 const UUID = /^[0-9a-fA-F-]{36}$/;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_VIDEO_BYTES = 250 * 1024 * 1024;
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
 // Agents commonly retry a display tool after a transport/indexing error.  The
 // media copy may already be durable at that point, so treat an identical call
 // in this short window as the same publish instead of creating a second chat
 // message.  Deliberately displaying the same file again later still works.
 const RETRY_DEDUPE_MS = 5 * 60 * 1000;
 
-export type MediaKind = "image" | "video" | "html";
+export type MediaKind = "image" | "video" | "html" | "file";
 
 export type ArtifactRefreshStatus = "idle" | "running" | "success" | "error";
 
@@ -67,6 +68,25 @@ const VIDEO_TYPES: Record<string, string> = {
   ".webm": "video/webm",
   ".mov": "video/quicktime",
   ".ogv": "video/ogg",
+};
+
+// `file` artifacts accept any extension and are always served as a download, so
+// the mime is advisory (a nicer "open with" hint), never a render decision.
+// Anything unknown falls back to octet-stream rather than being rejected.
+const FILE_TYPES: Record<string, string> = {
+  ".pdf": "application/pdf",
+  ".csv": "text/csv",
+  ".tsv": "text/tab-separated-values",
+  ".json": "application/json",
+  ".txt": "text/plain",
+  ".log": "text/plain",
+  ".md": "text/markdown",
+  ".xml": "application/xml",
+  ".yaml": "application/yaml",
+  ".yml": "application/yaml",
+  ".zip": "application/zip",
+  ".gz": "application/gzip",
+  ".tar": "application/x-tar",
 };
 
 export type ImageArtifact = {
@@ -144,6 +164,10 @@ function videoMimeFor(path: string): string | null {
   return VIDEO_TYPES[extname(path).toLowerCase()] ?? null;
 }
 
+function fileMimeFor(path: string): string {
+  return FILE_TYPES[extname(path).toLowerCase()] ?? "application/octet-stream";
+}
+
 function createMediaArtifact(
   input: {
     sessionId: string;
@@ -158,7 +182,14 @@ function createMediaArtifact(
 
   if (!isAbsolute(input.path)) throw new Error(`${media} path must be absolute`);
   const sourcePath = resolve(input.path);
-  const mimeType = media === "video" ? videoMimeFor(sourcePath) : imageMimeFor(sourcePath);
+  // `file` accepts any extension (octet-stream fallback) and so never fails the
+  // type check; image/video stay restricted to the kinds the player can render.
+  const mimeType =
+    media === "file"
+      ? fileMimeFor(sourcePath)
+      : media === "video"
+        ? videoMimeFor(sourcePath)
+        : imageMimeFor(sourcePath);
   if (!mimeType) {
     throw new Error(
       media === "video"
@@ -167,7 +198,8 @@ function createMediaArtifact(
     );
   }
 
-  const maxBytes = media === "video" ? MAX_VIDEO_BYTES : MAX_IMAGE_BYTES;
+  const maxBytes =
+    media === "file" ? MAX_FILE_BYTES : media === "video" ? MAX_VIDEO_BYTES : MAX_IMAGE_BYTES;
   const st = statSync(sourcePath);
   if (!st.isFile()) throw new Error(`${media} path is not a file`);
   if (st.size <= 0) throw new Error(`${media} file is empty`);
@@ -236,6 +268,17 @@ export function createVideoArtifact(input: {
   alt?: string;
 }): ImageArtifact {
   return createMediaArtifact(input, "video");
+}
+
+// Any local file the agent wants the user to open (PDF, CSV, log, archive, …).
+// Served as a download, never rendered in place — see src/artifact-headers.ts.
+export function createFileArtifact(input: {
+  sessionId: string;
+  path: string;
+  caption?: string;
+  alt?: string;
+}): ImageArtifact {
+  return createMediaArtifact(input, "file");
 }
 
 // HTML artifacts are UPDATABLE: an intentional publish bumps the user-facing
@@ -438,7 +481,10 @@ export function collapseArtifactRetryMessages<T extends {
   const out: T[] = [];
   const lastBySignature = new Map<string, number>();
   for (const message of messages) {
-    if ((message.kind !== "image" && message.kind !== "video") || message.ts == null) {
+    if (
+      (message.kind !== "image" && message.kind !== "video" && message.kind !== "file") ||
+      message.ts == null
+    ) {
       out.push(message);
       continue;
     }
@@ -459,7 +505,13 @@ export function collapseArtifactRetryMessages<T extends {
 }
 
 export function hydrateImageArtifactMessage(message: SessionMsg): SessionMsg | ImageArtifactMessage {
-  if (message.kind !== "image" && message.kind !== "video" && message.kind !== "html") return message;
+  if (
+    message.kind !== "image" &&
+    message.kind !== "video" &&
+    message.kind !== "html" &&
+    message.kind !== "file"
+  )
+    return message;
   const artifactId = message.id?.startsWith("artifact-") ? message.id.slice("artifact-".length) : null;
   if (!artifactId) return message;
   const artifact = getImageArtifact(artifactId);

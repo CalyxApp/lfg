@@ -5,9 +5,11 @@ import { join } from "node:path";
 import { PATHS } from "./config.ts";
 import {
   collapseArtifactRetryMessages,
+  createFileArtifact,
   createImageArtifact,
   deleteArtifact,
   getImageArtifact,
+  imageArtifactToMessage,
   publishHtmlArtifact,
   updateHtmlArtifactRefresh,
   type ArtifactRefreshConfig,
@@ -125,5 +127,58 @@ describe("stable HTML artifact ownership", () => {
       html: "<!doctype html><html><body>collision</body></html>",
     })).toThrow("different media kind");
     expect(getImageArtifact(image.id)?.media).toBe("image");
+  });
+});
+
+describe("file artifacts", () => {
+  const originalData = PATHS.data;
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "lfg-artifact-file-"));
+    PATHS.data = join(root, "data");
+  });
+
+  afterEach(() => {
+    PATHS.data = originalData;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("accepts any extension and copies the bytes with a known mime", () => {
+    const source = join(root, "report.pdf");
+    writeFileSync(source, "%PDF-1.4 fake");
+    const artifact = createFileArtifact({ sessionId: SESSION_A, path: source, caption: "Q3" });
+
+    expect(artifact.media).toBe("file");
+    expect(artifact.mimeType).toBe("application/pdf");
+    expect(artifact.name).toBe("report.pdf");
+    expect(readFileSync(artifact.filePath, "utf8")).toBe("%PDF-1.4 fake");
+    expect(getImageArtifact(artifact.id)?.media).toBe("file");
+  });
+
+  test("falls back to octet-stream for an unknown extension (never rejected)", () => {
+    const source = join(root, "data.bin");
+    writeFileSync(source, "raw-bytes");
+    const artifact = createFileArtifact({ sessionId: SESSION_A, path: source });
+    expect(artifact.mimeType).toBe("application/octet-stream");
+  });
+
+  test("the transcript message carries a file kind and download url", () => {
+    const source = join(root, "server.log");
+    writeFileSync(source, "line one");
+    const artifact = createFileArtifact({ sessionId: SESSION_A, path: source });
+    const message = imageArtifactToMessage(artifact);
+    expect(message.kind).toBe("file");
+    expect(message.url).toBe(`/api/artifacts/${artifact.id}`);
+    expect(message.name).toBe("server.log");
+  });
+
+  test("rejects a relative path and an empty file", () => {
+    expect(() => createFileArtifact({ sessionId: SESSION_A, path: "report.pdf" })).toThrow(
+      "absolute",
+    );
+    const empty = join(root, "empty.txt");
+    writeFileSync(empty, "");
+    expect(() => createFileArtifact({ sessionId: SESSION_A, path: empty })).toThrow("empty");
   });
 });

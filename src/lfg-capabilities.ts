@@ -3,7 +3,7 @@ import type { CodingAgentKind } from "./coding-agents.ts";
 // Bump whenever an agent-facing LFG capability or its operating guidance
 // changes. Managed sessions persist the value they launched with, which lets
 // the UI identify long-lived sessions whose MCP/tool catalog predates a ship.
-export const LFG_CAPABILITY_VERSION = "2026-07-23.1";
+export const LFG_CAPABILITY_VERSION = "2026-10-08.1";
 
 export const LFG_CAPABILITIES = [
   {
@@ -25,6 +25,11 @@ export const LFG_CAPABILITIES = [
     tool: "lfg_display_image / lfg_display_video",
     useWhen: "Visual or interaction work has screenshot or recording evidence.",
     guidance: "Display the best evidence in the session and reuse it in lfg_ship when the work is worth showcasing.",
+  },
+  {
+    tool: "lfg_display_file",
+    useWhen: "You produced a file the user should open or review — a PDF, CSV, log, archive, or any other document.",
+    guidance: "The transcript shows a download card. Use display_image/display_video instead for screenshots and recordings, which render inline.",
   },
   {
     tool: "lfg_publish_artifact",
@@ -55,6 +60,7 @@ export function lfgRuntimeContract(): string {
     `=== LFG RUNTIME CONTRACT (capability version ${LFG_CAPABILITY_VERSION}) ===`,
     "- You are running as an LFG-managed coding agent. LFG features are part of the product workflow, not optional implementation trivia.",
     "- After visual or interaction work, capture verification media and show the best evidence with `lfg_display_image` or `lfg_display_video`.",
+    "- When you produce a file the user should open or review (PDF, CSV, log, archive, any document), hand it over with `lfg_display_file`; it appears as a download card in the transcript.",
     "- Use `lfg_send_to_origin` when the user wants a result intentionally delivered back to the channel that launched this session. The origin adapter owns transport identity and credentials.",
     "- When a report, data view, or live dashboard is materially clearer as interactive HTML than prose, publish it with `lfg_publish_artifact`; use a stable id for updates.",
     "- When material user-visible work is complete and verified, call `lfg_ship` with a concise showcase and the strongest media. Do not ship diagnosis, planning, partial, invisible, or trivial work.",

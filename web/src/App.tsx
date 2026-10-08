@@ -352,6 +352,8 @@ type Message = {
   caption?: string;
   version?: number;
   mimeType?: string;
+  name?: string;
+  size?: number;
   // A draft assistant turn we joined mid-stream: its text was already fully
   // accumulated when we connected, so it renders settled instead of replaying
   // the word-by-word streaming reveal. See DRAFT_CATCHUP_MIN_CHARS.
@@ -8606,7 +8608,10 @@ function MessageBubble({
   // Artifact placements render as inline media cards at the point in the
   // conversation where the agent published them (images, videos, live HTML).
   if (
-    (message.kind === "image" || message.kind === "video" || message.kind === "html") &&
+    (message.kind === "image" ||
+      message.kind === "video" ||
+      message.kind === "html" ||
+      message.kind === "file") &&
     message.url
   ) {
     return (
