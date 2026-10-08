@@ -1264,7 +1264,7 @@ export async function indexedMessagePage(
           END
         WHERE m.path = ? AND m.order_seq < ?
           AND (
-            m.kind NOT IN ('image', 'video', 'html')
+            m.kind NOT IN ('image', 'video', 'html', 'file')
             OR m.message_id NOT LIKE 'artifact-%'
             OR a.id IS NOT NULL
           )
@@ -1359,7 +1359,7 @@ export function indexedMessagesAfterRowid(
             END
           WHERE m.path = ? AND m.rowid > ?
             AND (
-              m.kind NOT IN ('image', 'video', 'html')
+              m.kind NOT IN ('image', 'video', 'html', 'file')
               OR m.message_id NOT LIKE 'artifact-%'
               OR a.id IS NOT NULL
             )

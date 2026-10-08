@@ -15,9 +15,17 @@ import {
   RefreshCw,
   X,
 } from "lucide-react";
+import { Streamdown } from "streamdown";
 import { getJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
+
+// A leading YAML frontmatter block is metadata, not prose — strip it before
+// rendering so the reader opens on the document, like the vault file overlay does.
+function stripFrontmatter(src: string): string {
+  const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(src);
+  return m ? src.slice(m[0].length) : src;
+}
 
 export type ArtifactCard = {
   id: string;
@@ -72,10 +80,11 @@ function KindIcon({ kind, className }: { kind: ArtifactCard["kind"]; className?:
 
 // Which file types the in-app viewer can preview in place. html/svg and anything
 // unknown stay download-only (served as an attachment — the security boundary).
-function filePreviewKind(mime?: string): "image" | "pdf" | "text" | "download" {
+function filePreviewKind(mime?: string): "image" | "pdf" | "markdown" | "text" | "download" {
   const m = mime ?? "";
   if (m.startsWith("image/") && m !== "image/svg+xml") return "image";
   if (m === "application/pdf") return "pdf";
+  if (m === "text/markdown") return "markdown";
   if (
     (m.startsWith("text/") && m !== "text/html") ||
     m === "application/json" ||
@@ -135,7 +144,7 @@ export function FileViewerOverlay({
   }, [onClose]);
 
   useEffect(() => {
-    if (kind !== "text") return;
+    if (kind !== "text" && kind !== "markdown") return;
     let cancelled = false;
     setText(null);
     setTextError(false);
@@ -187,6 +196,22 @@ export function FileViewerOverlay({
           className="w-full flex-1 border-0 bg-white"
           style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
         />
+      ) : kind === "markdown" ? (
+        textError ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
+            Couldn't load this file.
+          </div>
+        ) : text === null ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
+            Loading…
+          </div>
+        ) : (
+          <div className="flex-1 overflow-auto px-4 py-4">
+            <div className="markdown mx-auto max-w-2xl text-[15px] leading-relaxed">
+              <Streamdown>{stripFrontmatter(text)}</Streamdown>
+            </div>
+          </div>
+        )
       ) : kind === "text" ? (
         textError ? (
           <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
