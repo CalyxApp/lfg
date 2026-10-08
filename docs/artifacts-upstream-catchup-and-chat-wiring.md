@@ -1,7 +1,20 @@
 # Artifacts: upstream catch-up + chat-surface wiring
 
+> **STATUS — SHIPPED & DEPLOYED (2026-10-08).** Phases 1 and 3 are merged to `main`
+> and live on production (`lfg-fork.service`). Phase 2 (media dimensions) and Phase 4
+> (floating voice orb) are deferred — see the notes below. What shipped:
+> - **`lfg_display_file`** — a coding agent hands the user any file; it appears as a
+>   card that opens a **full-screen viewer over the chat** (closes back to the chat).
+>   The viewer previews images, PDFs, and text in place; **markdown renders as markdown**
+>   (via Streamdown — embedded HTML is escaped, not executed); other types / html / svg
+>   download. `?inline=1` serves safe types inline; html/svg always download.
+> - **`publish_html`** in Converse — the OpenAI typed chat and gpt-realtime voice can
+>   publish a self-contained HTML artifact that renders as an inline card → full-screen
+>   reader. One tool, both surfaces (shared dispatcher + renderer).
+> - Capability version bumped to `2026-10-08.1`; new agent sessions get `lfg_display_file`.
+
 **Date:** 2026-10-08
-**Branch:** `session-artifacts-port`
+**Branch:** `session-artifacts-port` (merged to `main`)
 **Goal (Sam):** Talk to an agent, have it produce a file / HTML / image / video, and
 open & review that output on the phone. Primary surface = **coding-agent sessions**
 (the review surface). Secondary = **Converse** (typed OpenAI chat + gpt-realtime voice).
@@ -65,9 +78,10 @@ so an agent-written `.html`/`.svg` can't execute as the user). This is the direc
    `"Files"` filter; `KindIcon` file case; a file **card** (icon · name · size) that,
    when tapped, opens `FileViewerOverlay` — a full-screen takeover OVER the chat that
    closes back to it (same pattern as `HtmlViewerOverlay`). The viewer previews images,
-   PDFs and text in place and always offers Download. The gallery tile opens the same
-   viewer. (Decision, Sam 2026-10-08: a file should open and close like the HTML reader,
-   not just download.)
+   PDFs and text in place, **renders markdown as markdown** (Streamdown — safe, escapes
+   embedded HTML), and always offers Download. The gallery tile opens the same viewer.
+   (Decision, Sam 2026-10-08: a file should open and close like the HTML reader, not just
+   download; and a markdown file should render as markdown.)
 9. `web/src/App.tsx` — add `"file"` to the inline-render guard (`:8609`); widen the
    `Message` type with `name?`/`size?`.
 10. Serving: `GET /api/artifacts/:id?inline=1` serves SAFE file types (image/PDF/text,
