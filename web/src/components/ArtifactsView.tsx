@@ -70,21 +70,28 @@ function KindIcon({ kind, className }: { kind: ArtifactCard["kind"]; className?:
   return <Icon className={className} />;
 }
 
-// Downloadable file artifact: a filename + size row, no inline render. Reused by
-// the gallery tile (full) and the transcript inline card (compact).
+// Which file types the in-app viewer can preview in place. html/svg and anything
+// unknown stay download-only (served as an attachment — the security boundary).
+function filePreviewKind(mime?: string): "image" | "pdf" | "text" | "download" {
+  const m = mime ?? "";
+  if (m.startsWith("image/") && m !== "image/svg+xml") return "image";
+  if (m === "application/pdf") return "pdf";
+  if (
+    (m.startsWith("text/") && m !== "text/html") ||
+    m === "application/json" ||
+    m === "application/xml" ||
+    m === "application/yaml"
+  )
+    return "text";
+  return "download";
+}
+
+// File artifact as a compact row (icon · name · size). Presentational only — the
+// parent (inline-card button or gallery tile) owns the tap that opens the viewer,
+// so this is never itself a link or button (no nested-interactive HTML).
 function FileCard({ artifact, full }: { artifact: ArtifactCard; full?: boolean }) {
   return (
-    <a
-      href={artifact.url}
-      download={artifact.name}
-      target="_blank"
-      rel="noreferrer"
-      className={cn(
-        "flex items-center gap-3 bg-card px-3 text-left",
-        full ? "py-4" : "aspect-video",
-      )}
-      onClick={(e) => e.stopPropagation()}
-    >
+    <div className={cn("flex items-center gap-3 px-3", full ? "py-4" : "aspect-video")}>
       <FileIcon className="h-8 w-8 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-medium">
@@ -94,8 +101,121 @@ function FileCard({ artifact, full }: { artifact: ArtifactCard; full?: boolean }
           {[formatBytes(artifact.size), artifact.caption].filter(Boolean).join(" · ")}
         </div>
       </div>
-      <Download className="h-4 w-4 shrink-0 text-muted-foreground" />
-    </a>
+      <Maximize2 className="h-4 w-4 shrink-0 text-muted-foreground" />
+    </div>
+  );
+}
+
+// Full-screen file viewer — opens OVER the chat, closes back to it (same takeover
+// pattern as HtmlViewerOverlay). Previews images/PDF/text in place; a Download
+// button always saves the real file. Esc closes; body scroll locked while open.
+export function FileViewerOverlay({
+  artifact,
+  onClose,
+}: {
+  artifact: ArtifactCard;
+  onClose: () => void;
+}) {
+  const kind = filePreviewKind(artifact.mimeType);
+  const [text, setText] = useState<string | null>(null);
+  const [textError, setTextError] = useState(false);
+  const title = artifact.name || artifact.title || artifact.id;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [onClose]);
+
+  useEffect(() => {
+    if (kind !== "text") return;
+    let cancelled = false;
+    setText(null);
+    setTextError(false);
+    fetch(artifact.url)
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
+      .then((t) => {
+        if (!cancelled) setText(t.slice(0, 500_000));
+      })
+      .catch(() => {
+        if (!cancelled) setTextError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [artifact.url, kind]);
+
+  return (
+    <div className="fixed inset-0 z-[100] flex flex-col bg-background">
+      <div
+        className="flex shrink-0 items-center gap-2 border-b border-border bg-background/95 px-3 pb-2 backdrop-blur"
+        style={{ paddingTop: "max(env(safe-area-inset-top), 0.5rem)" }}
+      >
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close"
+          className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground active:scale-95"
+        >
+          <X className="size-[18px]" />
+        </button>
+        <div className="min-w-0 flex-1 truncate text-center text-sm font-medium">{title}</div>
+        <a
+          href={artifact.url}
+          download={artifact.name}
+          aria-label="Download"
+          className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground active:scale-95"
+        >
+          <Download className="size-[18px]" />
+        </a>
+      </div>
+      {kind === "image" ? (
+        <div className="flex flex-1 items-center justify-center overflow-auto p-4">
+          <img src={artifact.url} alt={title} className="max-h-full max-w-full object-contain" />
+        </div>
+      ) : kind === "pdf" ? (
+        <iframe
+          src={`${artifact.url}?inline=1`}
+          title={title}
+          className="w-full flex-1 border-0 bg-white"
+          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+        />
+      ) : kind === "text" ? (
+        textError ? (
+          <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
+            Couldn't load this file.
+          </div>
+        ) : (
+          <pre className="flex-1 overflow-auto whitespace-pre-wrap break-words px-4 py-3 font-mono text-xs leading-relaxed">
+            {text ?? "Loading…"}
+          </pre>
+        )
+      ) : (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+          <FileIcon className="h-10 w-10 text-muted-foreground" />
+          <div className="text-sm font-medium">{title}</div>
+          <div className="text-xs text-muted-foreground">
+            {[formatBytes(artifact.size), "Preview isn't available for this file type."]
+              .filter(Boolean)
+              .join(" · ")}
+          </div>
+          <a
+            href={artifact.url}
+            download={artifact.name}
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            <Download className="h-4 w-4" /> Download
+          </a>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -169,6 +289,7 @@ export function ArtifactInlineCard({
     version?: number;
     name?: string;
     size?: number;
+    mimeType?: string;
   };
 }) {
   const [reader, setReader] = useState(false);
@@ -188,15 +309,24 @@ export function ArtifactInlineCard({
     sessionId: "",
     version: artifact.version,
     size: artifact.size,
+    mimeType: artifact.mimeType,
   };
   const label = artifact.title || artifact.caption || artifact.text;
 
-  // Downloadable file: a single tappable download card, no inline media.
+  // File: tap the card to open the full-screen viewer over the chat; close
+  // returns here. Same doc-open gesture as an HTML artifact.
   if (kind === "file") {
     return (
-      <div className="my-1.5 w-full max-w-md overflow-hidden rounded-xl border bg-card shadow-sm">
-        <FileCard artifact={card} full />
-      </div>
+      <>
+        <button
+          type="button"
+          onClick={() => setReader(true)}
+          className="my-1.5 flex w-full max-w-md items-center overflow-hidden rounded-xl border bg-card text-left shadow-sm transition-shadow active:scale-[0.99] hover:shadow-md"
+        >
+          <FileCard artifact={card} full />
+        </button>
+        {reader ? <FileViewerOverlay artifact={card} onClose={() => setReader(false)} /> : null}
+      </>
     );
   }
 
@@ -278,6 +408,7 @@ export function ArtifactsView({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<ArtifactCard | null>(null);
+  const [fileView, setFileView] = useState<ArtifactCard | null>(null);
 
   const load = useCallback(async (k: string | null, offset = 0) => {
     setLoading(true);
@@ -349,7 +480,7 @@ export function ArtifactsView({
         {artifacts.map((a) => (
           <button
             key={a.id}
-            onClick={() => setOpen(a)}
+            onClick={() => (a.kind === "file" ? setFileView(a) : setOpen(a))}
             className="group overflow-hidden rounded-xl border bg-card text-left shadow-sm transition-shadow hover:shadow-md"
           >
             <div className="relative">
@@ -382,6 +513,10 @@ export function ArtifactsView({
             {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : `Load more (${total - artifacts.length})`}
           </button>
         </div>
+      ) : null}
+
+      {fileView ? (
+        <FileViewerOverlay artifact={fileView} onClose={() => setFileView(null)} />
       ) : null}
 
       {open ? (

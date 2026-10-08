@@ -62,10 +62,18 @@ so an agent-written `.html`/`.svg` can't execute as the user). This is the direc
 
 **Web**
 8. `web/src/components/ArtifactsView.tsx` — `ArtifactCard.kind` gains `"file"`; a
-   `"Files"` filter; `KindIcon` file case; a **download card** branch in `ArtifactMedia`
-   (gallery) and in `ArtifactInlineCard` (transcript) — icon · name · size · Download.
+   `"Files"` filter; `KindIcon` file case; a file **card** (icon · name · size) that,
+   when tapped, opens `FileViewerOverlay` — a full-screen takeover OVER the chat that
+   closes back to it (same pattern as `HtmlViewerOverlay`). The viewer previews images,
+   PDFs and text in place and always offers Download. The gallery tile opens the same
+   viewer. (Decision, Sam 2026-10-08: a file should open and close like the HTML reader,
+   not just download.)
 9. `web/src/App.tsx` — add `"file"` to the inline-render guard (`:8609`); widen the
    `Message` type with `name?`/`size?`.
+10. Serving: `GET /api/artifacts/:id?inline=1` serves SAFE file types (image/PDF/text,
+    never html/svg) with `Content-Disposition: inline` so the viewer can embed them;
+    default and all unsafe types stay `attachment`. The viewer uses `?inline=1` for the
+    PDF iframe; images/text render from the plain URL.
 
 **Gate:** `bun test src/artifact*.test.ts src/transcript-artifact-join.test.ts`
 (extended to cover `file`) + port `src/artifact-headers.test.ts`; `cd web && bun run build`.

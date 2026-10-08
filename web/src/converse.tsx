@@ -71,6 +71,7 @@ type ArtifactMsg = {
   version?: number;
   name?: string;
   size?: number;
+  mimeType?: string;
 };
 
 type LogEntry = {

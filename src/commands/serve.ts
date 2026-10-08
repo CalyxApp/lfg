@@ -4137,11 +4137,24 @@ export async function cmdServe() {
             // Video seeking (and Safari playback) needs byte-range support.
             "Accept-Ranges": "bytes",
           };
-          // `file` artifacts are downloads, not inline renders: force an
-          // attachment so an agent-written .html/.svg saves instead of
-          // executing as the user. The name is agent-chosen; see artifact-headers.
+          // `file` artifacts default to a download so an agent-written .html/.svg
+          // saves instead of executing as the user (the name is agent-chosen; see
+          // artifact-headers). ?inline=1 lets the in-app viewer preview the SAFE,
+          // non-executable types (PDF, images, text) in place — html/svg/binaries
+          // always download. nosniff (already set) blocks mime confusion.
           if ((artifact.media ?? "image") === "file") {
-            baseHeaders["Content-Disposition"] = contentDisposition("attachment", artifact.name);
+            const safeInline =
+              (contentType.startsWith("image/") && contentType !== "image/svg+xml") ||
+              contentType === "application/pdf" ||
+              (contentType.startsWith("text/") && contentType !== "text/html") ||
+              contentType === "application/json" ||
+              contentType === "application/xml" ||
+              contentType === "application/yaml";
+            const inline = url.searchParams.get("inline") === "1" && safeInline;
+            baseHeaders["Content-Disposition"] = contentDisposition(
+              inline ? "inline" : "attachment",
+              artifact.name,
+            );
           }
           // Honor a single-range request so the <video> element can seek without
           // re-downloading the whole file. Bun.file().slice() streams the slice.

@@ -19,6 +19,7 @@ export type ConversationArtifact = {
   version?: number;
   name?: string;
   size?: number;
+  mimeType?: string;
 };
 
 export type ConversationTurn = {
