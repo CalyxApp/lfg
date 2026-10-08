@@ -16,6 +16,7 @@
 import { scanVault, vaultItems, updateVaultDoc, isVault, type VaultDoc } from "./vault.ts";
 import { listDir, readRepoFile, writeRepoFile, withRepoLock, gitCommitPaths, gitGrep } from "./files.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
+import { publishHtmlArtifact, imageArtifactToMessage } from "./artifacts.ts";
 
 // ---- Response + value helpers ----
 function json(obj: unknown, init?: ResponseInit) {
@@ -766,6 +767,30 @@ export const VAULT_TOOL_SCHEMAS = [
       required: ["name"],
     },
   },
+  {
+    type: "function",
+    name: "publish_html",
+    description:
+      "Publish a self-contained HTML document the user can open full-screen and review on their phone — a formatted report, a written-up answer, a simple dashboard. Use this instead of a long text reply when a rich visual layout helps (headings, tables, sections, charts drawn with inline SVG/CSS). It appears as a tappable card in the conversation. The HTML must be ONE self-contained document: inline CSS/JS/data only, no external links, resources, or network. Re-publish with the same id to update the same card in place.",
+    parameters: {
+      type: "object",
+      properties: {
+        html: {
+          type: "string",
+          description:
+            "The complete self-contained HTML document (inline CSS/JS/data only; no external links or resources).",
+        },
+        title: { type: "string", description: "Short title shown on the card." },
+        id: {
+          type: "string",
+          description:
+            "Optional stable id (3-64 chars: lowercase letters, digits, dashes). Re-publish with the same id to update the card in place.",
+        },
+        caption: { type: "string", description: "Optional short caption shown under the card." },
+      },
+      required: ["html"],
+    },
+  },
 ];
 
 /**
@@ -789,11 +814,32 @@ export const WAIT_FOR_USER_TOOL = {
  * Dispatch a relayed tool call. Pure over (repoCwd, args); serve.ts resolves the repo
  * inline. Returns stringifiable JSON the browser forwards to the model verbatim.
  */
-export async function runVaultTool(name: string, repoCwd: string, args: Record<string, unknown>): Promise<Response> {
+export async function runVaultTool(
+  name: string,
+  repoCwd: string,
+  args: Record<string, unknown>,
+  // Converse mints a per-surface UUID so publish_html can own an artifact. Tools
+  // that don't publish ignore it; absent (e.g. a context with no session) the
+  // publish tool declines rather than throwing.
+  sessionId?: string,
+): Promise<Response> {
   try {
     switch (name) {
       case "wait_for_user":
         return json({ ok: true, waiting: true });
+      case "publish_html": {
+        if (!sessionId) return err(400, "publish_html is not available in this context");
+        const html = String(args.html ?? "");
+        if (!html.trim()) return err(400, "html content required");
+        const artifact = publishHtmlArtifact({
+          sessionId,
+          html,
+          id: str(args.id),
+          title: str(args.title),
+          caption: str(args.caption),
+        });
+        return json({ ok: true, artifact: imageArtifactToMessage(artifact) });
+      }
       case "describe_vault":
         return describeVault(repoCwd, str(args.type));
       case "search":

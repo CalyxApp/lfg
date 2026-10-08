@@ -144,8 +144,9 @@ export async function runRtTool(
   name: string,
   repoCwd: string,
   args: Record<string, unknown>,
+  sessionId?: string,
 ): Promise<Response> {
-  return runVaultTool(name, repoCwd, args);
+  return runVaultTool(name, repoCwd, args, sessionId);
 }
 
 /** Filesystem-safe log filename from a client session id. */

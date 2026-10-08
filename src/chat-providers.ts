@@ -35,6 +35,7 @@ type RunTurnOpts = {
   model: string;
   messages: ChatTurnMessage[];
   repoCwd: string; // workspace the vault tools operate on (same scoping as Converse)
+  sessionId?: string; // per-Converse UUID so publish_html can own an artifact
 };
 
 type ChatProvider = {
@@ -86,7 +87,7 @@ const openai: ChatProvider = {
   models: ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.5"],
   available: () => !!process.env.OPENAI_API_KEY,
   implemented: true,
-  async runTurn({ model, messages, repoCwd }) {
+  async runTurn({ model, messages, repoCwd, sessionId }) {
     const key = process.env.OPENAI_API_KEY;
     if (!key) return err(503, "OPENAI_API_KEY not set on the server");
 
@@ -111,6 +112,10 @@ const openai: ChatProvider = {
       detail?: string;
       result?: string;
     }[] = [];
+    // Artifact messages a tool published this turn (publish_html), surfaced to the
+    // client so it can render inline cards — Converse has no SQLite transcript, so
+    // the tool result carries the artifact rather than a transcript-index append.
+    const artifacts: unknown[] = [];
 
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
       let res: Response;
@@ -155,7 +160,7 @@ const openai: ChatProvider = {
 
       const calls = msg.tool_calls ?? [];
       if (calls.length === 0) {
-        return json({ text: (msg.content ?? "").trim(), toolCalls, model, provider: openai.id });
+        return json({ text: (msg.content ?? "").trim(), toolCalls, artifacts, model, provider: openai.id });
       }
 
       // Execute the requested vault tools and feed the outputs back.
@@ -167,7 +172,7 @@ const openai: ChatProvider = {
         } catch {
           /* leave empty */
         }
-        const toolRes = await runVaultTool(call.function.name, repoCwd, args);
+        const toolRes = await runVaultTool(call.function.name, repoCwd, args, sessionId);
         const output = await toolRes.text();
         let ok: boolean | undefined;
         let detail: string | undefined;
@@ -180,6 +185,7 @@ const openai: ChatProvider = {
               : typeof parsed?.project_id === "string"
                 ? (parsed.project_id as string)
                 : undefined;
+          if (parsed?.artifact) artifacts.push(parsed.artifact);
         } catch {
           /* non-JSON output — leave outcome unknown */
         }
@@ -264,7 +270,11 @@ export function listChatProviders() {
 // ------------------------------------------------------------ dispatch
 
 /** Run one typed turn of the unified chat against the configured provider. */
-export async function runChatTurn(repoCwd: string, messages: ChatTurnMessage[]): Promise<Response> {
+export async function runChatTurn(
+  repoCwd: string,
+  messages: ChatTurnMessage[],
+  sessionId?: string,
+): Promise<Response> {
   if (!Array.isArray(messages) || messages.length === 0) return err(400, "expected { messages: [...] }");
   const clean: ChatTurnMessage[] = [];
   for (const m of messages) {
@@ -290,5 +300,5 @@ export async function runChatTurn(repoCwd: string, messages: ChatTurnMessage[]):
   const p = PROVIDERS[s.provider];
   if (!p?.implemented || !p.runTurn) return err(503, `chat provider ${s.provider} not implemented yet`);
   if (!p.available()) return err(503, `${p.label} API key not set on the server`);
-  return p.runTurn({ model: s.model, messages: clean, repoCwd });
+  return p.runTurn({ model: s.model, messages: clean, repoCwd, sessionId });
 }

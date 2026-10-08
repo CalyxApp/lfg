@@ -7,12 +7,26 @@
 import { marked } from "marked";
 import { File as FileIcon } from "lucide-react";
 import { ToolCard, type ToolDetail } from "./tool-card";
+import { ArtifactInlineCard } from "./ArtifactsView";
+
+export type ConversationArtifact = {
+  kind?: string;
+  url?: string;
+  artifactId?: string;
+  title?: string;
+  caption?: string;
+  text?: string;
+  version?: number;
+  name?: string;
+  size?: number;
+};
 
 export type ConversationTurn = {
   role: "you" | "assistant" | "tool" | "system";
   text: string;
   ok?: boolean;
   tool?: ToolDetail;
+  artifact?: ConversationArtifact;
   images?: string[];
   files?: string[];
 };
@@ -21,7 +35,12 @@ export function ConversationTurns({ turns }: { turns: ConversationTurn[] }) {
   return (
     <>
       {turns.map((e, i) =>
-        e.role === "you" ? (
+        e.artifact ? (
+          // A published artifact (publish_html) — inline card, tap to open full-screen.
+          <div key={i} className="flex">
+            <ArtifactInlineCard artifact={e.artifact} />
+          </div>
+        ) : e.role === "you" ? (
           e.text === "…" ? (
             // Distinct "we're hearing you" state (not a real turn yet) vs a
             // finished user bubble — the transcript lands a beat later.

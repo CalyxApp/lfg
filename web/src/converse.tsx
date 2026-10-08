@@ -58,12 +58,28 @@ type Phase = "live" | "review";
 // `id` keys realtime-voice turns so their text can be upserted in place as
 // transcript deltas stream in (see handleEvent) — that's what keeps the thread
 // in sync with the audio you actually hear. `ok` marks a tool chip's outcome.
+// An artifact a tool published this turn (publish_html) — rendered as an inline
+// card the user can open full-screen. Shape mirrors the server's
+// imageArtifactToMessage; fed straight to ArtifactInlineCard.
+type ArtifactMsg = {
+  kind?: string;
+  url?: string;
+  artifactId?: string;
+  title?: string;
+  caption?: string;
+  text?: string;
+  version?: number;
+  name?: string;
+  size?: number;
+};
+
 type LogEntry = {
   role: "you" | "assistant" | "tool" | "system";
   text: string;
   id?: string;
   ok?: boolean;
   tool?: ToolDetail; // set on tool rows → expandable input/result preview
+  artifact?: ArtifactMsg; // set on artifact rows → inline card (publish_html)
   images?: string[]; // data: URLs shown as thumbnails on a "you" turn
   files?: string[]; // attached non-image file names shown as chips on a "you" turn
   // Per-file plumbing for re-sending across turns/modes: file_id (chat, native) +
@@ -232,6 +248,14 @@ export function Converse({ onClose }: { onClose: () => void }) {
       return next;
     });
 
+  // An artifact a tool just published (publish_html) → inline card in the thread.
+  const appendArtifact = (artifact: ArtifactMsg) =>
+    setLog((l) => {
+      const next = [...l.slice(-60), { role: "assistant" as const, text: "", artifact }];
+      logRef.current = next;
+      return next;
+    });
+
   // Insert-or-update a voice turn by realtime item id. Lets speech placeholders
   // and streaming transcript deltas update one entry in place, in the position
   // it was first heard — instead of whole turns popping in out of order when
@@ -324,6 +348,15 @@ export function Converse({ onClose }: { onClose: () => void }) {
         .toString(36)
         .slice(2, 8)}`;
     }
+  }
+
+  // A real UUID the artifact store requires to own a publish_html artifact. Kept
+  // separate from the debug-log id above (which isn't a UUID). One per surface so
+  // re-publishing the same artifact id updates its card in place across turns.
+  const artifactSidRef = useRef<string | null>(null);
+  function ensureArtifactSid(): string {
+    if (!artifactSidRef.current) artifactSidRef.current = crypto.randomUUID();
+    return artifactSidRef.current;
   }
 
   function flushLog() {
@@ -470,16 +503,18 @@ export function Converse({ onClose }: { onClose: () => void }) {
       const res = await fetch("/api/voice/rt/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages }),
+        body: JSON.stringify({ messages, sessionId: ensureArtifactSid() }),
       });
       if (!res.ok) throw new Error(`chat ${res.status}: ${(await res.text()).slice(0, 300)}`);
       const data = (await res.json()) as {
         text: string;
         toolCalls?: { name: string; args: Record<string, unknown>; ok?: boolean; result?: string }[];
+        artifacts?: ArtifactMsg[];
       };
       for (const tc of data.toolCalls ?? []) appendTool(tc.name, tc.args, tc.ok, tc.result);
       if (data.text) append("assistant", data.text);
-      logEvent("chat_assistant", { text: data.text, toolCalls: data.toolCalls ?? [] });
+      for (const a of data.artifacts ?? []) appendArtifact(a);
+      logEvent("chat_assistant", { text: data.text, toolCalls: data.toolCalls ?? [], artifacts: data.artifacts ?? [] });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
@@ -571,7 +606,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
       const res = await fetch(`/api/voice/rt/tools/${name}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ args }),
+        body: JSON.stringify({ args, sessionId: ensureArtifactSid() }),
       });
       output = await res.text();
     } catch (e) {
@@ -579,16 +614,20 @@ export function Converse({ onClose }: { onClose: () => void }) {
     } finally {
       stopWorking();
     }
-    // Friendly outcome chip (not raw args): parse the tool result for ok/error.
+    // Friendly outcome chip (not raw args): parse the tool result for ok/error,
+    // and surface any published artifact as an inline card in the thread.
     let ok: boolean | undefined;
+    let artifact: ArtifactMsg | undefined;
     try {
       const parsed = JSON.parse(output) as Record<string, unknown>;
       ok = parsed?.error ? false : ((parsed?.ok as boolean | undefined) ?? true);
+      if (parsed?.artifact) artifact = parsed.artifact as ArtifactMsg;
     } catch {
       /* unknown outcome */
     }
     logEvent("tool", { name, args, ok, output: output.slice(0, 2000) });
     appendTool(name, args, ok, output);
+    if (artifact) appendArtifact(artifact);
     const dc = dcRef.current;
     if (!dc || dc.readyState !== "open") return;
     dc.send(

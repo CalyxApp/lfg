@@ -1787,6 +1787,7 @@ export async function cmdServe() {
           const body = (await req.json().catch(() => null)) as {
             repo?: string;
             args?: Record<string, unknown>;
+            sessionId?: string;
           } | null;
           const repos = await listRepos();
           // Converse is scoped to a SINGLE workspace (default PlatosRaveCave) — other
@@ -1797,7 +1798,7 @@ export async function cmdServe() {
             ? repos.find((r) => r.name === body.repo)
             : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
           if (!repo) return err(404, "no repo available for tool call");
-          return runRtTool(m[1], repo.cwd, body?.args ?? {});
+          return runRtTool(m[1], repo.cwd, body?.args ?? {}, body?.sessionId);
         }
       }
 
@@ -1836,6 +1837,7 @@ export async function cmdServe() {
         const body = (await req.json().catch(() => null)) as {
           messages?: ChatTurnMessage[];
           repo?: string;
+          sessionId?: string;
         } | null;
         if (!body?.messages) return err(400, "expected { messages }");
         const repos = await listRepos();
@@ -1844,7 +1846,7 @@ export async function cmdServe() {
           ? repos.find((r) => r.name === body.repo)
           : repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
         if (!repo) return err(404, "no repo available for chat turn");
-        return runChatTurn(repo.cwd, body.messages);
+        return runChatTurn(repo.cwd, body.messages, body.sessionId);
       }
 
       // ---- chat model config: which provider/model powers typed turns of the
