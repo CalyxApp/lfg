@@ -420,7 +420,7 @@ import {
   handleRtInstructions,
   handleFileText,
 } from "../voice-rt.ts";
-import { handleLiveSpikeSdp, handleLiveSpikePage } from "../live-spike.ts";
+import { handleLiveSpikeSdp, handleLiveSpikePage, handleLiveSpikeLog } from "../live-spike.ts";
 import {
   saveConversationRecord,
   listConversationSummaries,
@@ -1729,6 +1729,7 @@ export async function cmdServe() {
       // live-spike.ts. Safe to delete.
       if (path === "/live-spike" && req.method === "GET") return handleLiveSpikePage();
       if (path === "/api/live-spike/sdp" && req.method === "POST") return handleLiveSpikeSdp(req);
+      if (path === "/api/live-spike/log" && req.method === "POST") return handleLiveSpikeLog(req);
 
       // ---- Converse (OpenAI gpt-realtime): a SEPARATE realtime voice interface,
       // additive to the ElevenLabs cascade above (shares only the tool backend).

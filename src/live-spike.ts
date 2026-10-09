@@ -19,6 +19,23 @@
 // JSON for delegation/transcript/error events, so the first real phone run reveals the
 // true shapes — if a name is off, the log shows it and it's a one-line fix.
 
+import { appendFileSync } from "node:fs";
+
+const LOG_PATH = "/tmp/live-spike.log";
+
+/** POST /api/live-spike/log — the browser streams its event log here so we can see
+ *  what GPT-Live actually emits over the data channel (phone-side only otherwise). */
+export async function handleLiveSpikeLog(req: Request): Promise<Response> {
+  try {
+    const body = (await req.json()) as { line?: string };
+    const line = typeof body?.line === "string" ? body.line : JSON.stringify(body);
+    appendFileSync(LOG_PATH, `${new Date().toISOString()} ${line.slice(0, 2000)}\n`);
+  } catch {
+    /* best effort */
+  }
+  return new Response(null, { status: 204 });
+}
+
 function json(obj: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(obj), {
     headers: { "Content-Type": "application/json" },
@@ -133,7 +150,8 @@ const PAGE = [
   '<pre id="log"></pre>',
   "<script>",
   "var logEl=document.getElementById('log');",
-  "function log(m){try{console.log(m);}catch(e){} logEl.textContent+=m+'\\n'; logEl.scrollTop=logEl.scrollHeight;}",
+  "function slog(m){try{fetch('/api/live-spike/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line:m})}).catch(function(){});}catch(e){}}",
+  "function log(m){try{console.log(m);}catch(e){} logEl.textContent+=m+'\\n'; logEl.scrollTop=logEl.scrollHeight; slog(m);}",
   "var mode='tools';",
   "function setMode(m){mode=m; document.getElementById('m-tools').className=(m==='tools'?'on':''); document.getElementById('m-assistant').className=(m==='assistant'?'on':'');}",
   "document.getElementById('m-tools').addEventListener('click',function(){setMode('tools');});",
@@ -184,7 +202,7 @@ const PAGE = [
   "    mic.getTracks().forEach(function(x){pc.addTrack(x,mic);});",
   "    dc=pc.createDataChannel('oai-events');",
   "    dc.onopen=function(){log('data channel open');};",
-  "    dc.onmessage=function(e){ try{ onEvent(JSON.parse(e.data)); }catch(_){ log('evt(raw): '+String(e.data).slice(0,120)); } };",
+  "    dc.onmessage=function(e){ slog('RAW '+String(e.data).slice(0,1500)); try{ onEvent(JSON.parse(e.data)); }catch(_){ log('evt(raw): '+String(e.data).slice(0,120)); } };",
   "    var offer=await pc.createOffer(); await pc.setLocalDescription(offer);",
   "    log('minting session...');",
   "    var res=await fetch('/api/live-spike/sdp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdp:offer.sdp,mode:mode})});",
