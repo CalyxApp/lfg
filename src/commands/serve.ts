@@ -420,6 +420,7 @@ import {
   handleRtInstructions,
   handleFileText,
 } from "../voice-rt.ts";
+import { handleLiveSpikeSdp, handleLiveSpikePage } from "../live-spike.ts";
 import {
   saveConversationRecord,
   listConversationSummaries,
@@ -1722,6 +1723,12 @@ export async function cmdServe() {
       if (path === "/api/voice/eleven-token" && req.method === "GET") {
         return handleElevenToken(req);
       }
+
+      // ---- GPT-Live-1 spike (THROWAWAY): isolated full-duplex voice feel-test.
+      // Standalone page + server-side SDP mint, not wired to Converse. See
+      // live-spike.ts. Safe to delete.
+      if (path === "/live-spike" && req.method === "GET") return handleLiveSpikePage();
+      if (path === "/api/live-spike/sdp" && req.method === "POST") return handleLiveSpikeSdp(req);
 
       // ---- Converse (OpenAI gpt-realtime): a SEPARATE realtime voice interface,
       // additive to the ElevenLabs cascade above (shares only the tool backend).
