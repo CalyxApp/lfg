@@ -1115,7 +1115,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
       {mode === "voice" ? (
         // ---- voice mode: a dedicated call screen (no transcript) ----
         <div className="flex flex-1 flex-col items-center justify-center gap-8 px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
-          <VoiceStage stream={micRef.current} status={voiceStatus} muted={muted} />
+          <VoiceStage status={voiceStatus} muted={muted} />
           <div className="text-center">
             <div className="text-xl font-medium">
               {voiceStatus === "connecting"

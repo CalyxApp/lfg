@@ -1,113 +1,69 @@
-// voice-stage.tsx — the big "we're live" indicator for Converse voice mode. A
-// soft circular orb that swells with your mic level while the line is live, calms
-// when muted, and spins while connecting. Mic level drives transforms in a rAF
-// loop (no React re-render per frame — same technique as VoiceMeter), with a gentle
-// breathing baseline so it feels alive even in silence. Honors reduced-motion.
+// voice-stage.tsx — the "we're live" hero for Converse voice mode. Renders the
+// ElevenLabs-style fluid Orb (web/src/eleven-orb.tsx, WebGL via R3F) in auto mode:
+// it animates itself from `agentState` (a soft shimmer while listening, a gentle
+// wander when idle/muted, a thinking swell while connecting) — no icon, no box.
+// Lazy-loaded (three.js is heavy) behind an error boundary + a static gradient
+// fallback, so a no-WebGL / stale-chunk case degrades to a blurred orb, never a crash.
 
-import { useEffect, useRef } from "react";
-import { Loader2, Mic, MicOff } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { Component, Suspense, type ReactNode } from "react";
+import { lazyWithReload } from "../lib/lazy-with-reload";
 
-export function VoiceStage({
-  stream,
-  status,
-  muted,
-}: {
-  stream: MediaStream | null;
-  status: "connecting" | "live" | "error";
-  muted: boolean;
-}) {
-  const coreRef = useRef<HTMLDivElement | null>(null);
-  const haloRef = useRef<HTMLDivElement | null>(null);
-  const reactive = status === "live" && !muted;
+const Orb = lazyWithReload("ConverseOrb", () =>
+  import("../eleven-orb").then((m) => ({ default: m.Orb })),
+);
 
-  useEffect(() => {
-    const core = coreRef.current;
-    const halo = haloRef.current;
-    const rest = () => {
-      if (core) core.style.transform = "scale(1)";
-      if (halo) {
-        halo.style.transform = "scale(1)";
-        halo.style.opacity = "0.22";
-      }
-    };
-    if (!stream || !reactive) {
-      rest();
-      return;
-    }
-    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-    if (reduce) {
-      rest();
-      return;
-    }
-    let raf = 0;
-    let ctx: AudioContext | null = null;
-    try {
-      const Ctor =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!Ctor) return;
-      ctx = new Ctor();
-      const src = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.8;
-      src.connect(analyser);
-      const data = new Uint8Array(analyser.frequencyBinCount);
-      const tick = () => {
-        analyser.getByteFrequencyData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) sum += data[i];
-        const level = Math.min(1, (sum / data.length / 255) * 2.2); // 0..1
-        const breathe = 1 + Math.sin(performance.now() / 650) * 0.012;
-        if (core) core.style.transform = `scale(${(breathe + level * 0.18).toFixed(3)})`;
-        if (halo) {
-          halo.style.transform = `scale(${(1 + level * 0.9).toFixed(3)})`;
-          halo.style.opacity = (0.18 + level * 0.5).toFixed(3);
-        }
-        raf = requestAnimationFrame(tick);
-      };
-      tick();
-    } catch {
-      /* no reactive orb if WebAudio is unavailable */
-    }
-    return () => {
-      cancelAnimationFrame(raf);
-      try {
-        ctx?.close();
-      } catch {
-        /* ignore */
-      }
-    };
-  }, [stream, reactive]);
+type Status = "connecting" | "live" | "error";
+type OrbAgentState = "listening" | "thinking" | "talking" | "consulting" | null;
 
-  const Icon = muted ? MicOff : status === "connecting" ? Loader2 : Mic;
-  const tone =
-    status === "error"
-      ? "bg-destructive/15 text-destructive"
-      : muted
-        ? "bg-muted text-muted-foreground"
-        : "bg-primary/15 text-primary";
-  const haloTone =
-    status === "error" ? "bg-destructive/25" : muted ? "bg-muted-foreground/15" : "bg-primary/25";
+// State → orb gradient, echoing voice-call.tsx so both voice surfaces speak the
+// same colour language.
+const COLORS: Record<string, [string, string]> = {
+  idle: ["#9aa7b8", "#7c8a9c"],
+  listening: ["#CADCFC", "#A0B9D1"],
+  thinking: ["#cfc2ff", "#9f8be6"],
+  error: ["#fca5a5", "#f87171"],
+};
+
+class OrbBoundary extends Component<
+  { fallback: ReactNode; children: ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
+
+export function VoiceStage({ status, muted }: { status: Status; muted: boolean }) {
+  const agentState: OrbAgentState =
+    status === "connecting" ? "thinking" : status === "error" || muted ? null : "listening";
+  const colorKey = status === "error" ? "error" : (agentState ?? "idle");
+  const colors = COLORS[colorKey] ?? COLORS.idle;
+
+  const fallback = (
+    <div
+      className="h-full w-full rounded-full"
+      style={{
+        background: `conic-gradient(from 0deg, ${colors[0]}, ${colors[1]}, ${colors[0]})`,
+        filter: "blur(12px)",
+        opacity: 0.7,
+      }}
+    />
+  );
 
   return (
-    <div className="relative flex size-56 items-center justify-center" aria-hidden="true">
-      <div
-        ref={haloRef}
-        className={cn("absolute size-40 rounded-full blur-xl", haloTone)}
-        style={{ transform: "scale(1)", opacity: 0.22 }}
-      />
-      <div
-        ref={coreRef}
-        className={cn(
-          "relative flex size-28 items-center justify-center rounded-full transition-colors duration-300",
-          tone,
-        )}
-        style={{ transform: "scale(1)" }}
-      >
-        <Icon className={cn("size-10", status === "connecting" && "animate-spin")} />
-      </div>
+    <div
+      className="flex items-center justify-center"
+      style={{ width: "min(62vw, 240px)", height: "min(62vw, 240px)" }}
+    >
+      <OrbBoundary fallback={fallback}>
+        <Suspense fallback={fallback}>
+          <Orb className="h-full w-full min-w-0" colors={colors} agentState={agentState} volumeMode="auto" />
+        </Suspense>
+      </OrbBoundary>
     </div>
   );
 }
