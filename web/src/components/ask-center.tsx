@@ -27,7 +27,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import { Streamdown } from "streamdown";
-import { MicButton } from "@/components/dictation";
+import { useWaveformDictation, WaveformRecorderRow } from "@/components/dictation";
 import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
 import { EmptyState } from "@/components/ui/empty-state";
 import {
@@ -41,9 +41,22 @@ import {
   Inbox,
   Maximize2,
   MessageCircleQuestion,
+  Mic,
   Send,
   X,
 } from "lucide-react";
+
+// When a reply box is focused the on-screen keyboard slides up and — because
+// these inputs live inside the scrollable Ask page, not a pinned composer —
+// iOS can leave the field stranded behind the keyboard. Nudge it back into the
+// visible band once the keyboard has animated in. Matches the "press it, start
+// typing" feel of the agent-chat composer, which never disappears.
+function keepInputVisible(el: HTMLElement | null) {
+  if (!el) return;
+  window.setTimeout(() => {
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, 300);
+}
 
 type Question = {
   id: string;
@@ -371,6 +384,17 @@ export function AskCenter({ onExpand }: { onExpand: () => void }) {
     setDraft("");
   }, [current?.id]);
 
+  // Voice-to-text matching the agent-chat composer: tap mic → waveform row.
+  const rec = useWaveformDictation({
+    baseText: draft,
+    onText: setDraft,
+    onInterim: setDraft,
+    onSend: (t) => {
+      if (current && t.trim()) void answer(current, t.trim());
+    },
+    onCancel: (b) => setDraft(b),
+  });
+
   if (!current || collapsed) return null;
 
   const queued = questions.length - 1;
@@ -433,27 +457,46 @@ export function AskCenter({ onExpand }: { onExpand: () => void }) {
         ) : null}
 
         <div className="flex items-end gap-1.5">
-          <Textarea
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="Type a reply…"
-            rows={1}
-            className="max-h-28 min-h-9 flex-1 resize-none"
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                void answer(current, draft);
-              }
-            }}
-          />
-          <Button
-            size="icon-sm"
-            disabled={busy || !draft.trim()}
-            onClick={() => void answer(current, draft)}
-            aria-label="Send answer"
-          >
-            <Send className="size-4" />
-          </Button>
+          {rec.active ? (
+            <WaveformRecorderRow rec={rec} />
+          ) : (
+            <>
+              <Textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onFocus={(e) => keepInputVisible(e.currentTarget)}
+                placeholder="Type a reply…"
+                rows={1}
+                className="max-h-28 min-h-9 flex-1 resize-none"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void answer(current, draft);
+                  }
+                }}
+              />
+              {rec.supported ? (
+                <Button
+                  size="icon-sm"
+                  type="button"
+                  variant="tint"
+                  onClick={() => void rec.start()}
+                  aria-label="Dictate"
+                  title="Dictate — you review before sending"
+                >
+                  <Mic className="size-4" />
+                </Button>
+              ) : null}
+              <Button
+                size="icon-sm"
+                disabled={busy || !draft.trim()}
+                onClick={() => void answer(current, draft)}
+                aria-label="Send answer"
+              >
+                <Send className="size-4" />
+              </Button>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -600,6 +643,20 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
     },
     [qIdx, isLast, answers, ask, answerCalyx],
   );
+
+  // Voice-to-text, identical to the agent-chat composer: tap the mic and the
+  // reply row swaps to the live waveform recorder (✕ cancel · ✓ review · ↑
+  // send). ✓ drops the transcript into the box to edit; ↑ submits it straight
+  // through the same path as tapping Send. Replaces the old bare mic button.
+  const rec = useWaveformDictation({
+    baseText: text,
+    onText: setText,
+    onInterim: setText,
+    onSend: (t) => {
+      if (t.trim()) recordAndAdvance(t.trim());
+    },
+    onCancel: (b) => setText(b),
+  });
 
   const toggle = (label: string) => {
     if (!multi) {
@@ -831,52 +888,62 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
         ) : null}
 
         {/* Free text. Any reply wakes the agent — including "I don't follow".
-            The mic is the same one every other surface uses, so it behaves
-            identically here (and its PCM→WAV path is the one that works on
-            iOS). */}
+            Press it, start typing; tap the mic to dictate. Behaves exactly like
+            the agent-chat composer: the whole row swaps to the live waveform
+            recorder while you talk. */}
         <div className="mt-3 flex items-end gap-2">
-          <Textarea
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder={q?.options?.length ? "Or say something else…" : "Your answer…"}
-            rows={2}
-            className="min-h-[44px] resize-none text-sm"
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                // Free text takes priority when the box has content.
-                if (text.trim()) {
-                  recordAndAdvance(text.trim());
-                } else if (multi && currentPicks.length > 0) {
-                  // No text but multi-select picks exist — same as tapping
-                  // the "Next" / "Send" button.
-                  recordAndAdvance(currentPicks.join(", "));
-                }
-              }
-            }}
-          />
-          <MicButton
-            baseText={text}
-            onText={(t) => setText(t)}
-            onAutoSubmit={(t) => {
-              // Spoken and finished: fill the box, don't send. An answer here
-              // restarts real work on the server, so it gets read back first.
-              setText(t);
-            }}
-            minimal
-          />
-          <Button
-            size="icon"
-            disabled={busy || !text.trim()}
-            onClick={() => recordAndAdvance(text.trim())}
-            aria-label={isLast || totalQ <= 1 ? "Send answer" : "Next question"}
-          >
-            {isLast || totalQ <= 1 ? (
-              <Send className="size-4" />
-            ) : (
-              <ChevronRight className="size-4" />
-            )}
-          </Button>
+          {rec.active ? (
+            <WaveformRecorderRow rec={rec} />
+          ) : (
+            <>
+              <Textarea
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                onFocus={(e) => keepInputVisible(e.currentTarget)}
+                placeholder={q?.options?.length ? "Or say something else…" : "Your answer…"}
+                rows={2}
+                className="min-h-[44px] flex-1 resize-none text-sm"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    // Free text takes priority when the box has content.
+                    if (text.trim()) {
+                      recordAndAdvance(text.trim());
+                    } else if (multi && currentPicks.length > 0) {
+                      // No text but multi-select picks exist — same as tapping
+                      // the "Next" / "Send" button.
+                      recordAndAdvance(currentPicks.join(", "));
+                    }
+                  }
+                }}
+              />
+              {rec.supported ? (
+                <Button
+                  size="icon"
+                  type="button"
+                  variant="tint"
+                  disabled={busy}
+                  onClick={() => void rec.start()}
+                  aria-label="Dictate"
+                  title="Dictate — you review before sending"
+                >
+                  <Mic className="size-4" />
+                </Button>
+              ) : null}
+              <Button
+                size="icon"
+                disabled={busy || !text.trim()}
+                onClick={() => recordAndAdvance(text.trim())}
+                aria-label={isLast || totalQ <= 1 ? "Send answer" : "Next question"}
+              >
+                {isLast || totalQ <= 1 ? (
+                  <Send className="size-4" />
+                ) : (
+                  <ChevronRight className="size-4" />
+                )}
+              </Button>
+            </>
+          )}
         </div>
 
         {/* The promise — honest about where it runs. */}
@@ -1330,6 +1397,16 @@ function QuestionCard({
 }) {
   const { busy } = useAsk();
   const [draft, setDraft] = useState("");
+  // Voice-to-text matching the agent-chat composer: tap mic → waveform row.
+  const rec = useWaveformDictation({
+    baseText: draft,
+    onText: setDraft,
+    onInterim: setDraft,
+    onSend: (t) => {
+      if (t.trim()) onAnswer?.(t.trim());
+    },
+    onCancel: (b) => setDraft(b),
+  });
   return (
     <div
       className={cn(
@@ -1387,27 +1464,46 @@ function QuestionCard({
           ) : null}
 
           <div className="flex items-end gap-1.5">
-            <Textarea
-              value={draft}
-              onChange={(e) => setDraft(e.target.value)}
-              placeholder="Type a reply…"
-              rows={1}
-              className="max-h-32 min-h-9 flex-1 resize-none"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  onAnswer?.(draft);
-                }
-              }}
-            />
-            <Button
-              size="icon-sm"
-              disabled={busy || !draft.trim()}
-              onClick={() => onAnswer?.(draft)}
-              aria-label="Send answer"
-            >
-              <Send className="size-4" />
-            </Button>
+            {rec.active ? (
+              <WaveformRecorderRow rec={rec} />
+            ) : (
+              <>
+                <Textarea
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onFocus={(e) => keepInputVisible(e.currentTarget)}
+                  placeholder="Type a reply…"
+                  rows={1}
+                  className="max-h-32 min-h-9 flex-1 resize-none"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      onAnswer?.(draft);
+                    }
+                  }}
+                />
+                {rec.supported ? (
+                  <Button
+                    size="icon-sm"
+                    type="button"
+                    variant="tint"
+                    onClick={() => void rec.start()}
+                    aria-label="Dictate"
+                    title="Dictate — you review before sending"
+                  >
+                    <Mic className="size-4" />
+                  </Button>
+                ) : null}
+                <Button
+                  size="icon-sm"
+                  disabled={busy || !draft.trim()}
+                  onClick={() => onAnswer?.(draft)}
+                  aria-label="Send answer"
+                >
+                  <Send className="size-4" />
+                </Button>
+              </>
+            )}
           </div>
         </div>
       ) : null}
