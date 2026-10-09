@@ -32,7 +32,7 @@ import {
 } from "lucide-react";
 import { NoteMetaEditor, type PropRow } from "./note-meta-editor";
 import { useWaveformDictation, WaveformRecorderRow } from "./components/dictation";
-import { VoiceMeter } from "./components/voice-meter";
+import { VoiceStage } from "./components/voice-stage";
 import { type ToolDetail } from "./components/tool-card";
 import { ConversationTurns } from "./components/conversation-turns";
 import { ConversationHistory } from "./conversation-history";
@@ -1112,6 +1112,73 @@ export function Converse({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
+      {mode === "voice" ? (
+        // ---- voice mode: a dedicated call screen (no transcript) ----
+        <div className="flex flex-1 flex-col items-center justify-center gap-8 px-6 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+          <VoiceStage stream={micRef.current} status={voiceStatus} muted={muted} />
+          <div className="text-center">
+            <div className="text-xl font-medium">
+              {voiceStatus === "connecting"
+                ? "Connecting…"
+                : voiceStatus === "error"
+                  ? "Voice error"
+                  : muted
+                    ? "Muted"
+                    : "Listening"}
+            </div>
+            <div className="mt-1 text-sm text-muted-foreground">
+              {voiceStatus === "connecting"
+                ? "Setting up the line"
+                : voiceStatus === "error"
+                  ? "Tap End and start again"
+                  : muted
+                    ? "Tap the mic to talk"
+                    : "Just talk — I'm listening"}
+            </div>
+          </div>
+          <div className="flex items-start justify-center gap-10">
+            <div className="flex flex-col items-center gap-2">
+              <button
+                type="button"
+                onClick={toggleMute}
+                disabled={voiceStatus !== "live"}
+                className={
+                  "flex size-16 items-center justify-center rounded-full border transition-transform active:scale-95 disabled:opacity-40 " +
+                  (muted
+                    ? "border-transparent bg-destructive text-destructive-foreground"
+                    : "border-border bg-card text-foreground")
+                }
+                aria-label={muted ? "Unmute microphone" : "Mute microphone"}
+              >
+                {muted ? <MicOff className="size-6" /> : <Mic className="size-6" />}
+              </button>
+              <span className="text-xs text-muted-foreground">{muted ? "Muted" : "Mic"}</span>
+            </div>
+            <div className="flex flex-col items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setMode("chat")}
+                className="flex size-16 items-center justify-center rounded-full bg-destructive text-destructive-foreground transition-transform active:scale-95"
+                aria-label="End voice"
+                title="End voice — back to the keyboard, keeps the conversation"
+              >
+                <Square className="size-6" />
+              </button>
+              <span className="text-xs text-muted-foreground">End</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={toggleSounds}
+            className="flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground active:scale-95"
+            aria-label={soundsMuted ? "Turn cue sounds on" : "Turn cue sounds off"}
+          >
+            {soundsMuted ? <VolumeX className="size-3.5" /> : <Volume2 className="size-3.5" />}
+            {soundsMuted ? "Cue sounds off" : "Cue sounds on"}
+          </button>
+        </div>
+      ) : (
+        <>
       <div className="flex-1 overflow-y-auto px-4 py-3" ref={scrollRef}>
         {log.length === 0 && !error ? (
           <div className="px-4 py-10 text-center text-sm text-muted-foreground">
@@ -1126,52 +1193,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
         )}
       </div>
 
-      {mode === "voice" ? (
-        <div className="flex items-center justify-center gap-3 border-t border-border px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-          {voiceStatus === "live" && <VoiceMeter stream={micRef.current} active={voiceStatus === "live"} />}
-          <span className="text-sm text-muted-foreground">
-            {voiceStatus === "live"
-              ? muted
-                ? "muted — tap the mic to talk"
-                : "voice is live — just talk"
-              : voiceStatus === "connecting"
-                ? "connecting…"
-                : "voice error"}
-          </span>
-          <button
-            type="button"
-            className="flex size-9 items-center justify-center rounded-full border border-border text-muted-foreground hover:text-foreground"
-            onClick={toggleSounds}
-            title={soundsMuted ? "Cue sounds off" : "Cue sounds on"}
-            aria-label={soundsMuted ? "Turn cue sounds on" : "Turn cue sounds off"}
-          >
-            {soundsMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
-          </button>
-          <button
-            type="button"
-            onClick={toggleMute}
-            disabled={voiceStatus !== "live"}
-            className={
-              muted
-                ? "flex size-11 items-center justify-center rounded-full bg-destructive text-destructive-foreground disabled:opacity-50 md:size-9"
-                : "flex size-11 items-center justify-center rounded-full border border-border text-foreground disabled:opacity-50 md:size-9"
-            }
-            title={muted ? "Unmute microphone" : "Mute microphone"}
-            aria-label={muted ? "Unmute microphone" : "Mute microphone"}
-          >
-            {muted ? <MicOff className="size-5 md:size-4" /> : <Mic className="size-5 md:size-4" />}
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode("chat")}
-            className="flex items-center gap-1.5 rounded-full border border-border px-4 py-2 text-sm font-medium text-foreground"
-            title="Stop voice — back to the keyboard, keeps the conversation"
-            aria-label="Stop voice"
-          >
-            <Square className="size-4" /> Stop
-          </button>
-        </div>
-      ) : dict.active ? (
+      {dict.active ? (
         // ---- dictation in progress: the shared waveform recorder ----
         <div className="border-t border-border bg-background px-3 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
           <WaveformRecorderRow rec={dict} />
@@ -1322,6 +1344,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
           )}
           </form>
         </div>
+      )}
+        </>
       )}
     </div>
   );
