@@ -166,6 +166,7 @@ export function describeVault(repoCwd: string, type?: string): Response {
     const counts: Record<string, number> = {};
     const tagFreq = new Map<string, number>();
     const projects: Candidate[] = [];
+    const areas: Candidate[] = [];
     for (const d of docs) {
       counts[d.type] = (counts[d.type] || 0) + 1;
       const tags = d.properties.tags;
@@ -176,6 +177,7 @@ export function describeVault(repoCwd: string, type?: string): Response {
         }
       }
       if (d.type === "project") projects.push({ path: d.path, title: d.title, type: d.type });
+      else if (d.type === "area") areas.push({ path: d.path, title: d.title, type: d.type });
     }
     return json({
       isVault: isVault(repoCwd),
@@ -183,6 +185,7 @@ export function describeVault(repoCwd: string, type?: string): Response {
       types: Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([t, n]) => ({ type: t, count: n })),
       tags: [...tagFreq.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([tag, count]) => ({ tag, count })),
       projects: projects.slice(0, 60),
+      areas: areas.slice(0, 60),
       truncated,
     });
   }
@@ -299,12 +302,15 @@ export function buildVaultContext(repoCwd: string, now: Date = new Date()): stri
 
     const { docs } = scanVault(repoCwd);
     const projects: string[] = [];
+    const areas: string[] = [];
     for (const d of docs) {
+      if (d.type === "area") { areas.push(d.title); continue; }
       if (d.type !== "project") continue;
       const status = str(d.properties.status)?.toLowerCase();
       if (status && CLOSED_STATUS.has(status)) continue;
       projects.push(status && status !== "active" ? `${d.title} [${status}]` : d.title);
     }
+    areas.sort();
 
     const { items } = vaultItems(repoCwd, "task");
     const overdue: string[] = [];
@@ -334,6 +340,7 @@ export function buildVaultContext(repoCwd: string, now: Date = new Date()): stri
         ? `Active projects (${projects.length}): ${projects.join("; ")}.`
         : "Active projects: none found.",
     ];
+    if (areas.length) sections.push(`Areas (${areas.length}): ${areas.join("; ")}.`);
     if (overdue.length) sections.push(`Tasks overdue (past 7 days), ${overdue.length}:\n${overdue.join("\n")}`);
     if (upcoming.length) sections.push(`Tasks due in the next 7 days, ${upcoming.length}:\n${upcoming.join("\n")}`);
     if (!overdue.length && !upcoming.length) {
@@ -441,6 +448,26 @@ function folderForType(repoCwd: string, type: string): string {
   return type === "note" ? "notes" : type;
 }
 
+/** Resolve a project reference ("[[Name]]", "Name", or a project_id slug) to its
+ *  vault directory (e.g. "projects/calyx-voice"), or null if no project matches.
+ *  Conservative: only an exact slug match on project_id or title counts, so an
+ *  unrecognised name falls back to the root tasks folder rather than misfiling. */
+function resolveProjectDir(repoCwd: string, projectRef: unknown): string | null {
+  if (typeof projectRef !== "string" || !projectRef.trim()) return null;
+  const raw = projectRef.replace(/^\[\[/, "").replace(/\]\]$/, "").trim();
+  const wantSlug = slugify(raw);
+  if (!wantSlug) return null;
+  const { docs } = scanVault(repoCwd);
+  for (const d of docs) {
+    if (d.type !== "project" || !d.path.includes("/")) continue;
+    const pid = str(d.properties.project_id);
+    if ((pid && slugify(pid) === wantSlug) || slugify(d.title) === wantSlug) {
+      return d.path.slice(0, d.path.lastIndexOf("/"));
+    }
+  }
+  return null;
+}
+
 /** create — a typed note, filed where notes of that type already live, committed. */
 export async function createNote(
   repoCwd: string,
@@ -449,8 +476,25 @@ export async function createNote(
   const title = (input.title ?? "").trim();
   if (!title) return err(400, "title required");
   const type = (input.type ?? "note").trim().toLowerCase() || "note";
-  const folder = folderForType(repoCwd, type);
   const baseSlug = slugify(title);
+  // Tasks are folder-notes. A root task lives at tasks/<slug>/index.md (the vault's
+  // overwhelming convention); a task that names a project goes in that project's
+  // tasks/ folder as a flat file. Every other type stays a flat file in the folder
+  // its kind already lives in. folderForType mis-sends tasks to whichever project
+  // tasks/ folder holds the most flat files — see voice-session-findings finding 1.
+  let folder: string;
+  let indexForm = false;
+  if (type === "task") {
+    const projDir = resolveProjectDir(repoCwd, input.properties?.project);
+    if (projDir) {
+      folder = `${projDir}/tasks`;
+    } else {
+      folder = "tasks";
+      indexForm = true;
+    }
+  } else {
+    folder = folderForType(repoCwd, type);
+  }
   const frontmatter = buildFrontmatter({ type, title, ...(input.properties ?? {}) });
   const bodyText = input.body?.trim();
   const content = bodyText ? `${frontmatter}\n\n${bodyText}\n` : `${frontmatter}\n`;
@@ -458,7 +502,8 @@ export async function createNote(
     const result = await withRepoLock(repoCwd, async () => {
       let written: { path: string } | null = null;
       for (let n = 1; n <= 20; n++) {
-        const rel = n === 1 ? `${folder}/${baseSlug}.md` : `${folder}/${baseSlug}-${n}.md`;
+        const stem = n === 1 ? baseSlug : `${baseSlug}-${n}`;
+        const rel = indexForm ? `${folder}/${stem}/index.md` : `${folder}/${stem}.md`;
         try {
           written = await writeRepoFile(repoCwd, rel, content, { createOnly: true });
           break;

@@ -798,7 +798,11 @@ export function Converse({ onClose }: { onClose: () => void }) {
               if (content.length === 0) continue;
             } else {
               if (!e.text) continue;
-              content = [{ type: "text", text: e.text }];
+              // Assistant messages replayed into the realtime session must use
+              // "output_text", not "text" — the API rejects "text" on an assistant
+              // item ("Value must be 'output_text'"), which broke history replay on
+              // reconnect (voice-session-findings 2026-10-09, finding 8).
+              content = [{ type: "output_text", text: e.text }];
             }
             dc.send(
               JSON.stringify({
@@ -822,7 +826,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
               .then((j) => {
                 const d = dcRef.current;
                 if (j?.instructions && d && d.readyState === "open") {
-                  d.send(JSON.stringify({ type: "session.update", session: { instructions: j.instructions } }));
+                  d.send(JSON.stringify({ type: "session.update", session: { type: "realtime", instructions: j.instructions } }));
                   logEvent("context_refresh", {});
                 }
               })
