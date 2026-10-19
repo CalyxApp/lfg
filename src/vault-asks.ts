@@ -217,6 +217,14 @@ function toAsk(d: VaultDoc, repo: string): CalyxAsk {
 // `scanVault`'s task machinery entirely and is read directly from its own
 // folder. Keep this in step with that file by hand, same rule as the
 // ask-questions mirror above.
+//
+// A chat's `ask` is saved here too (Calyx, waiting-questions-plan.md, Phase 1):
+// a `kind: question` file with a `chat_ask` block. Answering it is the same
+// append to `replies[]`; the Mac that owns the chat picks the reply up and
+// sends it into that chat. One question shows its options; a batch of
+// several ("Your calls") shows as its message, answered in words — one tap
+// must never answer five calls. A reply Calyx wrote may carry `answers` (the
+// choices by id); they are kept as they are when this file is rewritten.
 
 const HEADS_UPS_REL_DIR = ".calyx/heads-ups";
 const HEADS_UP_TYPE = "heads-up";
@@ -252,7 +260,9 @@ function isConflictCopyName(fileName: string): boolean {
   return CONFLICT_COPY_SUFFIX.test(stem);
 }
 
-type HeadsUpReply = { id: string; at: string; text: string; consumed_by?: string };
+type HeadsUpReplyAnswer = { questionId: string; optionIds: string[]; note?: string; usedPick?: boolean };
+
+type HeadsUpReply = { id: string; at: string; text: string; consumed_by?: string; answers?: HeadsUpReplyAnswer[] };
 
 type HeadsUpFile = {
   id: string;
@@ -263,7 +273,31 @@ type HeadsUpFile = {
   from: string;
   status: string;
   replies: HeadsUpReply[];
+  /** `kind: question` — it asks something. */
+  question: boolean;
+  /** The ask-format questions, unvalidated (normalized when shown). */
+  questions?: unknown;
+  /** A chat's saved `ask` holding several questions at once. */
+  chatAskBatch: boolean;
 };
+
+/** Mirrors `cleanReplyAnswers` in Calyx's headsUps.ts. */
+function parseReplyAnswers(v: unknown): HeadsUpReplyAnswer[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: HeadsUpReplyAnswer[] = [];
+  for (const raw of v) {
+    if (!raw || typeof raw !== "object") continue;
+    const a = raw as Record<string, unknown>;
+    const questionId = clean(a.questionId, 64);
+    if (!questionId) continue;
+    const optionIds = Array.isArray(a.optionIds)
+      ? a.optionIds.map((id) => clean(id, 64)).filter((id): id is string => !!id)
+      : [];
+    const note = clean(a.note, MAX_REPLY);
+    out.push({ questionId, optionIds, ...(note ? { note } : {}), ...(a.usedPick === true ? { usedPick: true } : {}) });
+  }
+  return out.length ? out : undefined;
+}
 
 function parseHeadsUpReplies(v: unknown): HeadsUpReply[] {
   if (!Array.isArray(v)) return [];
@@ -276,7 +310,8 @@ function parseHeadsUpReplies(v: unknown): HeadsUpReply[] {
     const text = clean(r.text, MAX_REPLY);
     if (!id || !at || !text) continue;
     const consumedBy = clean(r.consumed_by, 200);
-    out.push(consumedBy ? { id, at, text, consumed_by: consumedBy } : { id, at, text });
+    const answers = parseReplyAnswers(r.answers);
+    out.push({ id, at, text, ...(consumedBy ? { consumed_by: consumedBy } : {}), ...(answers ? { answers } : {}) });
   }
   return out;
 }
@@ -303,6 +338,10 @@ function readHeadsUpFile(repoCwd: string, fileName: string): HeadsUpFile | null 
     from: clean(p.from, MAX_LABEL) ?? "Agent",
     status: typeof p.status === "string" ? p.status : "new",
     replies: parseHeadsUpReplies(p.replies),
+    question: p.kind === "question",
+    questions: p.questions,
+    chatAskBatch:
+      !!p.chat_ask && typeof p.chat_ask === "object" && (p.chat_ask as Record<string, unknown>).batch === true,
   };
 }
 
@@ -348,13 +387,16 @@ function listHeadsUpFiles(repoCwd: string): HeadsUpFile[] {
 
 function toHeadsUpAsk(h: HeadsUpFile, repo: string): CalyxAsk {
   const lastReply = h.replies[h.replies.length - 1];
+  // One question shows its options. Several are answered in words, from the
+  // message that lists them — a tap on one option must not answer them all.
+  const questions = h.question && !h.chatAskBatch ? normalizeQuestions(h.questions) : [];
   return {
     id: h.path,
     path: h.path,
     title: h.title,
     kind: "heads-up",
     reason: h.message,
-    questions: [],
+    questions: questions.length === 1 ? questions : [],
     agent: h.from,
     answered: h.status !== "new",
     answer: lastReply?.text,

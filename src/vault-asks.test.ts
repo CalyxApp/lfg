@@ -204,3 +204,111 @@ describe("sync conflict copies reconcile to one item", () => {
     expect(ask.answer).toBe("Yes, ship it"); // the copy's reply is not lost
   });
 });
+
+describe("a chat's saved ask (Calyx waiting-questions Phase 1)", () => {
+  const ID_C = "ABCDEFGHJKMNPQRSTVWXYZ0123";
+
+  function writeRaw(fileName: string, text: string): void {
+    writeFileSync(join(headsUpsDir(), fileName), text, "utf8");
+  }
+
+  test("one question shows its options; a batch shows as its message", () => {
+    writeRaw(
+      `${ID_A}.md`,
+      [
+        "---",
+        "type: heads-up",
+        `id: ${ID_A}`,
+        "kind: question",
+        "title: Swap the bundle now?",
+        "from: Homepage chat",
+        "status: new",
+        "replies: []",
+        "questions:",
+        "  - id: q1",
+        "    text: Swap the bundle now?",
+        "    options:",
+        "      - id: o1",
+        "        label: Swap it now",
+        "      - id: o2",
+        "        label: Wait",
+        "chat_ask:",
+        "  id: ask-1",
+        "---",
+        "Swap the bundle now?",
+        "",
+      ].join("\n"),
+    );
+    writeRaw(
+      `${ID_B}.md`,
+      [
+        "---",
+        "type: heads-up",
+        `id: ${ID_B}`,
+        "kind: question",
+        "title: 2 calls for you",
+        "from: Homepage chat",
+        "status: new",
+        "replies: []",
+        "questions:",
+        "  - id: a",
+        "    text: Which layout?",
+        "    options:",
+        "      - label: Two columns",
+        "  - id: b",
+        "    text: Which colour?",
+        "    options:",
+        "      - label: Grey",
+        "chat_ask:",
+        "  id: ask-2",
+        "  batch: true",
+        "---",
+        "2 calls for you:",
+        "",
+        "1. Which layout?",
+        "2. Which colour?",
+        "",
+      ].join("\n"),
+    );
+    const asks = listCalyxAsks(repoCwd, "TestVault");
+    const single = asks.find((a) => a.title === "Swap the bundle now?")!;
+    const batch = asks.find((a) => a.title === "2 calls for you")!;
+    expect(single.questions.map((q) => q.options.map((o) => o.label))).toEqual([["Swap it now", "Wait"]]);
+    expect(batch.questions).toEqual([]);
+    expect(batch.reason).toContain("1. Which layout?");
+  });
+
+  test("answering keeps the choices on a reply Calyx wrote earlier", async () => {
+    writeRaw(
+      `${ID_C}.md`,
+      [
+        "---",
+        "type: heads-up",
+        `id: ${ID_C}`,
+        "kind: question",
+        "title: Ship it?",
+        "from: Homepage chat",
+        "status: new",
+        "replies:",
+        "  - id: 01JAAAAAAAAAAAAAAAAAAAAAAA",
+        "    at: 2026-10-19T10:00:00.000Z",
+        "    text: My calls",
+        "    consumed_by: chat-ask:ask-3",
+        "    answers:",
+        "      - questionId: q1",
+        "        optionIds: [o1]",
+        "        usedPick: true",
+        "---",
+        "Ship it?",
+        "",
+      ].join("\n"),
+    );
+    await answerCalyxAsk(repoCwd, `.calyx/heads-ups/${ID_C}.md`, "Actually, wait");
+    const { properties } = parseFrontmatter(readFileSync(join(headsUpsDir(), `${ID_C}.md`), "utf8"));
+    const replies = properties.replies as Array<Record<string, unknown>>;
+    expect(replies).toHaveLength(2);
+    expect(replies[0].answers).toEqual([{ questionId: "q1", optionIds: ["o1"], usedPick: true }]);
+    expect(replies[1].text).toBe("Actually, wait");
+    expect(replies[1].consumed_by).toBeUndefined();
+  });
+});
