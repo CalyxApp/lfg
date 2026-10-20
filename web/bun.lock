@@ -20,6 +20,7 @@
         "class-variance-authority": "^0.7.1",
         "clsx": "^2.1.1",
         "cnfast": "^0.0.8",
+        "dompurify": "^3.4.10",
         "ghostty-web": "^0.4.0",
         "livekit-client": "^2.19.2",
         "lucide-react": "^0.577.0",
