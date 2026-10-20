@@ -4,6 +4,8 @@
 // the screens open (an expanded card, the full-height sheet) gets a room socket;
 // collapsed cards hold none. The result is exactly what LFG's LiveView takes, so
 // the phone draws Calyx chats with LFG's list, cards, transcript and composer.
+// The agent's questions in those chats (L3a) come and are answered on the same
+// room sockets.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -16,15 +18,44 @@ import {
 } from "../App";
 import { chatsToSessions, EMPTY_HUB, engineAgent, engineLabel, reduceHub, type HubState } from "./hub-state";
 import { liveSocket, type LiveSocket } from "./live-socket";
-import { reduceRoom, roomMessages, roomStatus, type RoomState, type Sending } from "./room-state";
+import { reduceRoom, roomMessages, roomStatus, type AskAnswerPart, type RoomAsk, type RoomState, type Sending } from "./room-state";
 
 interface Room {
   sock: LiveSocket;
   state: RoomState | null;
   sending: Map<string, Sending>;
+  /** Answers on their way: the message ref → the question's id. */
+  answering: Map<string, string>;
+  /** Questions the room took this phone's answer for. */
+  answeredHere: Set<string>;
+  /** Why an answer did not go through, by question id. */
+  askErrors: Map<string, string>;
   /** What the screens draw, rebuilt only after news for this room. */
   view: { messages: Message[]; busy: boolean } | null;
 }
+
+/** A question in a chat, as the phone shows it. */
+export interface ChatAskView {
+  ask: RoomAsk;
+  /** This phone's answer is the one the room took. */
+  answeredHere: boolean;
+  /** An answer from this phone is on its way. */
+  busy: boolean;
+  error: string | null;
+}
+
+/** What a chat's question card needs besides the question. */
+export interface ChatAskInfo {
+  title: string;
+  /** The computer that will apply the answer: the one driving, or the one that drove last. */
+  computer: string | null;
+}
+
+const ASK_ERRORS: Record<string, string> = {
+  empty_answer: "Choose an option or type an answer first.",
+  unknown_ask: "This question has closed.",
+  offline: "Not connected to the chat. Try again in a moment.",
+};
 
 const NO_PROMPTS: Record<string, SessionPrompt | null> = {};
 const NO_QUEUES: Record<string, QueueMsg[]> = {};
@@ -66,7 +97,14 @@ export function useCloudChats(vaultId: string) {
     (chatId: string): Room => {
       const existing = roomsRef.current.get(chatId);
       if (existing) return existing;
-      const room = { state: null, sending: new Map(), view: null } as unknown as Room;
+      const room = {
+        state: null,
+        sending: new Map(),
+        answering: new Map(),
+        answeredHere: new Set(),
+        askErrors: new Map(),
+        view: null,
+      } as unknown as Room;
       const flush = () => {
         for (const [id, m] of room.sending) {
           if (!m.failed) room.sock.send({ t: "send", ref: id, requestId: id, text: m.text });
@@ -74,12 +112,21 @@ export function useCloudChats(vaultId: string) {
       };
       room.sock = liveSocket(`${base}/chats/${encodeURIComponent(chatId)}/ws?label=${encodeURIComponent(label)}`, {
         onOpen: (sock) => {
+          // An answer whose reply was lost with the old socket: the room's list says how it went.
+          room.answering.clear();
           // Catch up from where this phone got to, or take the whole snapshot.
           sock.send(room.state ? { t: "hello", after: room.state.lastSeq } : { t: "hello" });
           flush();
         },
         onMessage: (m) => {
-          if (m.t === "ack") {
+          const answeredAsk = typeof m.ref === "string" ? room.answering.get(m.ref) : undefined;
+          if (answeredAsk && (m.t === "ack" || m.t === "error")) {
+            room.answering.delete(m.ref as string);
+            if (m.ok) room.answeredHere.add(answeredAsk);
+            // not_open: another device answered first; its answer rides along and shows instead.
+            else if (m.code !== "not_open") room.askErrors.set(answeredAsk, ASK_ERRORS[m.code as string] ?? "Could not send the answer.");
+            if (m.ask) room.state = reduceRoom(room.state, { t: "ask", ask: m.ask });
+          } else if (m.t === "ack") {
             const id = ((m.item as { requestId?: string } | undefined)?.requestId ?? m.ref) as string | undefined;
             const pending = id ? room.sending.get(id) : undefined;
             if (!id || !pending) return;
@@ -137,15 +184,43 @@ export function useCloudChats(vaultId: string) {
     [openRoom, bump],
   );
 
+  const answer = useCallback(
+    (chatId: string, askId: string, text: string, answers: AskAnswerPart[]) => {
+      const room = openRoom(chatId);
+      const ref = `ans-${newRequestId().slice(4)}`;
+      room.askErrors.delete(askId);
+      if (room.sock.send({ t: "answer", ref, askId, text, answers })) room.answering.set(ref, askId);
+      else room.askErrors.set(askId, ASK_ERRORS.offline);
+      room.view = null;
+      bump();
+    },
+    [openRoom, bump],
+  );
+
   const view = useMemo(() => {
     const messagesBySid: Record<string, Message[]> = {};
     const busyBySid: Record<string, boolean> = {};
     const loadingBySid: Record<string, boolean> = {};
+    const asksBySid: Record<string, ChatAskView[]> = {};
+    const askInfoBySid: Record<string, ChatAskInfo> = {};
     for (const [id, room] of roomsRef.current) {
       room.view ??= roomMessages(room.state, room.sending);
       messagesBySid[id] = room.view.messages;
       busyBySid[id] = room.view.busy;
       loadingBySid[id] = !room.state;
+      const answering = new Set(room.answering.values());
+      asksBySid[id] = (room.state?.asks ?? []).map((ask) => ({
+        ask,
+        // After a reload the room still names this phone as the one that answered.
+        answeredHere: room.answeredHere.has(ask.id) || ask.answer?.from === label,
+        busy: answering.has(ask.id),
+        error: room.askErrors.get(ask.id) ?? null,
+      }));
+      const status = roomStatus(room.state);
+      askInfoBySid[id] = {
+        title: room.state?.title ?? "",
+        computer: status.kind === "none" ? (room.state?.lease?.lastLabel ?? null) : status.label,
+      };
     }
     // What a chat's open room knows is newer than the list: its title, engine, and where it is.
     const sessions: Session[] = listed.map((s) => {
@@ -163,7 +238,7 @@ export function useCloudChats(vaultId: string) {
           : {}),
       };
     });
-    return { sessions, messagesBySid, busyBySid, loadingBySid };
+    return { sessions, messagesBySid, busyBySid, loadingBySid, asksBySid, askInfoBySid };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [version, listed]);
 
@@ -187,5 +262,6 @@ export function useCloudChats(vaultId: string) {
     promptsBySid: NO_PROMPTS,
     queuesBySid: NO_QUEUES,
     ops,
+    answer,
   };
 }

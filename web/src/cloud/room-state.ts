@@ -8,7 +8,8 @@
 // Message list LFG's own chat screens draw.
 //
 // Ported from the S4 phone page (chat-worker src/page.html: onRoom, liveItems,
-// renderChat), which passed Sam's iPhone test on 2026-10-16.
+// renderChat), which passed Sam's iPhone test on 2026-10-16. Questions the
+// agent asks (L3a) ride the same socket: chat-worker src/room.ts, "Questions".
 
 import type { Message } from "../App";
 
@@ -55,6 +56,50 @@ export interface HistoryMessage {
   tools?: Array<{ name: string; label?: string; ok: boolean }>;
 }
 
+/** One option of a question, as Calyx shapes it (`AskOption`, extension src/lib/shared/askQuestions.ts). */
+export interface AskOptionData {
+  id?: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  /** Vault files that ARE this option. */
+  previews?: string[];
+  /** The older single form of `previews`. */
+  preview?: string;
+}
+
+/** One question, as Calyx shapes it (`AskQuestion`). */
+export interface AskQuestionData {
+  id?: string;
+  text: string;
+  header?: string;
+  options?: AskOptionData[];
+  multiSelect?: boolean;
+  allowOther?: boolean;
+  /** Vault files to look at before deciding. */
+  attachments?: string[];
+  context?: string;
+}
+
+export interface AskAnswerPart {
+  questionId: string;
+  optionIds: string[];
+  note?: string;
+}
+
+export interface RoomAsk {
+  id: string;
+  questions: AskQuestionData[];
+  context?: string;
+  /** Several questions answered together. */
+  batch: boolean;
+  createdAt: number;
+  /** open: waiting. answered: a device answered; the computer has not applied it yet. closed: settled. */
+  status: "open" | "answered" | "closed";
+  answer?: { text: string; answers?: AskAnswerPart[]; from: string; at: number };
+  outcome?: string;
+}
+
 export interface RoomState {
   title: string;
   engine: string | null;
@@ -64,6 +109,8 @@ export interface RoomState {
   upToSeq: number;
   tail: RoomEvent[];
   inbox: InboxItem[];
+  /** Questions still open, or answered and not yet applied on the computer, oldest first. */
+  asks: RoomAsk[];
   lastSeq: number;
 }
 
@@ -89,6 +136,12 @@ function mergeTail(tail: RoomEvent[], incoming: RoomEvent[], after: number): Roo
   return out.sort(bySeq);
 }
 
+/** The room's list of questions is whole: one missing from it has closed. */
+function liveAsks(raw: unknown): RoomAsk[] {
+  if (!Array.isArray(raw)) return [];
+  return (raw as RoomAsk[]).filter((a) => a?.id && a.status !== "closed").sort((a, b) => a.createdAt - b.createdAt);
+}
+
 function leaseOf(msg: Json): LeaseView {
   const { t: _t, ref: _ref, ...rest } = msg;
   return rest as unknown as LeaseView;
@@ -111,6 +164,7 @@ export function reduceRoom(state: RoomState | null, msg: Json): RoomState | null
         upToSeq,
         tail: mergeTail([], (msg.tail as RoomEvent[]) ?? [], upToSeq),
         inbox: ((msg.inbox as InboxItem[]) ?? []).filter((i) => i.status !== "done"),
+        asks: liveAsks(msg.asks),
         lastSeq: (msg.lastSeq as number) ?? 0,
       };
     }
@@ -122,6 +176,7 @@ export function reduceRoom(state: RoomState | null, msg: Json): RoomState | null
         lease: (msg.lease as LeaseView) ?? state.lease,
         tail: mergeTail(state.tail, (msg.tail as RoomEvent[]) ?? [], state.upToSeq),
         inbox: ((msg.inbox as InboxItem[]) ?? []).filter((i) => i.status !== "done"),
+        asks: Array.isArray(msg.asks) ? liveAsks(msg.asks) : state.asks,
         lastSeq: Math.max(state.lastSeq, (msg.lastSeq as number) ?? 0),
       };
     }
@@ -153,6 +208,11 @@ export function reduceRoom(state: RoomState | null, msg: Json): RoomState | null
       if (item.status !== "done") inbox.push(item);
       inbox.sort((a, b) => a.seq - b.seq);
       return { ...state, inbox };
+    }
+    case "ask": {
+      const ask = msg.ask as RoomAsk | null;
+      if (!state || !ask?.id) return state;
+      return { ...state, asks: liveAsks([...state.asks.filter((a) => a.id !== ask.id), ask]) };
     }
     case "lease":
       return state ? { ...state, lease: leaseOf(msg) } : state;

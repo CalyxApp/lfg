@@ -642,6 +642,8 @@ export type SessionOps = {
   /** Whether the composer shows for this session. */
   canDrive: (session: Session) => boolean;
   send: (sid: string, text: string, mode: "steer" | "queue") => Promise<{ msg?: QueueMsg }>;
+  /** Questions the agent is waiting on in this session, drawn above the composer (Calyx Cloud, L3a). */
+  asks?: (sid: string) => ReactNode;
 };
 
 const SERVER_SESSION_OPS: SessionOps = {
@@ -6669,6 +6671,7 @@ function SessionChat({
       />
 
       <PromptPanel prompt={prompt} sid={sid} onError={onError} />
+      {sid && ops.asks ? ops.asks(sid) : null}
       <QueuePanel queue={queue} sid={sid} messages={messages} />
 
       {error ? (
