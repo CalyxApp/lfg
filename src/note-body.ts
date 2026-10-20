@@ -598,7 +598,32 @@ function insertAfterLine(body: string, lines: Line[], afterLine: number, text: s
   const prev = lines[afterLine];
   const sep = separator(prev.text, text);
   const at = prev.end;
-  return { body: body.slice(0, at) + sep + text + body.slice(at), at: at + sep.length };
+  // Keep the new text apart from what follows too, or a paragraph below would
+  // merge into it (a list below a list stays tight).
+  const next = lines[afterLine + 1];
+  const lastNew = text.split("\n").slice(-1)[0];
+  const gap = next && next.text.trim() && separator(lastNew, next.text) === "\n\n" ? "\n" : "";
+  return { body: body.slice(0, at) + sep + text + gap + body.slice(at), at: at + sep.length };
+}
+
+const RULE_RE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+
+/**
+ * Where a heading's OWN text ends: before its first sub-heading, and before a
+ * divider (`---`) that closes it. "Add to Slide 2" means Slide 2's text — not
+ * after its "### detail" sub-section, and not past the `---` onto Slide 3.
+ * Returns [first line, line after the last] of that text.
+ */
+function ownText(h: Heading, headings: Heading[], lines: Line[], inCode: Set<number>): [number, number] {
+  let end = sectionEndLine(h, headings, lines.length);
+  const sub = headings.find((o) => o.line > h.line && o.line < end);
+  if (sub) end = sub.line;
+  while (end > h.line + 1) {
+    const t = lines[end - 1].text;
+    if (t.trim() && !(RULE_RE.test(t) && !inCode.has(end - 1))) break;
+    end--;
+  }
+  return [h.line + 1, end];
 }
 
 export function editNote(raw: string, edit: BodyEdit): EditResult {
@@ -608,7 +633,14 @@ export function editNote(raw: string, edit: BodyEdit): EditResult {
   const inCode = codeLines(lines);
   const headings = headingsOf(lines, inCode);
   const markers = markersOf(body);
+  // A note written with Windows line endings keeps them; a mixed one is left as is.
+  const crlf = body.includes("\r\n") && !/(^|[^\r])\n/.test(body);
   const done = (next: string, at: number, summary: string): EditResult => {
+    if (crlf) {
+      const head = next.slice(0, at).replace(/\r?\n/g, "\r\n");
+      next = head + next.slice(at).replace(/\r?\n/g, "\r\n");
+      at = head.length;
+    }
     try {
       return { ok: true, text: finish(parts, next), summary, line: lineNumber(parts, at) };
     } catch (e) {
@@ -638,9 +670,9 @@ export function editNote(raw: string, edit: BodyEdit): EditResult {
     if (edit.section) {
       const h = findHeading(headings, edit.section);
       if ("ok" in h) return h;
-      const end = sectionEndLine(h, headings, lines.length);
+      const [start, end] = ownText(h, headings, lines, inCode);
       if (edit.position === "start") {
-        const first = firstContentLine(lines, h.line + 1, end);
+        const first = firstContentLine(lines, start, end);
         if (first !== -1) {
           const line = lines[first];
           if (insideMarker(markers, line.start)) return SPLITS_COMMENT;
@@ -649,7 +681,7 @@ export function editNote(raw: string, edit: BodyEdit): EditResult {
           return done(next, line.start, `Added at the start of the section "${h.text}".`);
         }
       }
-      const lastIn = lastContentLine(lines, h.line + 1, end);
+      const lastIn = lastContentLine(lines, start, end);
       const after = lastIn === -1 ? h.line : lastIn;
       if (insideMarker(markers, lines[after].end)) return SPLITS_COMMENT;
       const r = insertAfterLine(body, lines, after, text);
