@@ -105,9 +105,18 @@ const MAX_ATTACHMENTS = 6;
 // Friendly one-line label for a tool call — "Created project “X”", not raw
 // JSON args (Sam, 2026-07-22: tool calls looked like "a whole bunch of random
 // text"; a successful create should read as exactly that).
-function toolLabel(name: string, args: Record<string, unknown>, ok?: boolean): string {
+function toolLabel(name: string, args: Record<string, unknown>, ok?: boolean, result?: string): string {
   const a = (k: string) => String((args as Record<string, unknown>)[k] ?? "").trim();
   const failed = ok === false;
+  // A write's reply says where it landed (built by the server from the edit itself),
+  // so the chip shows that — not the model's own account of it.
+  let said = "";
+  try {
+    const r = result ? (JSON.parse(result) as { summary?: unknown; message?: unknown }) : null;
+    said = String((failed ? r?.message : r?.summary) ?? "").trim();
+  } catch {
+    /* not JSON */
+  }
   switch (name) {
     case "search":
       return `Searched the vault for “${a("query")}”`;
@@ -127,6 +136,10 @@ function toolLabel(name: string, args: Record<string, unknown>, ok?: boolean): s
       return `${failed ? "Couldn't create" : "Created"} project${a("title") ? ` “${a("title")}”` : ""}`;
     case "update":
       return `${failed ? "Couldn't update" : "Updated"} “${a("name")}”`;
+    case "edit":
+      return `${failed ? "Couldn't edit" : "Edited"} “${a("name")}”${said ? ` — ${said}` : ""}`;
+    case "undo":
+      return failed ? `Couldn't undo${said ? ` — ${said}` : ""}` : said || "Undid my last change";
     default:
       return name.replaceAll("_", " ");
   }
@@ -243,7 +256,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
     setLog((l) => {
       const next = [
         ...l.slice(-60),
-        { role: "tool" as const, text: toolLabel(name, args, ok), ok, tool: { name, args, result, ok } },
+        { role: "tool" as const, text: toolLabel(name, args, ok, result), ok, tool: { name, args, result, ok } },
       ];
       logRef.current = next;
       return next;

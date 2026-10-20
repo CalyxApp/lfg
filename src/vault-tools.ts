@@ -14,9 +14,14 @@
 // the model as function_call_output.
 
 import { scanVault, vaultItems, updateVaultDoc, isVault, type VaultDoc } from "./vault.ts";
-import { listDir, readRepoFile, writeRepoFile, withRepoLock, gitCommitPaths, gitGrep } from "./files.ts";
+import { listDir, readRepoFile, writeRepoFile, withRepoLock, gitCommitPaths, gitGrep, safeResolve } from "./files.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { publishHtmlArtifact, imageArtifactToMessage } from "./artifacts.ts";
+// Every change to a note's TEXT goes through note-body.ts: it keeps the properties
+// block and the inline-comments block byte-identical, the comments block last, and
+// refuses anything else. Never append to a note's raw file text.
+import { appendToBody, editNote, noteBodyText, type BodyEdit } from "./note-body.ts";
+import { recordChange, removeCreatedFile, undoChange } from "./voice-undo.ts";
 
 // ---- Response + value helpers ----
 function json(obj: unknown, init?: ResponseInit) {
@@ -406,10 +411,12 @@ export async function readNote(repoCwd: string, name: string, section?: string):
   const file = await readRepoFile(repoCwd, d.path);
   if (!("content" in file)) return err(400, "note is not readable text");
   const parsed = parseFrontmatter(file.content);
-  const outline = headingsOf(parsed.content);
+  // The writing only — the inline-comments block at the end is Calyx's data, not text.
+  const body = noteBodyText(parsed.content);
+  const outline = headingsOf(body);
 
   if (section?.trim()) {
-    const sec = extractSection(parsed.content, section.trim());
+    const sec = extractSection(body, section.trim());
     if (!sec) {
       return json({
         path: d.path,
@@ -429,7 +436,7 @@ export async function readNote(repoCwd: string, name: string, section?: string):
     type: d.type,
     properties: parsed.properties,
     outline,
-    excerpt: parsed.content.trim().slice(0, 400),
+    excerpt: body.trim().slice(0, 400),
   });
 }
 
@@ -472,6 +479,7 @@ function resolveProjectDir(repoCwd: string, projectRef: unknown): string | null 
 export async function createNote(
   repoCwd: string,
   input: { type?: string; title: string; properties?: Record<string, unknown>; body?: string },
+  sessionId?: string,
 ): Promise<Response> {
   const title = (input.title ?? "").trim();
   if (!title) return err(400, "title required");
@@ -514,7 +522,11 @@ export async function createNote(
       }
       if (!written) throw new Error("could not find a free filename");
       const commit = gitCommitPaths(repoCwd, [written.path], `converse: ${type} — ${title}`);
-      return { path: written.path, commit };
+      const change_id = recordChange({
+        sessionId, repoCwd, path: written.path, title, before: null, after: content,
+        summary: `Created the ${type} "${title}".`,
+      });
+      return { path: written.path, commit, change_id };
     });
     return json({ ok: true, type, ...result });
   } catch (e) {
@@ -541,6 +553,7 @@ export async function createProject(
     tags?: string[];
     body?: string;
   },
+  sessionId?: string,
 ): Promise<Response> {
   const title = (input.title ?? "").trim();
   if (!title) return err(400, "title required");
@@ -550,6 +563,7 @@ export async function createProject(
   try {
     const result = await withRepoLock(repoCwd, async () => {
       let written: { path: string } | null = null;
+      let writtenText = "";
       let projectId = baseSlug;
       for (let n = 1; n <= 20; n++) {
         projectId = n === 1 ? baseSlug : `${baseSlug}-${n}`;
@@ -572,6 +586,7 @@ export async function createProject(
           written = await writeRepoFile(repoCwd, `projects/${projectId}/index.md`, content, {
             createOnly: true,
           });
+          writtenText = content;
           break;
         } catch (e) {
           if (e instanceof Error && e.message.includes("already exists")) continue;
@@ -580,7 +595,11 @@ export async function createProject(
       }
       if (!written) throw new Error("could not find a free project id");
       const commit = gitCommitPaths(repoCwd, [written.path], `converse: project — ${title}`);
-      return { project_id: projectId, path: written.path, commit };
+      const change_id = recordChange({
+        sessionId, repoCwd, path: written.path, title, before: null, after: writtenText,
+        summary: `Created the project "${title}".`,
+      });
+      return { project_id: projectId, path: written.path, commit, change_id };
     });
     return json({ ok: true, ...result });
   } catch (e) {
@@ -631,16 +650,27 @@ export async function webSearch(query: string): Promise<Response> {
   }
 }
 
-/** update — set frontmatter fields (surgical) and/or append to a note's body, committed. */
+async function readText(repoCwd: string, rel: string): Promise<string> {
+  const f = await readRepoFile(repoCwd, rel);
+  if (!("content" in f)) throw new Error("note is not editable text");
+  return f.content;
+}
+
+/**
+ * update — set frontmatter fields (surgical), committed and undoable. Changing the
+ * note's TEXT is `edit`. A legacy `append` (older clients) still works, through
+ * appendToBody, so it lands above the comments block.
+ */
 export async function updateNote(
   repoCwd: string,
   input: { name: string; properties?: Record<string, unknown>; append?: string },
+  sessionId?: string,
 ): Promise<Response> {
   const q = (input.name ?? "").trim();
   if (!q) return err(400, "name required");
   const hasProps = !!input.properties && Object.keys(input.properties).length > 0;
   const hasAppend = !!input.append?.trim();
-  if (!hasProps && !hasAppend) return err(400, "nothing to update (provide properties and/or append)");
+  if (!hasProps && !hasAppend) return err(400, "nothing to update (provide properties; use edit to change the text)");
 
   const resolved = resolveDoc(repoCwd, q);
   if (!resolved.doc) {
@@ -651,22 +681,128 @@ export async function updateNote(
   const label = resolved.doc.title;
   try {
     const result = await withRepoLock(repoCwd, async () => {
+      const before = await readText(repoCwd, rel);
       const changed: string[] = [];
+      const said: string[] = [];
       if (hasProps) {
         await updateVaultDoc(repoCwd, rel, input.properties!);
         changed.push("properties");
+        said.push(`set ${Object.keys(input.properties!).join(", ")}`);
       }
       if (hasAppend) {
-        const f = await readRepoFile(repoCwd, rel);
-        if (!("content" in f)) throw new Error("note is not editable text");
-        const next = `${f.content.replace(/\s*$/, "")}\n\n${input.append!.trim()}\n`;
-        await writeRepoFile(repoCwd, rel, next, { createOnly: false });
+        await writeRepoFile(repoCwd, rel, appendToBody(await readText(repoCwd, rel), input.append!), { createOnly: false });
         changed.push("body");
+        said.push("added text at the end of the note");
       }
+      const after = await readText(repoCwd, rel);
       const commit = gitCommitPaths(repoCwd, [rel], `converse: update ${label}`);
-      return { changed, commit };
+      const summary = `In "${label}": ${said.join(" and ")}.`;
+      const change_id =
+        after !== before ? recordChange({ sessionId, repoCwd, path: rel, title: label, before, after, summary }) : undefined;
+      return { changed, commit, summary, change_id };
     });
     return json({ ok: true, path: rel, ...result });
+  } catch (e) {
+    return err(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * edit — change a note's TEXT: add (under a heading, after quoted words, or at the
+ * end), replace exact words, or delete exact words. Placement and safety are all in
+ * note-body.ts, so the model cannot put text below the comments block, cut through
+ * a comment, or claim a place the text did not go: the reply's `summary` is built
+ * from where the text actually landed.
+ */
+export async function editNoteText(
+  repoCwd: string,
+  input: {
+    name: string;
+    action?: string;
+    text?: string;
+    section?: string;
+    position?: string;
+    after?: string;
+    find?: string;
+  },
+  sessionId?: string,
+): Promise<Response> {
+  const q = (input.name ?? "").trim();
+  if (!q) return err(400, "name required");
+  let edit: BodyEdit;
+  if (input.action === "add") {
+    edit = {
+      action: "add",
+      text: input.text ?? "",
+      section: input.section,
+      after: input.after,
+      position: input.position === "start" ? "start" : "end",
+    };
+  } else if (input.action === "replace") {
+    edit = { action: "replace", find: input.find ?? "", text: input.text ?? "" };
+  } else if (input.action === "delete") {
+    edit = { action: "delete", find: input.find ?? "" };
+  } else {
+    return json({ ok: false, error: "invalid", message: 'action must be "add", "replace" or "delete".' });
+  }
+
+  const resolved = resolveDoc(repoCwd, q);
+  if (!resolved.doc) {
+    if (resolved.candidates?.length) return json({ ambiguous: true, candidates: resolved.candidates });
+    return err(404, `no note found for "${q}"`);
+  }
+  const rel = resolved.doc.path;
+  const label = resolved.doc.title;
+  try {
+    const out = await withRepoLock(repoCwd, async () => {
+      const before = await readText(repoCwd, rel);
+      const r = editNote(before, edit);
+      if (!r.ok) return r;
+      await writeRepoFile(repoCwd, rel, r.text, { createOnly: false });
+      const commit = gitCommitPaths(repoCwd, [rel], `converse: edit ${label}`);
+      const change_id = recordChange({
+        sessionId, repoCwd, path: rel, title: label, before, after: r.text, summary: `${r.summary.replace(/\.$/, "")} in "${label}".`,
+      });
+      return { ...r, commit, change_id };
+    });
+    if (!out.ok) {
+      const { ok: _ok, reason, ...rest } = out;
+      return json({ ok: false, error: reason, path: rel, ...rest });
+    }
+    return json({ ok: true, path: rel, title: label, summary: out.summary, line: out.line, commit: out.commit, change_id: out.change_id });
+  } catch (e) {
+    return err(400, e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** undo — take back one of the assistant's own changes (the latest in this conversation by default). */
+export async function undoVaultChange(repoCwd: string, changeId?: string, sessionId?: string): Promise<Response> {
+  try {
+    const r = await withRepoLock(repoCwd, async () => {
+      const res = await undoChange(
+        { changeId, sessionId, repoCwd },
+        {
+          read: async (rel) => {
+            try {
+              const f = await readRepoFile(repoCwd, rel);
+              return "content" in f ? f.content : null;
+            } catch {
+              return null;
+            }
+          },
+          write: async (rel, text) => {
+            await writeRepoFile(repoCwd, rel, text, { createOnly: false });
+          },
+          remove: async (rel) => removeCreatedFile(await safeResolve(repoCwd, rel)),
+        },
+      );
+      if (!res.ok) return res;
+      const commit = gitCommitPaths(repoCwd, [res.path], `converse: undo — ${res.title}`);
+      return { ...res, commit };
+    });
+    if (!r.ok) return json({ ok: false, error: r.error, message: r.message });
+    const summary = r.deleted ? `Removed "${r.title}", which I had created.` : `Undid: ${r.summary}`;
+    return json({ ok: true, path: r.path, title: r.title, summary, commit: r.commit });
   } catch (e) {
     return err(400, e instanceof Error ? e.message : String(e));
   }
@@ -797,7 +933,7 @@ export const VAULT_TOOL_SCHEMAS = [
     type: "function",
     name: "update",
     description:
-      "Change an existing note: set frontmatter fields (e.g. mark a task done) and/or append text to its body. Preserves everything else the user wrote. Use for 'mark X done', 'set priority high', 'add a note to Y'.",
+      "Set a note's properties (frontmatter fields) — 'mark X done', 'set priority high', 'due Friday'. Preserves everything else. To change the note's TEXT, use edit.",
     parameters: {
       type: "object",
       properties: {
@@ -807,9 +943,43 @@ export const VAULT_TOOL_SCHEMAS = [
           description: "Frontmatter fields to set (e.g. { status: 'done' }). A null value deletes a field.",
           additionalProperties: true,
         },
-        append: { type: "string", description: "Text to append to the note body (markdown)." },
       },
-      required: ["name"],
+      required: ["name", "properties"],
+    },
+  },
+  {
+    type: "function",
+    name: "edit",
+    description:
+      "Change the TEXT of an existing note. action 'add': new text under a heading (section), after the line or paragraph holding words you quote (after), or at the end of the note (neither). action 'replace': swap exact words (find) for new ones (text). action 'delete': remove exact words (find); a bullet left empty goes too. Find places ONLY by heading name or by quoting the note's own words — never by line number. read the note first if you don't know its headings or exact wording. If the reply is not ok (not_found, ambiguous, touches_comment), tell the user plainly and ask — never retry with a guess. When it is ok, say where the change went using the reply's summary.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The note's title, filename, or path." },
+        action: { type: "string", enum: ["add", "replace", "delete"] },
+        text: { type: "string", description: "add: the markdown to add. replace: the new words." },
+        section: { type: "string", description: "add only: the heading to add under, as it appears in the note." },
+        position: {
+          type: "string",
+          enum: ["end", "start"],
+          description: "add with section only: the end of that section (default) or its start.",
+        },
+        after: { type: "string", description: "add only: words quoted from the line or paragraph to add after." },
+        find: { type: "string", description: "replace / delete: the exact existing words, quoted from the note." },
+      },
+      required: ["name", "action"],
+    },
+  },
+  {
+    type: "function",
+    name: "undo",
+    description:
+      "Undo one of YOUR OWN changes to the vault — 'undo that', 'take that back'. With no change_id it undoes your most recent change in this conversation; call it again to step further back. Every create, create_project, update and edit reply carries a change_id. Undo refuses if the note changed since; tell the user so.",
+    parameters: {
+      type: "object",
+      properties: {
+        change_id: { type: "string", description: "Optional. The change_id from the reply of the change to undo." },
+      },
     },
   },
   {
@@ -896,7 +1066,11 @@ export async function runVaultTool(
       case "read":
         return await readNote(repoCwd, String(args.name ?? ""), str(args.section));
       case "create":
-        return await createNote(repoCwd, { type: str(args.type), title: String(args.title ?? ""), properties: obj(args.properties), body: str(args.body) });
+        return await createNote(
+          repoCwd,
+          { type: str(args.type), title: String(args.title ?? ""), properties: obj(args.properties), body: str(args.body) },
+          sessionId,
+        );
       case "web_search":
         return await webSearch(String(args.query ?? ""));
       case "create_project":
@@ -908,9 +1082,29 @@ export async function runVaultTool(
           area: str(args.area),
           tags: Array.isArray(args.tags) ? args.tags.map(String) : undefined,
           body: str(args.body),
-        });
+        }, sessionId);
       case "update":
-        return await updateNote(repoCwd, { name: String(args.name ?? ""), properties: obj(args.properties), append: str(args.append) });
+        return await updateNote(
+          repoCwd,
+          { name: String(args.name ?? ""), properties: obj(args.properties), append: str(args.append) },
+          sessionId,
+        );
+      case "edit":
+        return await editNoteText(
+          repoCwd,
+          {
+            name: String(args.name ?? ""),
+            action: str(args.action),
+            text: typeof args.text === "string" ? args.text : undefined,
+            section: str(args.section),
+            position: str(args.position),
+            after: str(args.after),
+            find: typeof args.find === "string" ? args.find : undefined,
+          },
+          sessionId,
+        );
+      case "undo":
+        return await undoVaultChange(repoCwd, str(args.change_id), sessionId);
       default:
         return err(404, `unknown tool: ${name}`);
     }
