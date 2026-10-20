@@ -176,6 +176,9 @@ describe("roomMessages", () => {
     pi = reduceRoom(pi, waiting)!;
     expect(roomMessages(pi, none).messages.at(-1)?.text).toBe("Waits for MacBook to be back");
     expect(statusLine(roomStatus(pi))).toBe("Paused until MacBook is back");
+    // The same computer online again: not "away" — a message opens the chat there.
+    expect(statusLine(roomStatus(pi, ["MacBook"]))).toBe("Not open on a computer");
+    expect(statusLine(roomStatus(pi, ["Other Mac"]))).toBe("Paused until MacBook is back");
     expect(statusLine(roomStatus(reduceRoom(null, snapshot())))).toBe("Open on MacBook");
   });
 

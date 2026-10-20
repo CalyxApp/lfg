@@ -79,6 +79,7 @@ export function useCloudChats(vaultId: string) {
   const [hub, setHub] = useState<HubState>(EMPTY_HUB);
   const [hubOpen, setHubOpen] = useState(false);
   const roomsRef = useRef(new Map<string, Room>());
+  const onlineKeyRef = useRef("");
   const [version, setVersion] = useState(0);
   const bump = useCallback(() => setVersion((v) => v + 1), []);
 
@@ -203,8 +204,15 @@ export function useCloudChats(vaultId: string) {
     const loadingBySid: Record<string, boolean> = {};
     const asksBySid: Record<string, ChatAskView[]> = {};
     const askInfoBySid: Record<string, ChatAskInfo> = {};
+    // Which computers are online changes the wording ("Paused until … is back"), so a change redraws every chat.
+    const online = hub.online.map((o) => o.label);
+    const onlineKey = online.join("\n");
+    if (onlineKey !== onlineKeyRef.current) {
+      onlineKeyRef.current = onlineKey;
+      for (const room of roomsRef.current.values()) room.view = null;
+    }
     for (const [id, room] of roomsRef.current) {
-      room.view ??= roomMessages(room.state, room.sending);
+      room.view ??= roomMessages(room.state, room.sending, online);
       messagesBySid[id] = room.view.messages;
       busyBySid[id] = room.view.busy;
       loadingBySid[id] = !room.state;
@@ -216,7 +224,7 @@ export function useCloudChats(vaultId: string) {
         busy: answering.has(ask.id),
         error: room.askErrors.get(ask.id) ?? null,
       }));
-      const status = roomStatus(room.state);
+      const status = roomStatus(room.state, online);
       askInfoBySid[id] = {
         title: room.state?.title ?? "",
         computer: status.kind === "none" ? (room.state?.lease?.lastLabel ?? null) : status.label,
@@ -226,7 +234,7 @@ export function useCloudChats(vaultId: string) {
     const sessions: Session[] = listed.map((s) => {
       const state = roomsRef.current.get(s.sessionId ?? "")?.state;
       if (!state) return s;
-      const status = roomStatus(state);
+      const status = roomStatus(state, online);
       return {
         ...s,
         title: state.title || s.title,
@@ -240,7 +248,7 @@ export function useCloudChats(vaultId: string) {
     });
     return { sessions, messagesBySid, busyBySid, loadingBySid, asksBySid, askInfoBySid };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version, listed]);
+  }, [version, listed, hub.online]);
 
   const ops: SessionOps = useMemo(
     () => ({

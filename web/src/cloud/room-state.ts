@@ -231,11 +231,15 @@ export type RoomStatus =
   | { kind: "paused"; label: string }
   | { kind: "none" };
 
-export function roomStatus(state: RoomState | null): RoomStatus {
+/** `online`: the labels of the computers online now (the hub's presence). */
+export function roomStatus(state: RoomState | null, online: readonly string[] = []): RoomStatus {
   const lease = state?.lease;
   if (lease?.live && lease.holder) return { kind: "live", label: lease.holder.label };
   // A Pi chat lives on the computer that ran it: nobody else can carry it on yet (phase 2, S6b).
-  if (state?.engine === "pi-durable" && lease?.lastLabel) return { kind: "paused", label: lease.lastLabel };
+  // That computer online again is not "away": a message opens the chat there.
+  if (state?.engine === "pi-durable" && lease?.lastLabel && !online.includes(lease.lastLabel)) {
+    return { kind: "paused", label: lease.lastLabel };
+  }
   return { kind: "none" };
 }
 
@@ -266,6 +270,7 @@ const note = (id: string, text: string, ts?: number): Message => ({ id, role: "s
 export function roomMessages(
   state: RoomState | null,
   sending: ReadonlyMap<string, Sending>,
+  online: readonly string[] = [],
 ): { messages: Message[]; busy: boolean } {
   const out: Message[] = [];
   if (!state) {
@@ -313,7 +318,7 @@ export function roomMessages(
 
   // Messages the room holds that have not started, then ones still on their way.
   const started = new Set(turns.map((t) => t.requestId));
-  const status = roomStatus(state);
+  const status = roomStatus(state, online);
   const who = status.kind === "live" ? status.label : null;
   for (const item of state.inbox) {
     // Started: shown by the history or the live turn (a history pushed mid-turn clears its start from the tail).
