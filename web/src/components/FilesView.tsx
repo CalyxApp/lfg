@@ -6,6 +6,7 @@
 // Controlled: the parent (VaultView) owns which repo is open; this pane owns
 // navigation inside it. `openPath` lets sibling panes (Tasks) deep-link a file.
 
+import { backend } from "@/lib/backend";
 import { useCallback, useEffect, useState } from "react";
 import {
   ArrowLeft,
@@ -205,7 +206,7 @@ export function FilesView({
 
   const crumbs = dir ? dir.split("/") : [];
   const rawUrl = file
-    ? `/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(file.path)}`
+    ? backend.assetUrl(`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(file.path)}`)
     : "";
   const editable = !!file && !file.raw && !file.binary && !file.tooLarge;
   const isMd = !!file && MD_RE.test(file.path);
@@ -437,7 +438,7 @@ export function FilesView({
       {htmlView ? (
         <HtmlViewerOverlay
           title={htmlView.split("/").pop()?.replace(/\.html?$/i, "") || htmlView}
-          src={`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(htmlView)}`}
+          src={backend.assetUrl(`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(htmlView)}`)}
           onClose={() => setHtmlView(null)}
         />
       ) : null}
@@ -480,7 +481,7 @@ function MarkdownDoc({ source, editProps }: { source: string; editProps?: Markdo
         updates: { [editingField]: fieldValue.trim() || null },
       });
       // Reload the file to get the updated frontmatter.
-      const fresh = await fetch(
+      const fresh = await backend.fetch(
         `/api/repos/file?repo=${encodeURIComponent(editProps.repo)}&path=${encodeURIComponent(editProps.filePath)}`,
       ).then((r) => r.json() as Promise<{ content?: string }>);
       if (fresh.content != null) editProps.onSaved(fresh.content);

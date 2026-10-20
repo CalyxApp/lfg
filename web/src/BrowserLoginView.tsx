@@ -1,3 +1,4 @@
+import { backend } from "@/lib/backend";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ClipboardPaste, CornerDownLeft, Delete, Loader2, RotateCcw, Save, X } from "lucide-react";
 import { toast } from "sonner";
@@ -69,11 +70,7 @@ export default function BrowserLoginView(props: {
   // --- WebSocket lifecycle ---------------------------------------------------
   useLayoutEffect(() => {
     let disposed = false;
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${location.host}/api/browser/sessions/${encodeURIComponent(
-      sessionId,
-    )}/stream`;
-    const ws = new WebSocket(url);
+    const ws = backend.openSocket(`/api/browser/sessions/${encodeURIComponent(sessionId)}/stream`);
     wsRef.current = ws;
     setConn("connecting");
 

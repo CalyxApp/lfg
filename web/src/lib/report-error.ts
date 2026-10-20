@@ -14,6 +14,8 @@
 // is no build id — Vite/HMR errors are transient and the person editing already
 // sees them — so we stay quiet and just log.
 
+import { backend } from "@/lib/backend";
+
 // The hashed entry chunk this document loaded, e.g. "index-ab12cd.js". Present
 // only in a production `vite build`; null under dev/HMR. Mirrors main.tsx.
 const BUILD_ID =
@@ -137,6 +139,8 @@ export function reportError(r: Report): void {
     if (sent.has(key)) return;
     sent.add(key);
     count++;
+    // Calyx Cloud has nowhere to send it (the stale-chunk recovery above still runs).
+    if (!backend.capabilities.errorReporting) return;
 
     const body = {
       ...r,
@@ -146,7 +150,7 @@ export function reportError(r: Report): void {
     };
     // Fire-and-forget. keepalive lets it survive a navigation/reload triggered
     // by the error. Any failure is swallowed — never re-enter the handlers.
-    void fetch("/api/client-error", {
+    void backend.fetch("/api/client-error", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

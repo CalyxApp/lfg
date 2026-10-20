@@ -5,6 +5,7 @@
 // It asks the server who it is (/v1/me) instead. L2 replaces the plain chat
 // list below with LFG's own chat screens.
 
+import { backend } from "@/lib/backend";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MessagesSquare, Smartphone } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -21,7 +22,7 @@ type State =
   | { kind: "paired"; vaultId: string; expiresAt: number; chats: Chat[] | null };
 
 async function call(path: string, body?: unknown): Promise<{ status: number; data: any }> {
-  const res = await fetch(path, {
+  const res = await backend.fetch(path, {
     method: body === undefined ? "GET" : "POST",
     credentials: "same-origin",
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },

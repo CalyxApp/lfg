@@ -6,6 +6,7 @@
 // Stacks above the report overlay (z-[110]); its own X/Escape returns to the
 // report. Resolved against the primary repo (repo prop, e.g. PlatosRaveCave).
 
+import { backend } from "@/lib/backend";
 import { useEffect, useState, type ReactNode } from "react";
 import { ExternalLink, Loader2, X } from "lucide-react";
 import { Streamdown } from "streamdown";
@@ -111,7 +112,7 @@ export function VaultFileOverlay({
   const needsContent = !isHtml && !isImg && !isPdf;
 
   const title = (resolved.split("/").pop() || resolved).replace(/\.mdx?$/i, "");
-  const rawUrl = `/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(resolved)}`;
+  const rawUrl = backend.assetUrl(`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(resolved)}`);
 
   const [state, setState] = useState<{ loading: boolean; error?: string; file?: FileResult }>({
     loading: needsContent,

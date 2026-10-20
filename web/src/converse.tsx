@@ -16,6 +16,7 @@
 // On close with any turns: review step (title + properties, editable) → save to
 // the workspace vault as an `ai-voice-conversation` note (unchanged).
 
+import { backend } from "@/lib/backend";
 import { useEffect, useRef, useState } from "react";
 import {
   ArrowUp,
@@ -323,7 +324,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
   }
   async function uploadFile(id: string, f: File) {
     try {
-      const res = await fetch(`/api/voice/rt/upload-file?filename=${encodeURIComponent(f.name)}`, {
+      const res = await backend.fetch(`/api/voice/rt/upload-file?filename=${encodeURIComponent(f.name)}`, {
         method: "POST",
         headers: { "Content-Type": f.type || "application/octet-stream" },
         body: f,
@@ -408,7 +409,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
     const events = logBufRef.current;
     logBufRef.current = [];
     // fire-and-forget; keepalive lets it survive the surface closing
-    void fetch("/api/voice/rt/log", {
+    void backend.fetch("/api/voice/rt/log", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ sessionId: sid, events }),
@@ -474,7 +475,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
   // which chat model powers typed turns (selection persists server-side)
   useEffect(() => {
-    fetch("/api/chat/config")
+    backend.fetch("/api/chat/config")
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => j && setCfg(j as ChatConfig))
       .catch(() => {
@@ -484,7 +485,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
   async function updateChatConfig(patch: { provider?: string; model?: string }) {
     try {
-      const res = await fetch("/api/chat/config", {
+      const res = await backend.fetch("/api/chat/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
@@ -540,7 +541,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
     setSending(true);
     setError(null);
     try {
-      const res = await fetch("/api/voice/rt/chat", {
+      const res = await backend.fetch("/api/voice/rt/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages, sessionId: ensureArtifactSid() }),
@@ -643,7 +644,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
     startWorking(); // subtle "something's happening" heartbeat while the tool runs
     let output: string;
     try {
-      const res = await fetch(`/api/voice/rt/tools/${name}`, {
+      const res = await backend.fetch(`/api/voice/rt/tools/${name}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ args, sessionId: ensureArtifactSid() }),
@@ -761,7 +762,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
           await Promise.all(
             toExtract.map(async (f) => {
               try {
-                const r = await fetch("/api/voice/rt/file-text", {
+                const r = await backend.fetch("/api/voice/rt/file-text", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({ file_id: f.fileId }),
@@ -774,7 +775,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
           );
           if (cancelled) return;
         }
-        const tokenRes = await fetch(`/api/voice/rt/token?user=${encodeURIComponent(user)}`, { method: "POST" });
+        const tokenRes = await backend.fetch(`/api/voice/rt/token?user=${encodeURIComponent(user)}`, { method: "POST" });
         if (!tokenRes.ok) throw new Error(`token ${tokenRes.status}: ${await tokenRes.text()}`);
         const { value: ephemeralKey } = (await tokenRes.json()) as { value: string };
         if (!ephemeralKey) throw new Error("no ephemeral token returned");
@@ -860,7 +861,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
           if (ctxTimerRef.current) clearInterval(ctxTimerRef.current);
           ctxTimerRef.current = setInterval(() => {
             const u = localStorage.getItem("lfg_user") || "anon";
-            void fetch(`/api/voice/rt/instructions?user=${encodeURIComponent(u)}`)
+            void backend.fetch(`/api/voice/rt/instructions?user=${encodeURIComponent(u)}`)
               .then((r) => (r.ok ? r.json() : null))
               .then((j) => {
                 const d = dcRef.current;
@@ -981,7 +982,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
     const sig = `${rec.turns.length}:${body.length}`;
     if (sig === lastSavedRef.current && !leaving) return;
     try {
-      const res = await fetch("/api/converse/conversations", {
+      const res = await backend.fetch("/api/converse/conversations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
@@ -1036,7 +1037,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
       const props = Object.fromEntries(
         properties.filter((p) => p.key.trim()).map((p) => [p.key.trim(), p.value]),
       );
-      const res = await fetch("/api/voice/rt/save-conversation", {
+      const res = await backend.fetch("/api/voice/rt/save-conversation", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ title: title.trim(), tags, properties: props, transcript: buildTranscript() }),

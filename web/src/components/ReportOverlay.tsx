@@ -5,6 +5,7 @@
 // file. While a file is open the report's Escape is suppressed so a single back
 // gesture pops the file first, then the report.
 
+import { backend } from "@/lib/backend";
 import { useEffect, useState } from "react";
 import { HtmlViewerOverlay } from "./HtmlViewerOverlay";
 import { VaultFileOverlay } from "./VaultFileOverlay";
@@ -35,7 +36,7 @@ export function ReportOverlay({
     <>
       <HtmlViewerOverlay
         title={report.title}
-        src={report.url}
+        src={backend.assetUrl(report.url)}
         onClose={onClose}
         escEnabled={!vaultPath}
       />

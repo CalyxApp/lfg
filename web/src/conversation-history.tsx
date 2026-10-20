@@ -3,6 +3,7 @@
 // conversations contract (see docs/converse-universal-view.md). Renders turns with
 // the shared <ConversationTurns> so it matches the live thread exactly.
 
+import { backend } from "@/lib/backend";
 import { useEffect, useState } from "react";
 import { ArrowLeft, X } from "lucide-react";
 import { ConversationTurns, type ConversationTurn } from "./components/conversation-turns";
@@ -24,7 +25,7 @@ export function ConversationHistory({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/converse/conversations")
+    backend.fetch("/api/converse/conversations")
       .then((r) => (r.ok ? r.json() : []))
       .then((j) => setList(j as Summary[]))
       .catch(() => {
@@ -36,7 +37,7 @@ export function ConversationHistory({ onClose }: { onClose: () => void }) {
   async function openOne(id: string) {
     setError(null);
     try {
-      const r = await fetch(`/api/converse/conversations/${encodeURIComponent(id)}`);
+      const r = await backend.fetch(`/api/converse/conversations/${encodeURIComponent(id)}`);
       if (!r.ok) throw new Error();
       setOpen((await r.json()) as Record);
     } catch {

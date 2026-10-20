@@ -2,6 +2,7 @@
 // VT engine compiled to WASM) bridged over a websocket to a persistent tmux
 // shell on the box. ghostty-web renders Claude Code's heavy TUI faithfully where
 // xterm.js mangles it, which is the case we mostly care about here.
+import { backend } from "@/lib/backend";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { TouchEvent as ReactTouchEvent } from "react";
 import { init, Terminal as GhosttyTerminal, FitAddon } from "ghostty-web";
@@ -375,11 +376,9 @@ export function TermView() {
     // makes a deploy non-destructive instead of wiping the terminal.
     const connect = () => {
       if (disposed || !term) return;
-      const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      const url = `${proto}//${location.host}/api/term?session=${encodeURIComponent(
-        TERM_SESSION,
-      )}&cols=${term.cols}&rows=${term.rows}`;
-      const ws = new WebSocket(url);
+      const ws = backend.openSocket(
+        `/api/term?session=${encodeURIComponent(TERM_SESSION)}&cols=${term.cols}&rows=${term.rows}`,
+      );
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
@@ -475,7 +474,7 @@ export function TermView() {
     let alive = true;
     const poll = async () => {
       try {
-        const r = await fetch(`/api/term/scan?session=${TERM_SESSION}`);
+        const r = await backend.fetch(`/api/term/scan?session=${TERM_SESSION}`);
         const d = await r.json();
         if (alive && Array.isArray(d.urls) && d.urls.length)
           setLinks((prev) => mergeUrls(prev, d.urls));

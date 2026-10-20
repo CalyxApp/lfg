@@ -1,3 +1,4 @@
+import { backend } from "@/lib/backend";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Room } from "livekit-client";
 import { Phone } from "lucide-react";
@@ -116,7 +117,7 @@ export function VoiceOrb({
     setAgentState("thinking");
     flash("Connecting…");
     try {
-      const res = await fetch("/api/livekit/token");
+      const res = await backend.fetch("/api/livekit/token");
       if (!res.ok) throw new Error(`token ${res.status}`);
       const { url, token } = (await res.json()) as { url: string; token: string };
 

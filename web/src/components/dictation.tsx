@@ -6,6 +6,7 @@
 // Behavior must stay identical for the existing App.tsx call sites; change it
 // here and every mic surface changes together.
 
+import { backend } from "@/lib/backend";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { ArrowUp, Check, Loader2, Mic, X } from "lucide-react";
@@ -355,7 +356,7 @@ export function useDictation(opts: {
         offset += c.length;
       }
       try {
-        const res = await fetch("/api/voice/stt", {
+        const res = await backend.fetch("/api/voice/stt", {
           method: "POST",
           headers: { "Content-Type": "application/octet-stream" },
           body: floatToWav(merged, s.rate),
@@ -418,10 +419,9 @@ export function useDictation(opts: {
       // Realtime-STT socket: stream resampled PCM up, receive {partial,final}
       // transcripts back. Built before capture starts so the first frame has
       // somewhere to go (queued in `pending` until the socket opens).
-      const proto = location.protocol === "https:" ? "wss:" : "ws:";
       let ws: WebSocket | null = null;
       try {
-        ws = new WebSocket(`${proto}//${location.host}/api/voice/stt-stream`);
+        ws = backend.openSocket("/api/voice/stt-stream");
         ws.binaryType = "arraybuffer";
       } catch {
         ws = null;
