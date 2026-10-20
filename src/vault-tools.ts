@@ -412,7 +412,9 @@ export async function readNote(repoCwd: string, name: string, section?: string):
   if (!("content" in file)) return err(400, "note is not readable text");
   const parsed = parseFrontmatter(file.content);
   // The writing only — the inline-comments block at the end is Calyx's data, not text.
-  const body = noteBodyText(parsed.content);
+  // From the whole file, the same split `edit` uses: running it on parsed.content
+  // would strip properties twice and hide a body that opens with a `---` rule.
+  const body = noteBodyText(file.content);
   const outline = headingsOf(body);
 
   if (section?.trim()) {

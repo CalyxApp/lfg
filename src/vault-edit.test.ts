@@ -104,6 +104,16 @@ describe("read", () => {
     const r = await tool("read", { name: REL, section: "Team" });
     expect(r.section.text).not.toContain("comments:");
   });
+
+  test("a deck whose writing opens with a --- rule keeps its first slide", async () => {
+    // Properties are stripped once. Stripping again took "---\n## Slide 1…---"
+    // for a second properties block and hid the slide.
+    const deck = "projects/fundraise/deck.md";
+    writeFileSync(join(vault, deck), "---\ntitle: Deck\n---\n---\n## Slide 1\nFirst words\n---\n## Slide 2\nSecond\n");
+    const r = await tool("read", { name: deck });
+    expect(r.outline.map((h: { text: string }) => h.text)).toEqual(["Slide 1", "Slide 2"]);
+    expect((await tool("read", { name: deck, section: "Slide 1" })).section.text).toContain("First words");
+  });
 });
 
 describe("undo", () => {

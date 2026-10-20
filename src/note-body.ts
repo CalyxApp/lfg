@@ -183,7 +183,8 @@ function linesOf(body: string): Line[] {
   return out;
 }
 
-const HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$/;
+// A closing run of `#` counts only after a space (CommonMark): "## Learn C#" is "Learn C#".
+const HEADING_RE = /^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/;
 const LIST_RE = /^\s*([-*+]|\d+[.)])\s/;
 const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 
@@ -216,7 +217,8 @@ function headingsOf(lines: Line[], inCode: Set<number>): Heading[] {
   for (let i = 0; i < lines.length; i++) {
     if (inCode.has(i)) continue;
     const m = HEADING_RE.exec(lines[i].text);
-    if (m && m[2].trim()) out.push({ level: m[1].length, text: m[2].trim(), line: i });
+    const text = m ? m[2].trim() : "";
+    if (m && text && !/^#+$/.test(text)) out.push({ level: m[1].length, text, line: i });
   }
   return out;
 }
@@ -244,6 +246,22 @@ function withoutNumbering(s: string): string {
   return s.replace(/^\d+(\.\d+)*[.)]?\s*/, "");
 }
 
+/** `needle` appears in `hay` as whole words: "slide 1" is in "slide 1 — cover",
+ *  not in "slide 10 — theory". */
+function hasWords(hay: string, needle: string): boolean {
+  const word = /[\p{L}\p{N}]/u;
+  let at = hay.indexOf(needle);
+  while (at !== -1) {
+    const before = hay[at - 1] ?? "";
+    const after = hay[at + needle.length] ?? "";
+    const startsOk = !word.test(needle[0]) || !word.test(before);
+    const endsOk = !word.test(needle[needle.length - 1]) || !word.test(after);
+    if (startsOk && endsOk) return true;
+    at = hay.indexOf(needle, at + 1);
+  }
+  return false;
+}
+
 function findHeading(headings: Heading[], wanted: string): Heading | EditFailure {
   const w = normHeading(wanted);
   const wBare = withoutNumbering(w);
@@ -257,7 +275,7 @@ function findHeading(headings: Heading[], wanted: string): Heading | EditFailure
     ? exact
     : headings.filter((h) => {
         const n = withoutNumbering(normHeading(h.text));
-        return wBare.length >= 3 && n.length >= 3 && (n.includes(wBare) || wBare.includes(n));
+        return wBare.length >= 3 && n.length >= 3 && (hasWords(n, wBare) || hasWords(wBare, n));
       });
   if (pick.length === 1) return pick[0];
   if (pick.length > 1) {
@@ -387,9 +405,78 @@ function locate(body: string, markers: Marker[], quote: string): Found[] | EditF
     const visFrom = n.map[at];
     const visTo = n.map[at + q.length - 1] + 1;
     hits.push({ from: vis.map[visFrom], to: vis.map[visTo - 1] + 1 });
-    at = n.text.indexOf(q, at + q.length);
+    // +1, not +q.length: "ha ha" sits in "ha ha ha" twice, so it is ambiguous.
+    at = n.text.indexOf(q, at + 1);
   }
   return hits;
+}
+
+// ── formatting marks ────────────────────────────────────────────────────────
+
+/** `*` and `` ` `` are always marks; `_` only outside a word (snake_case is text). */
+function isMark(s: string, i: number): boolean {
+  const c = s[i];
+  if (c === "*" || c === "`") return true;
+  if (c !== "_") return false;
+  const word = /[\p{L}\p{N}]/u;
+  return !(word.test(s[i - 1] ?? "") && word.test(s[i + 1] ?? ""));
+}
+
+/** Length of the run of mark `c` that ends just before `at`. */
+function runBefore(s: string, at: number, c: string): number {
+  let i = at;
+  while (i > 0 && s[i - 1] === c && isMark(s, i - 1)) i--;
+  return at - i;
+}
+
+/** Length of the run of mark `c` that starts at `at`. */
+function runAfter(s: string, at: number, c: string): number {
+  let i = at;
+  while (i < s.length && s[i] === c && isMark(s, i)) i++;
+  return i - at;
+}
+
+/** How many runs of mark `c` lie inside [from, to). */
+function runsOf(s: string, from: number, to: number, c: string): number {
+  let n = 0;
+  for (let i = from; i < to; i++) {
+    if (s[i] === c && isMark(s, i) && !(i > from && s[i - 1] === c)) n++;
+  }
+  return n;
+}
+
+/**
+ * Quotes match without `*` `_` `` ` `` (see normalise), so a hit can start or
+ * end between a formatting mark and its partner. Changed as is, that leaves a
+ * stray `**`, which bolds the rest of the line. So widen the hit:
+ *   1. over marks the quote itself starts or ends with ("**Eyebrow:** The moment");
+ *   2. over the partner of a mark the hit holds without its pair;
+ *   3. for a delete, over a pair it would leave empty ("**this**").
+ * A hit with no marks in it, quoted with none, is left alone: changing a word
+ * inside bold keeps the bold.
+ */
+function widenOverMarks(body: string, hit: Found, quote: string, deleting: boolean): Found {
+  let { from, to } = hit;
+  const q = quote.trim();
+  for (const c of ["*", "_", "`"]) {
+    const lead = runAfter(q, 0, c);
+    if (lead) from -= Math.min(lead, runBefore(body, from, c));
+    const trail = runBefore(q, q.length, c);
+    if (trail) to += Math.min(trail, runAfter(body, to, c));
+    if (runsOf(body, from, to, c) % 2 === 1) {
+      const before = runBefore(body, from, c);
+      if (before) from -= before;
+      else to += runAfter(body, to, c);
+    }
+  }
+  while (deleting && from > 0 && "*_`".includes(body[from - 1])) {
+    const c = body[from - 1];
+    const before = runBefore(body, from, c);
+    if (!before || before !== runAfter(body, to, c)) break;
+    from -= before;
+    to += before;
+  }
+  return { from, to };
 }
 
 function excerpt(s: string, max = 60): string {
@@ -589,7 +676,7 @@ export function editNote(raw: string, edit: BodyEdit): EditResult {
     const hits = locate(body, markers, find);
     if (!Array.isArray(hits)) return hits;
     if (hits.length !== 1) return failWhere(lines, find, hits);
-    const { from, to } = hits[0];
+    const { from, to } = widenOverMarks(body, hits[0], find, edit.action === "delete");
     const replacement = edit.action === "replace" ? (edit.text ?? "").replace(/\r/g, "").replace(/\n+$/, "") : "";
     if (edit.action === "replace" && !replacement.trim()) {
       return { ok: false, reason: "invalid", message: "Replace needs new text. To remove words, use delete." };
@@ -611,7 +698,7 @@ export function editNote(raw: string, edit: BodyEdit): EditResult {
     let lineEnd = next.indexOf("\n", from);
     if (lineEnd === -1) lineEnd = next.length;
     const left = next.slice(lineStart, lineEnd);
-    if (/^\s*([-*+]|\d+[.)])?\s*$/.test(left)) {
+    if (/^\s*(([-*+]|\d+[.)])([ \t]+\[[ xX]\])?)?\s*$/.test(left)) {
       next = next.slice(0, lineStart) + next.slice(Math.min(lineEnd + 1, next.length));
       next = next.replace(/\n{3,}/g, (m, idx: number) => (idx <= lineStart && idx + m.length >= lineStart ? "\n\n" : m));
     } else {
