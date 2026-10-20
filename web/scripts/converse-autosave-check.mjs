@@ -5,7 +5,7 @@
 //   node web/scripts/converse-autosave-check.mjs        # CHROMIUM=<path> to pick a browser
 //
 // Fails (exit 1) unless, WITHOUT the close button:
-//   - a typed chat longer than the 60-entry screen window is saved whole, each turn once;
+//   - a typed chat (with a tool call) longer than the 60-entry screen window is saved whole, each turn once;
 //   - a voice chat (placeholder, streamed reply, late user transcript) is saved, each turn once;
 //   - hiding the page posts a save.
 import { dirname, join } from "node:path";
@@ -65,7 +65,11 @@ async function openConverse() {
       return r.fulfill({
         json: { settings: { provider: "openai", model: "m" }, providers: [{ id: "openai", label: "OpenAI", models: ["m"] }] },
       });
-    if (p === "/api/voice/rt/chat") return r.fulfill({ json: { text: `Reply ${++replies}.` } });
+    if (p === "/api/voice/rt/chat") {
+      const n = ++replies;
+      const toolCalls = n === 1 ? [{ name: "search", args: { query: "pitch" }, ok: true, result: "{}" }] : [];
+      return r.fulfill({ json: { text: `Reply ${n}.`, toolCalls } });
+    }
     if (p === "/api/voice/rt/token") return r.fulfill({ json: { value: "ek" } });
     return r.fulfill({ json: {} });
   });
@@ -99,7 +103,7 @@ try {
       await page.locator("textarea").fill(`Question ${i}`);
       await page.locator('button[aria-label="Send"]').click();
       await page.getByText(`Reply ${i}.`).first().waitFor({ timeout: 10_000 });
-      want.push(`you:Question ${i}`, `assistant:Reply ${i}.`);
+      want.push(`you:Question ${i}`, ...(i === 1 ? ["tool:Searched the vault for “pitch”"] : []), `assistant:Reply ${i}.`);
     }
     await page.waitForTimeout(2_000); // past the 1.5 s save delay
     const n = saves.length;

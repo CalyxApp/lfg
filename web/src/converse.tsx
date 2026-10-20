@@ -196,46 +196,50 @@ export function Converse({ onClose }: { onClose: () => void }) {
   // The on-screen log keeps the last ~60 entries (it is also the typed model's
   // context). Saving needs the WHOLE chat, so every entry is also kept here, by a
   // stable key, in the order it first appeared. Every log update goes through
-  // remember(). A new entry gets its key from newKey() OUTSIDE the setLog
-  // updater: React runs an updater twice in StrictMode (and when it replays
-  // queued updates), and a key made inside it would save the turn twice.
+  // remember().
   const fullRef = useRef<Map<number, LogEntry>>(new Map());
   const keyRef = useRef(0);
   const newKey = () => ++keyRef.current;
   function remember(next: LogEntry[]) {
     logRef.current = next;
     for (const e of next) {
-      if (e.k === undefined) e.k = newKey(); // fallback only; see above
+      if (e.k === undefined) e.k = newKey(); // fallback only — see addToLog()
       fullRef.current.set(e.k, e);
     }
   }
 
-  const append = (role: LogEntry["role"], text: string, ok?: boolean) => {
-    const entry: LogEntry = { role, text, ok, k: newKey() };
+  // setLog for an update that adds ONE new entry at the end. The entry's key is
+  // made here, OUTSIDE the updater: React runs an updater twice in StrictMode (and
+  // again when it replays queued updates), and a key made inside it would save
+  // the turn twice.
+  function addToLog(update: (l: LogEntry[]) => LogEntry[]) {
+    const k = newKey();
     setLog((l) => {
-      const next = [...l.slice(-60), entry];
+      const next = update(l);
+      next[next.length - 1].k = k;
       remember(next);
       return next;
     });
-  };
+  }
+
+  const append = (role: LogEntry["role"], text: string, ok?: boolean) =>
+    addToLog((l) => [...l.slice(-60), { role, text, ok }]);
 
   const appendUser = (
     text: string,
     images?: string[],
     fileData?: { name: string; fileId?: string; text?: string }[],
-  ) => {
-    const entry: LogEntry = { role: "you", text, k: newKey() };
-    if (images && images.length) entry.images = images;
-    if (fileData && fileData.length) {
-      entry.fileData = fileData;
-      entry.files = fileData.map((f) => f.name);
-    }
-    setLog((l) => {
+  ) =>
+    addToLog((l) => {
+      const entry: LogEntry = { role: "you", text };
+      if (images && images.length) entry.images = images;
+      if (fileData && fileData.length) {
+        entry.fileData = fileData;
+        entry.files = fileData.map((f) => f.name);
+      }
       const next = [...l.slice(-60), entry];
-      remember(next);
       return next;
     });
-  };
 
   // Build the prior-turn chat history as rich content so typed chat re-references
   // earlier uploads (images + files) later in the conversation and across a
@@ -260,24 +264,21 @@ export function Converse({ onClose }: { onClose: () => void }) {
 
   // Tool row carrying the full call detail (name/args/result) so the chip can
   // expand to a preview. `label` stays the friendly one-liner from toolLabel().
-  const appendTool = (name: string, args: Record<string, unknown>, ok: boolean | undefined, result?: string) => {
-    const entry: LogEntry = { role: "tool", text: toolLabel(name, args, ok), ok, tool: { name, args, result, ok }, k: newKey() };
-    setLog((l) => {
-      const next = [...l.slice(-60), entry];
-      remember(next);
+  const appendTool = (name: string, args: Record<string, unknown>, ok: boolean | undefined, result?: string) =>
+    addToLog((l) => {
+      const next = [
+        ...l.slice(-60),
+        { role: "tool" as const, text: toolLabel(name, args, ok), ok, tool: { name, args, result, ok } },
+      ];
       return next;
     });
-  };
 
   // An artifact a tool just published (publish_html) → inline card in the thread.
-  const appendArtifact = (artifact: ArtifactMsg) => {
-    const entry: LogEntry = { role: "assistant", text: "", artifact, k: newKey() };
-    setLog((l) => {
-      const next = [...l.slice(-60), entry];
-      remember(next);
+  const appendArtifact = (artifact: ArtifactMsg) =>
+    addToLog((l) => {
+      const next = [...l.slice(-60), { role: "assistant" as const, text: "", artifact }];
       return next;
     });
-  };
 
   // Insert-or-update a voice turn by realtime item id. Lets speech placeholders
   // and streaming transcript deltas update one entry in place, in the position
