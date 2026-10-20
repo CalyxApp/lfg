@@ -11,7 +11,8 @@ import { join } from "node:path";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { PATHS } from "./config.ts";
 
-const DIR = join(PATHS.data, "converse-conversations");
+// LFG_CONVERSE_DIR lets tests use a scratch folder.
+const dir = () => process.env.LFG_CONVERSE_DIR || join(PATHS.data, "converse-conversations");
 
 export type ConversationTurn = {
   role: "you" | "assistant" | "tool" | "system";
@@ -47,22 +48,22 @@ function safeId(id: string): string {
 
 /** Persist (or overwrite) one conversation record. */
 export async function saveConversationRecord(rec: ConversationRecord): Promise<void> {
-  await mkdir(DIR, { recursive: true });
-  await writeFile(join(DIR, `${safeId(rec.id)}.json`), JSON.stringify(rec), "utf8");
+  await mkdir(dir(), { recursive: true });
+  await writeFile(join(dir(), `${safeId(rec.id)}.json`), JSON.stringify(rec), "utf8");
 }
 
 /** List conversation summaries, newest first. Best-effort: skips unreadable files. */
 export async function listConversationSummaries(): Promise<ConversationSummary[]> {
   let files: string[];
   try {
-    files = (await readdir(DIR)).filter((f) => f.endsWith(".json"));
+    files = (await readdir(dir())).filter((f) => f.endsWith(".json"));
   } catch {
     return []; // dir doesn't exist yet → no conversations
   }
   const out: ConversationSummary[] = [];
   for (const f of files) {
     try {
-      const rec = JSON.parse(await readFile(join(DIR, f), "utf8")) as ConversationRecord;
+      const rec = JSON.parse(await readFile(join(dir(), f), "utf8")) as ConversationRecord;
       out.push({
         id: rec.id,
         title: rec.title,
@@ -82,7 +83,7 @@ export async function listConversationSummaries(): Promise<ConversationSummary[]
 /** Fetch one full record by id, or null if missing/unreadable. */
 export async function getConversationRecord(id: string): Promise<ConversationRecord | null> {
   try {
-    return JSON.parse(await readFile(join(DIR, `${safeId(id)}.json`), "utf8")) as ConversationRecord;
+    return JSON.parse(await readFile(join(dir(), `${safeId(id)}.json`), "utf8")) as ConversationRecord;
   } catch {
     return null;
   }
