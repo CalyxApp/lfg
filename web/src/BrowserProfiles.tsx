@@ -1,3 +1,4 @@
+import { backend } from "@/lib/backend";
 import { useCallback, useEffect, useState } from "react";
 import {
   CheckCircle2,
@@ -39,12 +40,7 @@ type TestResult = {
 // Mirror of App.tsx's tiny fetch wrapper: relative paths, JSON in/out, throws on
 // non-2xx with the server's `error` field when present.
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error((data as { error?: string })?.error || `${res.status} ${res.statusText}`);
-  }
-  return data as T;
+  return backend.request<T>(path, init);
 }
 
 // How the live login browser should be sized. "fit" matches the user's own

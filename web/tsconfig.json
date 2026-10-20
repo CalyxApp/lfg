@@ -19,5 +19,8 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src", "vite.config.ts"]
+  "include": ["src", "vite.config.ts"],
+  // Tests run under `bun test` (bun:test types), as upstream's do; the app
+  // build has no bun typings, so tsc leaves them out.
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
 }

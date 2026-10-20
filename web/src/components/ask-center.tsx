@@ -14,6 +14,7 @@
 //                        question, each answerable inline. Front and centre for
 //                        working the whole queue.
 
+import { backend } from "@/lib/backend";
 import {
   createContext,
   useCallback,
@@ -179,7 +180,7 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
       } catch {
         // no subscription — keep the unscoped fallback
       }
-      const res = await fetch(feedUrl, { cache: "no-store" });
+      const res = await backend.fetch(feedUrl, { cache: "no-store" });
       if (!res.ok) return;
       const data = (await res.json()) as { questions: Question[] };
       const qs = data.questions || [];
@@ -205,7 +206,7 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
   // ours — a slower poll is plenty and keeps a phone off the network.
   const refreshCalyx = useCallback(async () => {
     try {
-      const res = await fetch("/api/vault/asks", { cache: "no-store" });
+      const res = await backend.fetch("/api/vault/asks", { cache: "no-store" });
       if (!res.ok) return; // no vault configured on this server — feature is simply absent
       const data = (await res.json()) as { asks?: CalyxAsk[] };
       const asks = data.asks || [];
@@ -254,7 +255,7 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
       if (busy || !text.trim()) return;
       setBusy(true);
       try {
-        const res = await fetch(`/api/ask/${q.id}/answer`, {
+        const res = await backend.fetch(`/api/ask/${q.id}/answer`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ answer: text.trim(), via: "web" }),
@@ -282,7 +283,7 @@ export function AskProvider({ children }: { children: React.ReactNode }) {
       if (busy || !text.trim()) return;
       setBusy(true);
       try {
-        const res = await fetch("/api/vault/asks/answer", {
+        const res = await backend.fetch("/api/vault/asks/answer", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ repo: ask.repo, path: ask.path, answer: text.trim() }),
@@ -611,7 +612,7 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
     let alive = true;
     void (async () => {
       try {
-        const res = await fetch(
+        const res = await backend.fetch(
           `/api/vault/asks/body?repo=${encodeURIComponent(ask.repo)}&path=${encodeURIComponent(ask.path)}`,
           { cache: "no-store" },
         );
@@ -1035,7 +1036,7 @@ function AttachmentOverlay({
     let alive = true;
     void (async () => {
       try {
-        const res = await fetch(
+        const res = await backend.fetch(
           `/api/repos/file?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`,
           { cache: "no-store" },
         );
@@ -1063,7 +1064,7 @@ function AttachmentOverlay({
     return (
       <HtmlViewerOverlay
         title={fileLabel(path)}
-        src={`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`}
+        src={backend.assetUrl(`/api/repos/raw?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`)}
         onClose={onClose}
       />
     );

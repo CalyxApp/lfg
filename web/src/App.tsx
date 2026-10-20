@@ -1,3 +1,4 @@
+import { backend } from "@/lib/backend";
 import { Component, type ComponentProps, forwardRef, memo, Suspense, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -610,12 +611,7 @@ function canDriveSession(session: Pick<Session, "agent" | "tmuxTarget">): boolea
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, init);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(data?.error || `${res.status} ${res.statusText}`);
-  }
-  return data as T;
+  return backend.request<T>(path, init);
 }
 
 let skillCatalogPromise: Promise<SkillCatalogItem[]> | null = null;
@@ -668,11 +664,8 @@ function evlog(event: string, fields: Record<string, unknown> = {}) {
       path: location.pathname + location.search,
       ...fields,
     });
-    if (navigator.sendBeacon) {
-      const blob = new Blob([payload], { type: "application/json" });
-      if (navigator.sendBeacon("/api/evlog", blob)) return;
-    }
-    void fetch("/api/evlog", {
+    if (backend.beacon("/api/evlog", new Blob([payload], { type: "application/json" }))) return;
+    void backend.fetch("/api/evlog", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: payload,
@@ -728,7 +721,7 @@ function logFindingAction(
   path: "reply" | "execute" | "dismiss",
   hadText: boolean,
 ): void {
-  void fetch(`/api/auto/findings/${findingId}/action`, {
+  void backend.fetch(`/api/auto/findings/${findingId}/action`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, hadText }),
@@ -1414,7 +1407,7 @@ function useLiveSessionStream(sessions: Session[], streamIds: string[]) {
     // in-flight draft in full (catch-up); later ones are live growth.
     const draftSeen = new Set<string>();
     evlog("live_stream_client_start", { rid, ids, idsCount: ids.length });
-    const es = new EventSource(`/api/live/stream?ids=${ids.join(",")}&rid=${encodeURIComponent(rid)}`);
+    const es = backend.openEvents(`/api/live/stream?ids=${ids.join(",")}&rid=${encodeURIComponent(rid)}`);
     es.onopen = () => {
       evlog("live_stream_client_open", {
         rid,
@@ -2290,18 +2283,11 @@ export function App() {
     }
   }, [hideToastedFinding, showToastedFinding]);
 
-  const refreshBrain = useCallback(async () => {
-    const [config, notes, suggestions, runs] = await Promise.all([
-      api<{ config: SessionBrainConfig }>("/api/session-brain/config"),
-      api<{ notes: SessionNote[] }>("/api/session-brain/notes?status=open"),
-      api<{ suggestions: PatternSuggestion[] }>("/api/session-brain/suggestions?status=open"),
-      api<{ runs: SessionBrainRun[] }>("/api/session-brain/runs?limit=12"),
-    ]);
-    setBrainConfig(config.config ?? null);
-    setBrainNotes(notes.notes ?? []);
-    setBrainSuggestions(suggestions.suggestions ?? []);
-    setBrainRuns(runs.runs ?? []);
-  }, []);
+  // The server no longer has the session-brain routes (serve.ts: "session-brain
+  // routes removed — upstream deleted the subsystem"). These four reads always
+  // failed, so the Brain panel always showed its empty state; they are no longer
+  // made. The Brain screen and its buttons stay until Sam decides to remove them.
+  const refreshBrain = useCallback(async () => {}, []);
 
   const refreshSessions = useCallback(async (_opts?: { retireLaunchId?: string }) => {
     const payload = await api<{ sessions: Session[] }>("/api/sessions");
@@ -2526,7 +2512,7 @@ export function App() {
   const liveStatusKey = liveStatusIds.join(",");
   useEffect(() => {
     if (tab !== "live" || !liveStatusKey) return;
-    const es = new EventSource(`/api/live/status?ids=${liveStatusKey}`);
+    const es = backend.openEvents(`/api/live/status?ids=${liveStatusKey}`);
     es.addEventListener("status", (event) => {
       const rows = parseLiveEvent<
         Array<
@@ -2850,7 +2836,7 @@ export function App() {
       const start = await api<{ runId: string }>(`/api/agents/${agent}/run`, {
         method: "POST",
       });
-      const events = new EventSource(`/api/agents/${agent}/runs/${start.runId}`);
+      const events = backend.openEvents(`/api/agents/${agent}/runs/${start.runId}`);
       events.addEventListener("log", (event) => {
         setRunLog((prev) => `${prev ?? ""}\n${JSON.parse(event.data)}`.trim());
       });
@@ -7804,7 +7790,7 @@ const SessionCard = memo(function SessionCard({
     haptic("selection");
     try {
       stopSpeaking();
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}/summary/stream`, {
+      const res = await backend.fetch(`/api/sessions/${encodeURIComponent(sid)}/summary/stream`, {
         method: "POST",
       });
       if (!res.ok) {
@@ -11039,7 +11025,7 @@ function VoiceSettingsSection() {
 
   useEffect(() => {
     let alive = true;
-    void fetch("/api/voice/config")
+    void backend.fetch("/api/voice/config")
       .then((r) => (r.ok ? r.json() : null))
       .then((d: VoiceConfig | null) => {
         if (alive && d) setCfg(d);
@@ -11054,7 +11040,7 @@ function VoiceSettingsSection() {
     setCfg((c) => (c ? { ...c, settings: { ...c.settings, ...patch } } : c));
     setSaving(true);
     try {
-      const r = await fetch("/api/voice/config", {
+      const r = await backend.fetch("/api/voice/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),

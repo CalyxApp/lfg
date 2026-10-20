@@ -4,6 +4,7 @@
 // aka diffs.com) — Shiki-highlighted, split/unified, rendered fully client-side
 // (nothing leaves the box). Data comes from GET /api/sessions/:id/diff* .
 
+import { backend } from "@/lib/backend";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { PatchDiff } from "@pierre/diffs/react";
@@ -35,7 +36,7 @@ type DiffStat = { isWorktree: boolean; files: number; additions: number; deletio
 type DiffStyle = "unified" | "split";
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+  const res = await backend.fetch(path);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error((data as { error?: string })?.error || `${res.status}`);
   return data as T;

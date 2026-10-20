@@ -1,3 +1,4 @@
+import { backend } from "@/lib/backend";
 import {
   Component,
   Suspense,
@@ -191,7 +192,7 @@ export function VoiceCall({
       setStatus("connecting");
       setAgentState("thinking");
       try {
-        const res = await fetch("/api/livekit/token");
+        const res = await backend.fetch("/api/livekit/token");
         // 503 = "livekit not configured": this deployment has no self-hosted
         // LiveKit worker (Tier C was skipped). Fall back to the ElevenLabs
         // managed agent (Option B) — same brain via the custom-LLM endpoint —

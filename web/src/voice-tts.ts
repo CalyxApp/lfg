@@ -9,6 +9,7 @@
 // AudioContext is allowed to start.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { backend } from "@/lib/backend";
 import { useSyncExternalStore } from "react";
 
 const TTS_SAMPLE_RATE = 24000; // matches synthesizeTts() output on the server
@@ -215,7 +216,7 @@ export async function speakText(
 
   let buf: ArrayBuffer;
   try {
-    const res = await fetch("/api/voice/tts", {
+    const res = await backend.fetch("/api/voice/tts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: t, voice: opts?.voice }),

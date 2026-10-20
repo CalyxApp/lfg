@@ -3,6 +3,7 @@
 // viewer. HTML artifacts render in the same locked-down sandboxed iframe the
 // backend enforces via CSP; re-published ids show a version badge.
 
+import { backend } from "@/lib/backend";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Download,
@@ -148,7 +149,7 @@ export function FileViewerOverlay({
     let cancelled = false;
     setText(null);
     setTextError(false);
-    fetch(artifact.url)
+    backend.fetch(artifact.url)
       .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
       .then((t) => {
         if (!cancelled) setText(t.slice(0, 500_000));
@@ -177,7 +178,7 @@ export function FileViewerOverlay({
         </button>
         <div className="min-w-0 flex-1 truncate text-center text-sm font-medium">{title}</div>
         <a
-          href={artifact.url}
+          href={backend.assetUrl(artifact.url)}
           download={artifact.name}
           aria-label="Download"
           className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground active:scale-95"
@@ -187,11 +188,11 @@ export function FileViewerOverlay({
       </div>
       {kind === "image" ? (
         <div className="flex flex-1 items-center justify-center overflow-auto p-4">
-          <img src={artifact.url} alt={title} className="max-h-full max-w-full object-contain" />
+          <img src={backend.assetUrl(artifact.url)} alt={title} className="max-h-full max-w-full object-contain" />
         </div>
       ) : kind === "pdf" ? (
         <iframe
-          src={`${artifact.url}?inline=1`}
+          src={backend.assetUrl(`${artifact.url}?inline=1`)}
           title={title}
           className="w-full flex-1 border-0 bg-white"
           style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
@@ -232,7 +233,7 @@ export function FileViewerOverlay({
               .join(" · ")}
           </div>
           <a
-            href={artifact.url}
+            href={backend.assetUrl(artifact.url)}
             download={artifact.name}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
           >
@@ -266,7 +267,7 @@ function HtmlEmbed({ artifact, full }: { artifact: ArtifactCard; full?: boolean 
     <iframe
       ref={frameRef}
       title={artifact.title || artifact.id}
-      src={artifact.url}
+      src={backend.assetUrl(artifact.url)}
       sandbox="allow-scripts"
       className="w-full border-0 bg-white dark:bg-zinc-900"
       style={{ height, pointerEvents: full ? "auto" : "none" }}
@@ -280,7 +281,7 @@ function ArtifactMedia({ artifact, full }: { artifact: ArtifactCard; full?: bool
   if (artifact.kind === "video")
     return (
       <video
-        src={artifact.url}
+        src={backend.assetUrl(artifact.url)}
         controls={full}
         muted={!full}
         playsInline
@@ -290,7 +291,7 @@ function ArtifactMedia({ artifact, full }: { artifact: ArtifactCard; full?: bool
     );
   return (
     <img
-      src={full ? artifact.url : `${artifact.url}?preview=1`}
+      src={backend.assetUrl(full ? artifact.url : `${artifact.url}?preview=1`)}
       alt={artifact.caption || artifact.name || artifact.id}
       loading="lazy"
       className={cn("w-full", full ? "max-h-[70vh] object-contain" : "aspect-video object-cover")}
@@ -388,7 +389,7 @@ export function ArtifactInlineCard({
         {reader ? (
           <HtmlViewerOverlay
             title={label || card.id}
-            src={artifact.url}
+            src={backend.assetUrl(artifact.url)}
             onClose={() => setReader(false)}
           />
         ) : null}
@@ -410,7 +411,7 @@ export function ArtifactInlineCard({
           ) : null}
         </span>
         <a
-          href={artifact.url}
+          href={backend.assetUrl(artifact.url)}
           target="_blank"
           rel="noreferrer"
           className="shrink-0 rounded-md border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent"
