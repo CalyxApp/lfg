@@ -87,6 +87,7 @@ type LogEntry = {
   // extracted text (voice, since realtime can't read documents). `files` is the
   // display-name mirror of this.
   fileData?: { name: string; fileId?: string; text?: string }[];
+  k?: number; // stable key for the full transcript (see remember())
 };
 
 // Something the user attached to the composer. Images go inline as base64
@@ -205,19 +206,44 @@ export function Converse({ onClose }: { onClose: () => void }) {
   const logRef = useRef<LogEntry[]>([]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  const append = (role: LogEntry["role"], text: string, ok?: boolean) =>
+  // The on-screen log keeps the last ~60 entries (it is also the typed model's
+  // context). Saving needs the WHOLE chat, so every entry is also kept here, by a
+  // stable key, in the order it first appeared. Every log update goes through
+  // remember().
+  const fullRef = useRef<Map<number, LogEntry>>(new Map());
+  const keyRef = useRef(0);
+  const newKey = () => ++keyRef.current;
+  function remember(next: LogEntry[]) {
+    logRef.current = next;
+    for (const e of next) {
+      if (e.k === undefined) e.k = newKey(); // fallback only — see addToLog()
+      fullRef.current.set(e.k, e);
+    }
+  }
+
+  // setLog for an update that adds ONE new entry at the end. The entry's key is
+  // made here, OUTSIDE the updater: React runs an updater twice in StrictMode (and
+  // again when it replays queued updates), and a key made inside it would save
+  // the turn twice.
+  function addToLog(update: (l: LogEntry[]) => LogEntry[]) {
+    const k = newKey();
     setLog((l) => {
-      const next = [...l.slice(-60), { role, text, ok }];
-      logRef.current = next;
+      const next = update(l);
+      next[next.length - 1].k = k;
+      remember(next);
       return next;
     });
+  }
+
+  const append = (role: LogEntry["role"], text: string, ok?: boolean) =>
+    addToLog((l) => [...l.slice(-60), { role, text, ok }]);
 
   const appendUser = (
     text: string,
     images?: string[],
     fileData?: { name: string; fileId?: string; text?: string }[],
   ) =>
-    setLog((l) => {
+    addToLog((l) => {
       const entry: LogEntry = { role: "you", text };
       if (images && images.length) entry.images = images;
       if (fileData && fileData.length) {
@@ -225,7 +251,6 @@ export function Converse({ onClose }: { onClose: () => void }) {
         entry.files = fileData.map((f) => f.name);
       }
       const next = [...l.slice(-60), entry];
-      logRef.current = next;
       return next;
     });
 
@@ -253,20 +278,18 @@ export function Converse({ onClose }: { onClose: () => void }) {
   // Tool row carrying the full call detail (name/args/result) so the chip can
   // expand to a preview. `label` stays the friendly one-liner from toolLabel().
   const appendTool = (name: string, args: Record<string, unknown>, ok: boolean | undefined, result?: string) =>
-    setLog((l) => {
+    addToLog((l) => {
       const next = [
         ...l.slice(-60),
         { role: "tool" as const, text: toolLabel(name, args, ok, result), ok, tool: { name, args, result, ok } },
       ];
-      logRef.current = next;
       return next;
     });
 
   // An artifact a tool just published (publish_html) → inline card in the thread.
   const appendArtifact = (artifact: ArtifactMsg) =>
-    setLog((l) => {
+    addToLog((l) => {
       const next = [...l.slice(-60), { role: "assistant" as const, text: "", artifact }];
-      logRef.current = next;
       return next;
     });
 
@@ -274,7 +297,8 @@ export function Converse({ onClose }: { onClose: () => void }) {
   // and streaming transcript deltas update one entry in place, in the position
   // it was first heard — instead of whole turns popping in out of order when
   // the (slow) full-transcript events finally arrive.
-  const upsert = (id: string, role: LogEntry["role"], text: string) =>
+  const upsert = (id: string, role: LogEntry["role"], text: string) => {
+    const k = newKey(); // used only if this is a new entry
     setLog((l) => {
       const idx = l.findIndex((e) => e.id === id);
       let next: LogEntry[];
@@ -282,11 +306,12 @@ export function Converse({ onClose }: { onClose: () => void }) {
         next = [...l];
         next[idx] = { ...next[idx], text };
       } else {
-        next = [...l.slice(-60), { id, role, text }];
+        next = [...l.slice(-60), { id, role, text, k }];
       }
-      logRef.current = next;
+      remember(next);
       return next;
     });
+  };
   // ---- image attachments (typed chat) ----
   function readAsDataUrl(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -414,6 +439,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
       clearTimeout(placeholderTimers.current[itemId]);
       delete placeholderTimers.current[itemId];
     }
+    const k = newKey(); // used only if no placeholder is found
     setLog((l) => {
       let idx = itemId ? l.findIndex((e) => e.id === itemId) : -1;
       if (idx < 0) {
@@ -429,9 +455,9 @@ export function Converse({ onClose }: { onClose: () => void }) {
         next = [...l];
         next[idx] = { ...next[idx], role: "you", text };
       } else {
-        next = [...l.slice(-60), { id: itemId, role: "you", text }];
+        next = [...l.slice(-60), { id: itemId, role: "you", text, k }];
       }
-      logRef.current = next;
+      remember(next);
       return next;
     });
   }
@@ -678,7 +704,7 @@ export function Converse({ onClose }: { onClose: () => void }) {
               const idx = l.findIndex((e) => e.id === id);
               if (idx < 0 || l[idx].text !== "…") return l; // resolved meanwhile
               const next = l.filter((_, i) => i !== idx);
-              logRef.current = next;
+              remember(next);
               return next;
             });
           }, PLACEHOLDER_TTL_MS);
@@ -895,47 +921,17 @@ export function Converse({ onClose }: { onClose: () => void }) {
     return `## Transcript\n\n${body}\n`;
   }
 
-  // Close the surface → tear down voice if live, AUTO-SAVE the conversation to the
-  // vault (no manual review step — Sam 2026-07-29: "just automatically save it
-  // somewhere so I can revisit these"), then close. Best-effort: we still close if
-  // the save fails (the raw per-session debug log under data/converse-logs is the
-  // backstop). Every conversation with real turns is kept.
-  async function closeSurface() {
-    if (mode === "voice") setMode("chat"); // effect cleanup tears the session down
-    flushLog();
-    if (threadTurns().length === 0) {
-      onClose();
-      return;
-    }
-    const d = new Date();
-    const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-    const durMs = startedAtRef.current ? Date.now() - startedAtRef.current : 0;
-    const firstUser = logRef.current.find((e) => e.role === "you")?.text ?? "";
-    const models = [
-      ...(cfg ? [`${cfg.settings.provider}/${cfg.settings.model}`] : []),
-      ...(usedVoiceRef.current ? [MODEL] : []),
-    ];
-    const noteTitle = firstUser ? firstUser.slice(0, 60) : `Voice note ${dateStr}`;
-    const model = models.join(" + ") || MODEL;
-    const noteProps = { date: dateStr, duration: formatDuration(durMs), model };
-
-    // (1) human-friendly markdown note in the vault (Calyx export, unchanged).
-    try {
-      await fetch("/api/voice/rt/save-conversation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: noteTitle, tags: [], properties: noteProps, transcript: buildTranscript() }),
-        keepalive: true,
-      });
-    } catch {
-      /* raw debug log is the backstop */
-    }
-
-    // (2) structured record for the universal view — the machine-readable source
-    // of truth (keeps tool calls + attachments the markdown drops). Written behind
-    // the storage adapter (see docs/converse-universal-view.md).
+  // ---------------- autosave ----------------
+  // Every chat — voice or typed — is saved as it goes (Sam, 2026-10-20: "I don't
+  // want to choose to save them"). Before, a chat saved only when closed with the
+  // close button, so a chat left by switching apps or locking the phone was lost
+  // (15 of 21 on the server). Now the whole record is posted ~1.5 s after every
+  // change and again when the page is hidden; the server keeps one record and one
+  // vault note per chat, updated in place (src/converse-autosave.ts).
+  function buildRecord() {
     ensureSessionId();
-    const turns = logRef.current
+    const all = Array.from(fullRef.current.values());
+    const turns = all
       .filter((e) => !(e.role === "you" && e.text === "…"))
       .filter((e) => e.text.trim() || (e.images && e.images.length) || (e.files && e.files.length) || e.tool)
       .map((e) => ({
@@ -946,24 +942,90 @@ export function Converse({ onClose }: { onClose: () => void }) {
         ...(e.images ? { images: e.images } : {}),
         ...(e.files ? { files: e.files } : {}),
       }));
+    const started = startedAtRef.current ? new Date(startedAtRef.current) : new Date();
+    const dateStr = `${started.getFullYear()}-${pad(started.getMonth() + 1)}-${pad(started.getDate())}`;
+    const firstUser = all.find((e) => e.role === "you" && e.text.trim() && e.text !== "…")?.text ?? "";
+    const c = cfgRef.current; // the hidden-page listener was made at mount, before cfg loaded
+    const models = [
+      ...(c ? [`${c.settings.provider}/${c.settings.model}`] : []),
+      ...(usedVoiceRef.current ? [MODEL] : []),
+    ];
+    return {
+      id: sessionIdRef.current!,
+      title: firstUser ? firstUser.slice(0, 60) : `Conversation ${dateStr}`,
+      date: dateStr,
+      model: models.join(" + ") || MODEL,
+      durationMs: startedAtRef.current ? Date.now() - startedAtRef.current : 0,
+      createdAt: started.toISOString(),
+      turns,
+    };
+  }
+
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastSavedRef = useRef("");
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;
+
+  // `leaving`: the page is being hidden or closed. keepalive lets the request
+  // outlive the page, but browsers cap a keepalive body at 64 KB — a longer chat
+  // (images ride inline) goes as a normal request; the per-turn saves have
+  // already stored all but the last moment of it.
+  async function saveNow(leaving = false) {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    const rec = buildRecord();
+    if (!rec.turns.some((t) => t.role === "you")) return;
+    const body = JSON.stringify(rec);
+    const sig = `${rec.turns.length}:${body.length}`;
+    if (sig === lastSavedRef.current && !leaving) return;
     try {
-      await fetch("/api/converse/conversations", {
+      const res = await fetch("/api/converse/conversations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: sessionIdRef.current,
-          title: noteTitle,
-          date: dateStr,
-          model,
-          durationMs: durMs,
-          createdAt: new Date().toISOString(),
-          turns,
-        }),
-        keepalive: true,
+        body,
+        keepalive: leaving && body.length < 60_000,
       });
+      if (res.ok) lastSavedRef.current = sig;
     } catch {
-      /* non-fatal — the markdown note + debug log still exist */
+      /* next turn or the hidden-page save tries again; the debug log is the backstop */
     }
+  }
+
+  useEffect(() => {
+    if (!log.length) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => void saveNow(), 1500);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [log]);
+
+  useEffect(() => {
+    const onHide = () => {
+      if (document.visibilityState === "hidden") {
+        flushLog();
+        void saveNow(true);
+      }
+    };
+    const onPageHide = () => {
+      flushLog();
+      void saveNow(true);
+    };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", onPageHide);
+      void saveNow(true); // the surface unmounting is also an exit
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Close the surface → tear down voice if live, save (the same autosave), close.
+  async function closeSurface() {
+    if (mode === "voice") setMode("chat"); // effect cleanup tears the session down
+    flushLog();
+    await saveNow(true);
     onClose();
   }
 

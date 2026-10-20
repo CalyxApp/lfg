@@ -422,11 +422,11 @@ import {
 } from "../voice-rt.ts";
 import { handleLiveSpikeSdp, handleLiveSpikePage, handleLiveSpikeLog } from "../live-spike.ts";
 import {
-  saveConversationRecord,
   listConversationSummaries,
   getConversationRecord,
   type ConversationRecord,
 } from "../converse-store.ts";
+import { autosaveConversation } from "../converse-autosave.ts";
 import {
   getChatSettings,
   setChatSettings,
@@ -1773,11 +1773,21 @@ export async function cmdServe() {
       // ---- Universal conversation store (Phase 4). A normalized HTTP contract
       // over a storage adapter (converse-store.ts) so the browsing UI is decoupled
       // from where records live. See docs/converse-universal-view.md.
+      // Autosave: the chat posts its whole record after every turn and when the
+      // page is hidden. Saves the record (grow-only) AND its one vault note, which
+      // is updated in place until the user changes it (converse-autosave.ts).
       if (path === "/api/converse/conversations" && req.method === "POST") {
         const rec = (await req.json().catch(() => null)) as ConversationRecord | null;
         if (!rec?.id || !Array.isArray(rec.turns)) return err(400, "expected a conversation record { id, turns[] }");
-        await saveConversationRecord(rec);
-        return json({ ok: true, id: rec.id });
+        const repos = await listRepos();
+        const workspace = process.env.CONVERSE_WORKSPACE ?? "PlatosRaveCave";
+        const repo = repos.find((r) => r.name === workspace || r.cwd.endsWith(`/${workspace}`)) ?? repos[0];
+        try {
+          const saved = await autosaveConversation(repo?.cwd ?? null, rec);
+          return json({ ok: true, id: rec.id, ...saved });
+        } catch (e) {
+          return err(500, e instanceof Error ? e.message : String(e));
+        }
       }
       if (path === "/api/converse/conversations" && req.method === "GET") {
         return json(await listConversationSummaries());
