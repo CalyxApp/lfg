@@ -137,6 +137,19 @@ describe("roomMessages", () => {
     expect(notes).toEqual(["Stopped", "Something went wrong"]);
   });
 
+  test("a started message whose turn start a mid-turn history cleared is not shown again as waiting", () => {
+    // The computer reconnected mid-turn and pushed its history: the message is in the
+    // history, the turn's start is gone from the tail, and the room says it started.
+    const s = reduceRoom(null, snapshot({
+      history: { upToSeq: 6, messages: [{ id: "h1", role: "user", text: "Pick a colour", at: 1 }] },
+      inbox: [{ seq: 1, requestId: "req-a", text: "Pick a colour", by: "user", from: "Mac", at: 1, status: "claimed", epoch: 1, started: true }],
+      lastSeq: 6,
+    }))!;
+    const view = roomMessages(s, none);
+    expect(view.messages.filter((m) => m.text === "Pick a colour")).toHaveLength(1);
+    expect(view.busy).toBe(true);
+  });
+
   test("inbox: waiting, starting, cut — and a started one shows as its turn, not twice", () => {
     const item = (requestId: string, status: string) => ({ seq: 1, requestId, text: requestId, by: "user", from: "iPhone", at: 1, status, epoch: null });
     let s = reduceRoom(null, snapshot({ history: { upToSeq: 0, messages: [] }, lastSeq: 0 }))!;

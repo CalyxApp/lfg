@@ -37,6 +37,8 @@ export interface InboxItem {
   at: number;
   status: "waiting" | "claimed" | "done" | "cut";
   epoch: number | null;
+  /** Its turn has started: its message is in the history or the live turn already. */
+  started?: boolean;
 }
 
 export interface RoomEvent {
@@ -314,7 +316,8 @@ export function roomMessages(
   const status = roomStatus(state);
   const who = status.kind === "live" ? status.label : null;
   for (const item of state.inbox) {
-    if (started.has(item.requestId) || item.status === "done") continue;
+    // Started: shown by the history or the live turn (a history pushed mid-turn clears its start from the tail).
+    if (started.has(item.requestId) || item.started || item.status === "done") continue;
     out.push({ ...pendingUser(`inbox-${item.requestId}`, { text: item.text, at: item.at }), pending: item.status !== "cut" });
     out.push(
       note(
