@@ -97,8 +97,10 @@ export async function upsertConversationNote(repoCwd: string, rec: ConversationR
       if (hash(current) !== known.hash) return { action: "kept-user-version", path: known.path };
       if (current === content) return { action: "unchanged", path: known.path };
       await writeRepoFile(repoCwd, known.path, content, { createOnly: false });
-      gitCommitPaths(repoCwd, [known.path], `converse: conversation — ${rec.title}`);
+      // Record the new hash BEFORE committing: if the commit fails, the index must
+      // still match the file, or the next save would take our own text for the user's.
       writeIndex({ ...ix, [rec.id]: { path: known.path, hash: hash(content) } });
+      gitCommitPaths(repoCwd, [known.path], `converse: conversation — ${rec.title}`);
       return { action: "updated", path: known.path };
     }
     const base = slugify(rec.title);
@@ -111,22 +113,33 @@ export async function upsertConversationNote(repoCwd: string, rec: ConversationR
         if (e instanceof Error && e.message.includes("already exists")) continue;
         throw e;
       }
+      writeIndex({ ...ix, [rec.id]: { path: rel, hash: hash(content) } }); // before the commit, as above
       gitCommitPaths(repoCwd, [rel], `converse: conversation — ${rec.title}`);
-      writeIndex({ ...ix, [rec.id]: { path: rel, hash: hash(content) } });
       return { action: "created", path: rel };
     }
     throw new Error("could not find a free filename for the conversation note");
   });
 }
 
+type AutosaveResult = { record: "saved" | "kept-longer"; note: NoteOutcome | { action: "no-vault" } };
+
+// One save at a time in this process. The browser can post one chat twice at once
+// (a turn's save still in flight when the page-hidden save goes). The record's
+// read-compare-write and the note index must not interleave, or the shorter post
+// can land last and shrink the chat.
+let queue: Promise<unknown> = Promise.resolve();
+
 /**
  * Save one posted conversation: the record (grow-only) and its vault note.
  * `repoCwd` null = no vault available; the record is still kept.
  */
-export async function autosaveConversation(
-  repoCwd: string | null,
-  rec: ConversationRecord,
-): Promise<{ record: "saved" | "kept-longer"; note: NoteOutcome | { action: "no-vault" } }> {
+export function autosaveConversation(repoCwd: string | null, rec: ConversationRecord): Promise<AutosaveResult> {
+  const run = queue.then(() => saveOne(repoCwd, rec));
+  queue = run.catch(() => undefined);
+  return run;
+}
+
+async function saveOne(repoCwd: string | null, rec: ConversationRecord): Promise<AutosaveResult> {
   const existing = await getConversationRecord(rec.id);
   let stored = rec;
   if (existing && Array.isArray(existing.turns) && existing.turns.length > rec.turns.length) {

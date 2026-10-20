@@ -109,6 +109,45 @@ describe("the user's version always wins", () => {
   });
 });
 
+describe("saves that overlap or fail part-way", () => {
+  const path = "ai-voice-conversations/find-the-pitch-v3.md";
+
+  // The browser can post one chat twice at once: a turn's save still in flight
+  // when the page-hidden save goes, or visibilitychange + pagehide together.
+  test("two saves of one chat at the same moment never shrink it", async () => {
+    await autosaveConversation(vault, rec([["you", "a"]]));
+    await Promise.all([
+      autosaveConversation(vault, rec([["you", "a"], ["assistant", "b"], ["you", "c"]])),
+      autosaveConversation(vault, rec([["you", "a"], ["assistant", "b"]])),
+    ]);
+    expect((await getConversationRecord(rec([]).id))?.turns.length).toBe(3);
+    expect(note(path)).toContain("**You:** c");
+  });
+
+  test("two first saves at the same moment make one note", async () => {
+    await Promise.all([
+      autosaveConversation(vault, rec([["you", "Find the pitch v3"]])),
+      autosaveConversation(vault, rec([["you", "Find the pitch v3"]])),
+    ]);
+    expect(notes()).toEqual(["find-the-pitch-v3.md"]);
+  });
+
+  test("a failed git commit makes no second note and does not freeze the note", async () => {
+    const hook = join(vault, ".git", "hooks", "pre-commit");
+    writeFileSync(hook, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    await autosaveConversation(vault, rec([["you", "Find the pitch v3"]])).catch(() => {});
+    await autosaveConversation(vault, rec([["you", "Find the pitch v3"], ["assistant", "More."]])).catch(() => {});
+    expect(notes()).toEqual(["find-the-pitch-v3.md"]);
+    unlinkSync(hook);
+    const r = await autosaveConversation(
+      vault,
+      rec([["you", "Find the pitch v3"], ["assistant", "More."], ["you", "Again."]]),
+    );
+    expect(r.note.action).toBe("updated");
+    expect(note(path)).toContain("**You:** Again.");
+  });
+});
+
 describe("the note text", () => {
   test("is a transcript of the spoken and typed turns, without tool rows or placeholders", () => {
     const text = conversationNoteText({
