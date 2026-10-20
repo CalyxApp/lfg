@@ -19,6 +19,7 @@ import {
   FilePlus,
   FolderPlus,
   Pencil,
+  Undo2,
   Wrench,
 } from "lucide-react";
 
@@ -39,6 +40,8 @@ const ICONS: Record<string, LucideIcon> = {
   create: FilePlus,
   create_project: FolderPlus,
   update: Pencil,
+  edit: Pencil,
+  undo: Undo2,
 };
 
 function pretty(s?: string): string {
