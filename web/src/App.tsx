@@ -1,5 +1,5 @@
 import { backend } from "@/lib/backend";
-import { Component, type ComponentProps, forwardRef, memo, Suspense, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, type ComponentProps, createContext, forwardRef, memo, Suspense, useCallback, useContext, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   DEFAULT_SCHED_TZ,
@@ -141,6 +141,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { sanitizeHtml } from "@/lib/sanitize";
 import { Streamdown } from "streamdown";
 import changelogMarkdown from "../../CHANGELOG.md?raw";
 import { useExtensionNavTabs } from "./lib/extensions";
@@ -211,7 +212,7 @@ type AgentReport = {
   actions: ActionRow[];
 };
 
-type Session = {
+export type Session = {
   agent?: "claude" | "aisdk" | "codex" | "codex-aisdk" | "opencode" | "grok" | string;
   pid?: number;
   cmd?: string;
@@ -236,7 +237,8 @@ type Session = {
   // Build health (from the backend). "blocked" means the session can't make
   // progress until a human acts; statusReason/statusDetail explain why.
   status?: "ok" | "blocked";
-  statusReason?: "model_unavailable" | "out_of_credits" | "provider_auth" | "provider_error" | null;
+  // computer_away: a Calyx Cloud chat whose computer is gone (statusDetail names it).
+  statusReason?: "model_unavailable" | "out_of_credits" | "provider_auth" | "provider_error" | "computer_away" | null;
   statusDetail?: string | null;
   // Live "working" flag from the list call (backend computes it from the tmux
   // pane / aisdk registry). Lets a collapsed card show working/idle without
@@ -336,7 +338,7 @@ type SessionBrainConfig = {
   model: string;
 };
 
-type Message = {
+export type Message = {
   id?: string;
   role?: string;
   kind?: string;
@@ -387,15 +389,15 @@ const STREAMING_RESPONSE_ANIMATION = {
 const DRAFT_CATCHUP_MIN_CHARS = 160;
 
 type PromptOption = { index: number; label: string; selected?: boolean };
-type SessionPrompt = { question?: string; options: PromptOption[] };
-type QueueMsg = {
+export type SessionPrompt = { question?: string; options: PromptOption[] };
+export type QueueMsg = {
   id: string;
   text: string;
   status: "pending" | "sending" | "queued" | "failed" | "delivered";
   error?: string;
 };
 
-type LoadOlderMessages = (sid: string) => Promise<boolean>;
+export type LoadOlderMessages = (sid: string) => Promise<boolean>;
 
 type ComposerAttachment = {
   id: string;
@@ -592,6 +594,7 @@ function agentIconSrc(agent?: string): string {
   if (agent === "grok") return "/agent-grok.svg";
   if (agent === "hermes") return "/agent-hermes.svg?v=20260629";
   if (agent === "opencode") return "/agent-opencode.svg";
+  if (agent === "pi") return "/agent-pi.svg";
   return "/agent-claude.svg";
 }
 function agentIconAlt(agent?: string): string {
@@ -599,6 +602,7 @@ function agentIconAlt(agent?: string): string {
   if (agent === "grok") return "Grok";
   if (agent === "hermes") return "Hermes";
   if (agent === "opencode") return "OpenCode";
+  if (agent === "pi") return "Pi";
   return "Claude";
 }
 
@@ -613,6 +617,45 @@ function canDriveSession(session: Pick<Session, "agent" | "tmuxTarget">): boolea
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return backend.request<T>(path, init);
 }
+
+// What the session screens may do with a session, and how they send to it.
+// The default is your own LFG server, exactly as before. Calyx Cloud (LFG
+// plan L2) provides its own: chats are Calyx chat rooms, which take messages
+// and nothing else from a phone, so every other control is hidden there.
+export type SessionOps = {
+  can: {
+    /** The session menu: assign, fork, stop, end. */
+    manage: boolean;
+    /** Attach files to a message. */
+    upload: boolean;
+    /** The composer's stop button. */
+    interrupt: boolean;
+    /** End sessions: swipe to delete, "Clear all", the stage's close shortcut. */
+    close: boolean;
+    /** Swipe a card to the session brain. */
+    brain: boolean;
+    /** Tap the agent icon to hear a summary. */
+    summary: boolean;
+    /** The "files changed / Review" bar. */
+    diff: boolean;
+  };
+  /** Whether the composer shows for this session. */
+  canDrive: (session: Session) => boolean;
+  send: (sid: string, text: string, mode: "steer" | "queue") => Promise<{ msg?: QueueMsg }>;
+};
+
+const SERVER_SESSION_OPS: SessionOps = {
+  can: { manage: true, upload: true, interrupt: true, close: true, brain: true, summary: true, diff: true },
+  canDrive: canDriveSession,
+  send: (sid, text, mode) =>
+    api<{ msg?: QueueMsg }>(`/api/sessions/${sid}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, mode }),
+    }),
+};
+
+export const SessionOpsContext = createContext<SessionOps>(SERVER_SESSION_OPS);
 
 let skillCatalogPromise: Promise<SkillCatalogItem[]> | null = null;
 let skillCatalogLoadedAt = 0;
@@ -1285,7 +1328,7 @@ function markCreatedSid(sid: string): void {
 // per-card collapse state. SessionCard dispatches `lfg-collapse-change` when the
 // user toggles a card (and the browser fires `storage` for other tabs); we
 // recompute from localStorage on either. Drives which sessions actually stream.
-function useExpandedIds(sessions: Session[], forceExpanded = false): string[] {
+export function useExpandedIds(sessions: Session[], forceExpanded = false): string[] {
   const sids = useMemo(
     () => sessions.map((s) => s.sessionId).filter((id): id is string => !!id),
     [sessions],
@@ -4762,7 +4805,7 @@ function buildSessionTree(
   return { roots, effectiveBusy, flatten, nodeForSessionId, rootForSessionId };
 }
 
-function LiveView({
+export function LiveView({
   // Defense-in-depth: `sessions`/`findings`/`autoAgents` are read via `.length`
   // unconditionally below (the original `findings.length` crash site). The fetch
   // layer already guards these to [], but default here too so any future caller
@@ -4810,6 +4853,7 @@ function LiveView({
   onOpenFinding: (f: AutoFinding) => void;
 }) {
   const isWide = useIsWide();
+  const ops = useContext(SessionOpsContext);
   // Full-height detail sheet (mobile tap). Held here, above every card,
   // so it can switch which session it shows without unmounting. `origin` anchors
   // the open/close morph to the title the user tapped.
@@ -5028,6 +5072,7 @@ function LiveView({
             count={idle.length}
             dotClass="bg-success/30 ring-1 ring-inset ring-success/20"
             action={
+              ops.can.close ? (
               <button
                 type="button"
                 onClick={clearIdle}
@@ -5036,6 +5081,7 @@ function LiveView({
                 <X className="size-3" />
                 Clear all
               </button>
+              ) : undefined
             }
           />
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-2">
@@ -5116,6 +5162,7 @@ function RailStage({
   onOpenFinding: (f: AutoFinding) => void;
   onNew: () => void;
 }) {
+  const ops = useContext(SessionOpsContext);
   const MAX_COLUMNS = 4;
   const layoutScope = projectFilter || "__all";
   const layoutKey = encodeURIComponent(layoutScope);
@@ -5370,7 +5417,7 @@ function RailStage({
   );
   const closeSession = useCallback(
     async (sid: string | null) => {
-      if (!sid || !bySid.has(sid)) return;
+      if (!sid || !bySid.has(sid) || !ops.can.close) return;
       closeColumn(sid);
       try {
         await api(`/api/sessions/${sid}/close`, { method: "POST" });
@@ -5381,7 +5428,7 @@ function RailStage({
         await onRefresh();
       }
     },
-    [bySid, closeColumn, onRemove, onRefresh],
+    [bySid, closeColumn, onRemove, onRefresh, ops],
   );
 
   // Latest values for the global key handler, so it binds once but never reads
@@ -6163,7 +6210,9 @@ function PausedBanner({
   }
 
   const title =
-    reason === "out_of_credits"
+    reason === "computer_away"
+      ? `Paused until ${session.statusDetail || "your computer"} is back`
+      : reason === "out_of_credits"
       ? "Build paused — out of credits"
       : reason === "provider_auth"
         ? "Build paused — provider rejected the model"
@@ -6171,7 +6220,9 @@ function PausedBanner({
           ? "Build paused — provider error"
           : "Build paused";
   const detail =
-    reason === "out_of_credits"
+    reason === "computer_away"
+      ? "This chat runs on that computer. It carries on when the computer is back."
+      : reason === "out_of_credits"
       ? "This app's build agent ran out of AI credits. Top up the wallet to resume the build."
       : reason === "provider_auth"
         ? `${session.statusDetail || "The selected provider rejected the request."} Check the OpenCode provider key or switch models.`
@@ -6441,6 +6492,7 @@ function SessionChat({
   onDictatingChange?: (recording: boolean) => void;
 }) {
   const sid = session.sessionId;
+  const ops = useContext(SessionOpsContext);
   // Seed the composer from any saved draft so an unsent message survives this
   // component being unmounted (see loadComposerDraft). `setMessageText` wraps the
   // raw setter to persist every change under the currently-bound sid.
@@ -6573,11 +6625,7 @@ function SessionChat({
       // Pulse the composer so the send visibly launches into the transcript.
       setLaunching(true);
       window.setTimeout(() => setLaunching(false), 480);
-      const sent = await api<{ msg?: QueueMsg }>(`/api/sessions/${sid}/send`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: outgoingText, mode }),
-      });
+      const sent = await ops.send(sid, outgoingText, mode);
       onTrackSendStatus(sid, outgoingText, sent.msg ?? null);
       for (const att of files) {
         if (att.previewUrl) URL.revokeObjectURL(att.previewUrl);
@@ -6627,14 +6675,14 @@ function SessionChat({
         <div className="border-t border-border/70 px-3 py-1.5 text-xs text-destructive">{error}</div>
       ) : null}
 
-      {canDriveSession(session) ? (
+      {ops.canDrive(session) ? (
         <form
           onSubmit={sendMessage}
           onDragEnter={(event) => {
-            if (Array.from(event.dataTransfer.types).includes("Files")) setDraggingFiles(true);
+            if (ops.can.upload && Array.from(event.dataTransfer.types).includes("Files")) setDraggingFiles(true);
           }}
           onDragOver={(event) => {
-            if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+            if (!ops.can.upload || !Array.from(event.dataTransfer.types).includes("Files")) return;
             event.preventDefault();
             event.dataTransfer.dropEffect = "copy";
             setDraggingFiles(true);
@@ -6646,7 +6694,7 @@ function SessionChat({
             }
           }}
           onDrop={(event) => {
-            if (!event.dataTransfer.files.length) return;
+            if (!ops.can.upload || !event.dataTransfer.files.length) return;
             event.preventDefault();
             setDraggingFiles(false);
             addFiles(event.dataTransfer.files);
@@ -6731,6 +6779,7 @@ function SessionChat({
               <WaveformRecorderRow rec={rec} />
             ) : (
               <>
+            {ops.can.upload ? (
             <Button
               size="icon"
               type="button"
@@ -6743,6 +6792,7 @@ function SessionChat({
             >
               <Paperclip className="size-4" />
             </Button>
+            ) : null}
             <div className="relative min-w-0 flex-1">
               <SkillTextarea
                 data-composer-sid={sid}
@@ -6750,7 +6800,7 @@ function SessionChat({
                 onValueChange={setMessageText}
                 onPaste={(event) => {
                   const files = event.clipboardData?.files;
-                  if (files?.length) {
+                  if (files?.length && ops.can.upload) {
                     event.preventDefault();
                     addFiles(files);
                   }
@@ -6769,7 +6819,7 @@ function SessionChat({
                 )}
               />
             </div>
-            {busy && canDriveSession(session) ? (
+            {busy && ops.can.interrupt && canDriveSession(session) ? (
               <Button
                 size="icon"
                 type="button"
@@ -6911,6 +6961,7 @@ function SessionActionsMenu({
   triggerClassName?: string;
 }) {
   const [forkOpen, setForkOpen] = useState(false);
+  const ops = useContext(SessionOpsContext);
   const sid = session.sessionId;
 
   async function assign(user: string) {
@@ -6953,6 +7004,8 @@ function SessionActionsMenu({
       );
     }
   }
+
+  if (!ops.can.manage) return null;
 
   return (
     <>
@@ -7765,6 +7818,7 @@ const SessionCard = memo(function SessionCard({
 }) {
   const [error, setError] = useState<string | null>(null);
   const [summarizing, setSummarizing] = useState(false);
+  const ops = useContext(SessionOpsContext);
 
   const sid = session.sessionId;
 
@@ -7973,6 +8027,7 @@ const SessionCard = memo(function SessionCard({
 
 const onTouchStart = (e: ReactTouchEvent) => {
     if (!isMobile || e.touches.length !== 1) return;
+    if (!ops.can.close && !ops.can.brain) return; // nothing behind the card to reveal
     if ((e.target as HTMLElement).closest("form")) return; // don't hijack the composer
     const el = sectionRef.current;
     if (!el) return;
@@ -8153,7 +8208,7 @@ const onTouchStart = (e: ReactTouchEvent) => {
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              void speakSummary();
+              if (ops.can.summary) void speakSummary();
             }}
             disabled={!sid || summarizing}
             aria-label={summarizing ? "Preparing session summary" : "Speak session summary"}
@@ -8362,6 +8417,7 @@ const ChatStream = memo(function ChatStream({
   onLoadOlderMessages: LoadOlderMessages;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const ops = useContext(SessionOpsContext);
   const [stick, setStick] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasOlder, setHasOlder] = useState(true);
@@ -8520,7 +8576,7 @@ const ChatStream = memo(function ChatStream({
     </div>
     {/* Floating "diffs for review" bar: appears when this session's worktree
         has changes; opens the pierre-style diff viewer. */}
-    <SessionDiffBar sid={sid} onVisibilityChange={setDiffBarVisible} />
+    {ops.can.diff ? <SessionDiffBar sid={sid} onVisibilityChange={setDiffBarVisible} /> : null}
     </div>
   );
 });
@@ -8578,6 +8634,16 @@ function MessageBubble({
   // entrance so the draft→final swap doesn't flash.
   entering?: boolean;
 }) {
+  // A quiet line between messages: where a Calyx Cloud chat stands ("Waiting
+  // for MacBook…") or a note its computer added. Plain text, never HTML.
+  if (message.kind === "note") {
+    return (
+      <div className="msg mx-auto max-w-[90%] text-balance text-center text-xs text-muted-foreground">
+        {message.text}
+      </div>
+    );
+  }
+
   if (message.kind === "thinking") {
     return (
       <AiMessage className="msg" from="assistant">
@@ -8634,7 +8700,7 @@ function MessageBubble({
             "msg-text markdown user-bubble text-base w-fit max-w-[85%]",
             message.pending && "is-pending",
           )}
-          dangerouslySetInnerHTML={{ __html: message.html || escapeHtml(message.text || "") }}
+          dangerouslySetInnerHTML={{ __html: sanitizeHtml(message.html || escapeHtml(message.text || "")) }}
         />
       ) : (
         // Assistant turns render markdown from the raw source via Streamdown,

@@ -5,6 +5,7 @@
 // a fragment of turn rows; the caller supplies the scroll container / gap wrapper.
 
 import { marked } from "marked";
+import { sanitizeHtml } from "@/lib/sanitize";
 import { File as FileIcon } from "lucide-react";
 import { ToolCard, type ToolDetail } from "./tool-card";
 import { ArtifactInlineCard } from "./ArtifactsView";
@@ -84,7 +85,7 @@ export function ConversationTurns({ turns }: { turns: ConversationTurn[] }) {
           <div
             key={i}
             className="msg-text markdown max-w-full text-base"
-            dangerouslySetInnerHTML={{ __html: marked.parse(e.text, { async: false }) as string }}
+            dangerouslySetInnerHTML={{ __html: sanitizeHtml(marked.parse(e.text, { async: false }) as string) }}
           />
         ) : e.role === "tool" ? (
           <div key={i} className="flex">

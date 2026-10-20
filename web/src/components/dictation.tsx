@@ -248,8 +248,9 @@ export function useDictation(opts: {
   reviewOnStopRef.current = opts.reviewOnStop ?? false;
   baseTextRef.current = opts.baseText ?? "";
 
+  // Calyx Cloud has no speech-to-text yet (LFG plan section 4): no mic there.
   const supported =
-    typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia;
+    backend.capabilities.voice && typeof navigator !== "undefined" && !!navigator.mediaDevices?.getUserMedia;
 
   // `auto` distinguishes a silence-triggered stop (→ onAutoSubmit) from a manual
   // tap (→ onText). `discard` tears the session down without transcribing — used
