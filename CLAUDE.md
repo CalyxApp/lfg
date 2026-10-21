@@ -3,12 +3,12 @@
 Production deploy/ops facts + adoption history: `docs/upstream-adoption-plan.md`.
 
 
-## Cross-workstream tracking (all Calyx/lfg agents)
+## Tracking what's open (all Calyx/lfg agents)
 
-Before starting work: read `docs/tracking/STATUS.md` in the **Calyx VS Code
-extension** repo (VPS:
-`/home/openclaw/repos/mdEditorTestExtenstionVscode/docs/tracking/STATUS.md`) so
-you know the state of the other workstreams (lfg mobile app, VS Code extension,
-Chrome new-tab). After finishing real work: update your workstream's file under
-`docs/tracking/workstreams/` there and its `STATUS.md` block, then commit
-(stage only `docs/tracking/`).
+State lives in the work's own folder: this repo's `docs/`, or for plans that span repos, a
+folder under `docs/tracking/` in the **Calyx VS Code extension** repo (VPS:
+`/home/openclaw/repos/mdEditorTestExtenstionVscode/docs/tracking/`). Sam's open sessions in every
+project are listed in that repo's `docs/tracking/working-on/index.md`.
+
+The Calyx repo's `docs/tracking/STATUS.md` and `docs/tracking/workstreams/` were **retired on
+2026-10-21** (Sam): they repeated the work folders and fell behind them. Don't write to them.
