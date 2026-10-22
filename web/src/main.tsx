@@ -5,13 +5,19 @@ import { createRoot } from "react-dom/client";
 import * as ReactDOM from "react-dom";
 import "./index.css";
 import { App, RootErrorBoundary } from "./App";
+import { CloudApp } from "./cloud/CloudApp";
+import { backendKind } from "./lib/backend/kind";
 import { registerExtension } from "./lib/extensions";
 import { installErrorReporting } from "./lib/report-error";
 
+// Served by Calyx Cloud (the chat server) or by the user's own LFG server.
+const BACKEND = backendKind();
+
 // Capture uncaught errors + unhandled rejections and auto-report them to the
 // backend (which surfaces a finding/push and dispatches an auto-fix agent).
-// Installed first so an early-boot throw is still caught.
-installErrorReporting();
+// Installed first so an early-boot throw is still caught. Calyx Cloud has no
+// such endpoint.
+if (BACKEND === "server") installErrorReporting();
 
 // Runtime extension host. We expose the host's React (so external extension
 // bundles share ONE React instead of bundling their own — hooks break with two)
@@ -77,7 +83,7 @@ if (isUpdateProbe) {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <RootErrorBoundary>
-        <App />
+        {BACKEND === "cloud" ? <CloudApp /> : <App />}
       </RootErrorBoundary>
     </StrictMode>,
   );
