@@ -1,18 +1,20 @@
 // LFG on Calyx Cloud: pair this phone with Calyx on a computer (L0), then
-// follow and answer Calyx chats with LFG's own chat screens (L2).
+// follow and answer Calyx chats with LFG's own chat screens (L2), and answer
+// the agent's questions in them (L3a).
 //
 // The pass is an HttpOnly cookie the chat server sets; this page never sees it.
 // It asks the server who it is (/v1/me) instead.
 
 import { backend } from "@/lib/backend";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessagesSquare, MoreVertical, Smartphone } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Caption } from "@/components/ui/caption";
 import { EmptyState } from "@/components/ui/empty-state";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { LiveView, SessionOpsContext } from "../App";
+import { LiveView, SessionOpsContext, type SessionOps } from "../App";
+import { ChatAsksContext, ChatAsksPanel, type ChatAsksValue } from "./ChatAsks";
 import { onlineLine } from "./hub-state";
 import { useCloudChats } from "./useCloudChats";
 
@@ -127,9 +129,18 @@ export function CloudApp() {
 function CloudChats({ vaultId, expiresAt, onForget }: { vaultId: string; expiresAt: number; onForget: () => void }) {
   const chats = useCloudChats(vaultId);
   const online = chats.hub.online.length > 0;
+  const ops: SessionOps = useMemo(
+    () => ({ ...chats.ops, asks: (sid: string) => <ChatAsksPanel chatId={sid} /> }),
+    [chats.ops],
+  );
+  const asks: ChatAsksValue = useMemo(
+    () => ({ asksBySid: chats.asksBySid, askInfoBySid: chats.askInfoBySid, answer: chats.answer }),
+    [chats.asksBySid, chats.askInfoBySid, chats.answer],
+  );
 
   return (
-    <SessionOpsContext.Provider value={chats.ops}>
+    <SessionOpsContext.Provider value={ops}>
+    <ChatAsksContext.Provider value={asks}>
       <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
         <header className="flex shrink-0 items-center gap-3 px-5 pb-2 pt-[calc(0.75rem+env(safe-area-inset-top))]">
           <div className="min-w-0 flex-1">
@@ -206,6 +217,7 @@ function CloudChats({ vaultId, expiresAt, onForget }: { vaultId: string; expires
           )}
         </main>
       </div>
+    </ChatAsksContext.Provider>
     </SessionOpsContext.Provider>
   );
 }

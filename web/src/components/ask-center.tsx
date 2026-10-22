@@ -74,7 +74,7 @@ type Question = {
 // comes from an agent task that hit a fork, wrote its question into the vault,
 // and *exited* — so it survives restarts and days of silence, and your answer is
 // what starts the work again. Same inbox, different promise; the UI says which.
-type CalyxAskOption = {
+export type CalyxAskOption = {
   label: string;
   description?: string;
   recommended?: boolean;
@@ -82,7 +82,7 @@ type CalyxAskOption = {
   preview?: string;
 };
 
-type CalyxAskQuestion = {
+export type CalyxAskQuestion = {
   text: string;
   header?: string;
   options: CalyxAskOption[];
@@ -92,7 +92,7 @@ type CalyxAskQuestion = {
   attachments?: string[];
 };
 
-type CalyxAsk = {
+export type CalyxAsk = {
   id: string;
   path: string;
   title: string;
@@ -535,11 +535,34 @@ function formatMultiAnswer(
     .join("\n\n");
 }
 
-function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
-  const { answerCalyx, busy } = useAsk();
+/**
+ * Where a Calyx ask comes from when it is not a vault task on your own server:
+ * a question in a Calyx Cloud chat (LFG plan L3a). The card draws the same;
+ * this says how to answer and what to promise.
+ */
+export type CalyxAskSource = {
+  /** Send the answer: the words, and each question's answer (an option label, labels joined by ", ", or typed text). */
+  answer: (text: string, detail: { answers: string[]; picks: string[][] }) => void;
+  busy: boolean;
+  /** Shown once the ask is answered, in place of "Answered — restarting". */
+  answeredTitle: string;
+  /** The line under the reply box. */
+  promise: string;
+  /** The background, if the agent gave one; shown under the toggle instead of a fetched briefing. */
+  briefing?: string;
+  /** Files live in the vault and this phone cannot open them yet: names only, no links. */
+  filesUnavailable?: boolean;
+  /** Why the last answer did not go through. */
+  error?: string | null;
+};
+
+export function CalyxAskCard({ ask, source }: { ask: CalyxAsk; source?: CalyxAskSource }) {
+  const ctx = useContext(AskContext);
+  if (!source && !ctx) throw new Error("useAsk must be used within <AskProvider>");
+  const busy = source ? source.busy : ctx!.busy;
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
-  const [body, setBody] = useState<string | null>(null);
+  const [body, setBody] = useState<string | null>(source ? (source.briefing ?? "") : null);
   const [viewing, setViewing] = useState<string | null>(null);
   const [pendingChoice, setPendingChoice] = useState<string | null>(null);
 
@@ -637,12 +660,13 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
 
       if (isLast) {
         const formatted = formatMultiAnswer(ask.questions, next);
-        void answerCalyx(ask, formatted);
+        if (source) source.answer(formatted, { answers: next, picks });
+        else void ctx!.answerCalyx(ask, formatted);
       } else {
         setQIdx((i) => i + 1);
       }
     },
-    [qIdx, isLast, answers, ask, answerCalyx],
+    [qIdx, isLast, answers, ask, ctx, source, picks],
   );
 
   // Voice-to-text, identical to the agent-chat composer: tap the mic and the
@@ -685,7 +709,7 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
       <div className="rounded-2xl border border-border/60 bg-muted/30 p-4">
         <div className="flex items-center gap-2 text-sm font-medium">
           <Check className="size-4 text-primary" />
-          Answered — restarting
+          {source ? source.answeredTitle : "Answered — restarting"}
         </div>
         <div className="mt-1 text-xs text-muted-foreground">{ask.title}</div>
         {ask.answer ? (
@@ -764,7 +788,22 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
             you choose, not after. */}
         {q?.attachments?.length ? (
           <div className="mt-2.5 flex flex-wrap gap-1.5">
-            {q.attachments.map((a) => (
+            {q.attachments.map((a) =>
+              source?.filesUnavailable ? (
+                // Names only: the file is in the vault, which this phone cannot open yet.
+                <span
+                  key={a}
+                  title={a}
+                  className="flex items-center gap-1.5 rounded-lg border border-border bg-background px-2 py-1 text-xs"
+                >
+                  {isImagePath(a) ? (
+                    <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  ) : (
+                    <FileText className="size-3.5 shrink-0 text-muted-foreground" />
+                  )}
+                  <span className="max-w-[13rem] truncate">{fileLabel(a)}</span>
+                </span>
+              ) : (
               <button
                 key={a}
                 type="button"
@@ -778,7 +817,8 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
                 )}
                 <span className="max-w-[13rem] truncate">{fileLabel(a)}</span>
               </button>
-            ))}
+              ),
+            )}
           </div>
         ) : null}
 
@@ -819,7 +859,12 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
                   {/* Looking must not mean choosing. When the option IS a
                       rendered thing, you need to open it before you can decide,
                       so previewing is its own tap. */}
-                  {o.preview ? (
+                  {o.preview && source?.filesUnavailable ? (
+                    <span className="mt-1.5 inline-flex max-w-full items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                      <FileText className="size-3 shrink-0" />
+                      <span className="truncate">{fileLabel(o.preview)}</span>
+                    </span>
+                  ) : o.preview ? (
                     <span
                       role="button"
                       tabIndex={0}
@@ -947,23 +992,29 @@ function CalyxAskCard({ ask }: { ask: CalyxAsk }) {
           )}
         </div>
 
+        {source?.error ? <div className="mt-2 text-xs text-destructive">{source.error}</div> : null}
+
         {/* The promise — honest about where it runs. */}
         <div className="mt-2 text-[11px] text-muted-foreground">
           {totalQ > 1 && !isLast
             ? `Question ${qIdx + 1} of ${totalQ} — your answers are sent together after the last one.`
-            : "Answering restarts this task on your server — it resumes even with this closed."}
+            : source
+              ? source.promise
+              : "Answering restarts this task on your server — it resumes even with this closed."}
         </div>
       </div>
 
       {/* The briefing, collapsed. */}
+      {source && !source.briefing ? null : (
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="flex w-full items-center gap-1.5 border-t border-border/60 px-4 py-2.5 text-xs text-muted-foreground hover:bg-muted/40"
       >
         <ChevronDown className={cn("size-3.5 transition-transform", open && "rotate-180")} />
-        {open ? "Hide the details" : "Why it stopped, and where it got to"}
+        {open ? "Hide the details" : source ? "Why it is asking" : "Why it stopped, and where it got to"}
       </button>
+      )}
       {open ? (
         <div className="border-t border-border/60 bg-muted/20 px-4 py-3">
           {ask.reason ? (

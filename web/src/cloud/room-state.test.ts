@@ -137,6 +137,19 @@ describe("roomMessages", () => {
     expect(notes).toEqual(["Stopped", "Something went wrong"]);
   });
 
+  test("a started message whose turn start a mid-turn history cleared is not shown again as waiting", () => {
+    // The computer reconnected mid-turn and pushed its history: the message is in the
+    // history, the turn's start is gone from the tail, and the room says it started.
+    const s = reduceRoom(null, snapshot({
+      history: { upToSeq: 6, messages: [{ id: "h1", role: "user", text: "Pick a colour", at: 1 }] },
+      inbox: [{ seq: 1, requestId: "req-a", text: "Pick a colour", by: "user", from: "Mac", at: 1, status: "claimed", epoch: 1, started: true }],
+      lastSeq: 6,
+    }))!;
+    const view = roomMessages(s, none);
+    expect(view.messages.filter((m) => m.text === "Pick a colour")).toHaveLength(1);
+    expect(view.busy).toBe(true);
+  });
+
   test("inbox: waiting, starting, cut — and a started one shows as its turn, not twice", () => {
     const item = (requestId: string, status: string) => ({ seq: 1, requestId, text: requestId, by: "user", from: "iPhone", at: 1, status, epoch: null });
     let s = reduceRoom(null, snapshot({ history: { upToSeq: 0, messages: [] }, lastSeq: 0 }))!;
@@ -163,6 +176,9 @@ describe("roomMessages", () => {
     pi = reduceRoom(pi, waiting)!;
     expect(roomMessages(pi, none).messages.at(-1)?.text).toBe("Waits for MacBook to be back");
     expect(statusLine(roomStatus(pi))).toBe("Paused until MacBook is back");
+    // The same computer online again: not "away" — a message opens the chat there.
+    expect(statusLine(roomStatus(pi, ["MacBook"]))).toBe("Not open on a computer");
+    expect(statusLine(roomStatus(pi, ["Other Mac"]))).toBe("Paused until MacBook is back");
     expect(statusLine(roomStatus(reduceRoom(null, snapshot())))).toBe("Open on MacBook");
   });
 
@@ -186,3 +202,41 @@ describe("roomMessages", () => {
   });
 });
 
+
+describe("questions in the room (L3a)", () => {
+  const ask = (id: string, status: "open" | "answered" | "closed", createdAt = 1, extra: Record<string, unknown> = {}) => ({
+    id,
+    questions: [{ id: "q1", text: "Which?", options: [{ id: "o1", label: "A" }] }],
+    batch: false,
+    createdAt,
+    status,
+    ...extra,
+  });
+
+  test("a snapshot carries the open and answered ones; closed ones are not shown", () => {
+    const s = reduceRoom(null, snapshot({ asks: [ask("b", "answered", 2), ask("a", "open", 1), ask("c", "closed", 3)] }))!;
+    expect(s.asks.map((a) => `${a.id}:${a.status}`)).toEqual(["a:open", "b:answered"]);
+    expect(reduceRoom(null, snapshot())!.asks).toEqual([]);
+  });
+
+  test("live: a new question, its answer, then closed", () => {
+    let s = reduceRoom(null, snapshot())!;
+    s = reduceRoom(s, { t: "ask", ask: ask("a", "open") })!;
+    expect(s.asks.map((a) => a.status)).toEqual(["open"]);
+    s = reduceRoom(s, { t: "ask", ask: ask("a", "answered", 1, { answer: { text: "A", from: "MacBook", at: 5 } }) })!;
+    expect(s.asks).toHaveLength(1);
+    expect(s.asks[0].answer?.from).toBe("MacBook");
+    s = reduceRoom(s, { t: "ask", ask: ask("a", "closed", 1, { outcome: "answered" }) })!;
+    expect(s.asks).toEqual([]);
+    // Before any snapshot, nothing to change.
+    expect(reduceRoom(null, { t: "ask", ask: ask("a", "open") })).toBeNull();
+  });
+
+  test("resume replaces the list (one missing has closed); a resume without one keeps it", () => {
+    let s = reduceRoom(null, snapshot({ asks: [ask("a", "open"), ask("b", "open", 2)] }))!;
+    s = reduceRoom(s, { t: "resume", after: 4, lease: lease("MacBook"), tail: [], inbox: [], asks: [ask("b", "answered", 2)], lastSeq: 4 })!;
+    expect(s.asks.map((a) => `${a.id}:${a.status}`)).toEqual(["b:answered"]);
+    s = reduceRoom(s, { t: "resume", after: 4, lease: lease("MacBook"), tail: [], inbox: [], lastSeq: 4 })!;
+    expect(s.asks.map((a) => a.id)).toEqual(["b"]);
+  });
+});

@@ -8,7 +8,8 @@
 // Message list LFG's own chat screens draw.
 //
 // Ported from the S4 phone page (chat-worker src/page.html: onRoom, liveItems,
-// renderChat), which passed Sam's iPhone test on 2026-10-16.
+// renderChat), which passed Sam's iPhone test on 2026-10-16. Questions the
+// agent asks (L3a) ride the same socket: chat-worker src/room.ts, "Questions".
 
 import type { Message } from "../App";
 
@@ -36,6 +37,8 @@ export interface InboxItem {
   at: number;
   status: "waiting" | "claimed" | "done" | "cut";
   epoch: number | null;
+  /** Its turn has started: its message is in the history or the live turn already. */
+  started?: boolean;
 }
 
 export interface RoomEvent {
@@ -55,6 +58,50 @@ export interface HistoryMessage {
   tools?: Array<{ name: string; label?: string; ok: boolean }>;
 }
 
+/** One option of a question, as Calyx shapes it (`AskOption`, extension src/lib/shared/askQuestions.ts). */
+export interface AskOptionData {
+  id?: string;
+  label: string;
+  description?: string;
+  recommended?: boolean;
+  /** Vault files that ARE this option. */
+  previews?: string[];
+  /** The older single form of `previews`. */
+  preview?: string;
+}
+
+/** One question, as Calyx shapes it (`AskQuestion`). */
+export interface AskQuestionData {
+  id?: string;
+  text: string;
+  header?: string;
+  options?: AskOptionData[];
+  multiSelect?: boolean;
+  allowOther?: boolean;
+  /** Vault files to look at before deciding. */
+  attachments?: string[];
+  context?: string;
+}
+
+export interface AskAnswerPart {
+  questionId: string;
+  optionIds: string[];
+  note?: string;
+}
+
+export interface RoomAsk {
+  id: string;
+  questions: AskQuestionData[];
+  context?: string;
+  /** Several questions answered together. */
+  batch: boolean;
+  createdAt: number;
+  /** open: waiting. answered: a device answered; the computer has not applied it yet. closed: settled. */
+  status: "open" | "answered" | "closed";
+  answer?: { text: string; answers?: AskAnswerPart[]; from: string; at: number };
+  outcome?: string;
+}
+
 export interface RoomState {
   title: string;
   engine: string | null;
@@ -64,6 +111,8 @@ export interface RoomState {
   upToSeq: number;
   tail: RoomEvent[];
   inbox: InboxItem[];
+  /** Questions still open, or answered and not yet applied on the computer, oldest first. */
+  asks: RoomAsk[];
   lastSeq: number;
 }
 
@@ -89,6 +138,12 @@ function mergeTail(tail: RoomEvent[], incoming: RoomEvent[], after: number): Roo
   return out.sort(bySeq);
 }
 
+/** The room's list of questions is whole: one missing from it has closed. */
+function liveAsks(raw: unknown): RoomAsk[] {
+  if (!Array.isArray(raw)) return [];
+  return (raw as RoomAsk[]).filter((a) => a?.id && a.status !== "closed").sort((a, b) => a.createdAt - b.createdAt);
+}
+
 function leaseOf(msg: Json): LeaseView {
   const { t: _t, ref: _ref, ...rest } = msg;
   return rest as unknown as LeaseView;
@@ -111,6 +166,7 @@ export function reduceRoom(state: RoomState | null, msg: Json): RoomState | null
         upToSeq,
         tail: mergeTail([], (msg.tail as RoomEvent[]) ?? [], upToSeq),
         inbox: ((msg.inbox as InboxItem[]) ?? []).filter((i) => i.status !== "done"),
+        asks: liveAsks(msg.asks),
         lastSeq: (msg.lastSeq as number) ?? 0,
       };
     }
@@ -122,6 +178,7 @@ export function reduceRoom(state: RoomState | null, msg: Json): RoomState | null
         lease: (msg.lease as LeaseView) ?? state.lease,
         tail: mergeTail(state.tail, (msg.tail as RoomEvent[]) ?? [], state.upToSeq),
         inbox: ((msg.inbox as InboxItem[]) ?? []).filter((i) => i.status !== "done"),
+        asks: Array.isArray(msg.asks) ? liveAsks(msg.asks) : state.asks,
         lastSeq: Math.max(state.lastSeq, (msg.lastSeq as number) ?? 0),
       };
     }
@@ -154,6 +211,11 @@ export function reduceRoom(state: RoomState | null, msg: Json): RoomState | null
       inbox.sort((a, b) => a.seq - b.seq);
       return { ...state, inbox };
     }
+    case "ask": {
+      const ask = msg.ask as RoomAsk | null;
+      if (!state || !ask?.id) return state;
+      return { ...state, asks: liveAsks([...state.asks.filter((a) => a.id !== ask.id), ask]) };
+    }
     case "lease":
       return state ? { ...state, lease: leaseOf(msg) } : state;
     case "meta":
@@ -169,11 +231,15 @@ export type RoomStatus =
   | { kind: "paused"; label: string }
   | { kind: "none" };
 
-export function roomStatus(state: RoomState | null): RoomStatus {
+/** `online`: the labels of the computers online now (the hub's presence). */
+export function roomStatus(state: RoomState | null, online: readonly string[] = []): RoomStatus {
   const lease = state?.lease;
   if (lease?.live && lease.holder) return { kind: "live", label: lease.holder.label };
   // A Pi chat lives on the computer that ran it: nobody else can carry it on yet (phase 2, S6b).
-  if (state?.engine === "pi-durable" && lease?.lastLabel) return { kind: "paused", label: lease.lastLabel };
+  // That computer online again is not "away": a message opens the chat there.
+  if (state?.engine === "pi-durable" && lease?.lastLabel && !online.includes(lease.lastLabel)) {
+    return { kind: "paused", label: lease.lastLabel };
+  }
   return { kind: "none" };
 }
 
@@ -204,6 +270,7 @@ const note = (id: string, text: string, ts?: number): Message => ({ id, role: "s
 export function roomMessages(
   state: RoomState | null,
   sending: ReadonlyMap<string, Sending>,
+  online: readonly string[] = [],
 ): { messages: Message[]; busy: boolean } {
   const out: Message[] = [];
   if (!state) {
@@ -251,10 +318,11 @@ export function roomMessages(
 
   // Messages the room holds that have not started, then ones still on their way.
   const started = new Set(turns.map((t) => t.requestId));
-  const status = roomStatus(state);
+  const status = roomStatus(state, online);
   const who = status.kind === "live" ? status.label : null;
   for (const item of state.inbox) {
-    if (started.has(item.requestId) || item.status === "done") continue;
+    // Started: shown by the history or the live turn (a history pushed mid-turn clears its start from the tail).
+    if (started.has(item.requestId) || item.started || item.status === "done") continue;
     out.push({ ...pendingUser(`inbox-${item.requestId}`, { text: item.text, at: item.at }), pending: item.status !== "cut" });
     out.push(
       note(
